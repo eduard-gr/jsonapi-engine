@@ -29,7 +29,7 @@ PHP-библиотека, реализующая JSON API.
 | 6. Документ JSON:API | `src/Document/` | готово |
 | Точка входа библиотеки, транзакция, пагинация | — | нет; весь путь собирает контроллер примера `example/Controller/CertificatesController` |
 
-Проверено на SQLite и PDO (`example/db`): документ по плану для запроса примера совпадает с эталоном `test/Fixture/document.json`. Целевая СУБД — PostgreSQL; против неё пока проверяются только сущности (`test/Integration`).
+Проверено на SQLite и PDO (`example/db`): документ по плану для запроса примера совпадает с эталоном `test/Fixture/document.json`. Целевая СУБД — PostgreSQL; против неё пока ничего не проверяется.
 
 ## Зависимости
 
@@ -38,7 +38,7 @@ PHP-библиотека, реализующая JSON API.
 | PHP 8.5+ | clone with в узлах плана |
 | `ext-ds` ^2.0 | `Ds\Map`, `Ds\Set` в реестре ресурсов, документе и хеш-соединении. |
 | `ext-pdo` | Узел `SqlScanIterator` выполняет SQL через PDO (пример — SQLite). |
-| `ext-pgsql`, [`sad_spirit/pg_builder`](https://github.com/sad-spirit/pg-builder), [`sad_spirit/pg_wrapper`](https://github.com/sad-spirit/pg-wrapper) `^3.3` | Целевой стек для PostgreSQL: pg_builder строит SQL плана, pg_wrapper нужен `Model\EntityDatabaseValidator`. |
+| [`sad_spirit/pg_builder`](https://github.com/sad-spirit/pg-builder) `^3.3` | Строит SQL плана для PostgreSQL. |
 
 Psalm знает только ext-ds 1.x (в 2.0 нет интерфейса `Ds\Sequence`), поэтому классы 2.0 описаны заглушкой `stubs/ds.phpstub`, подключённой в `psalm.xml`.
 
@@ -803,7 +803,7 @@ echo json_encode($flow->explain(), JSON_PRETTY_PRINT);
 
 ### Сущность
 
-Слой `src/Model` (`Ggs\JsonApiEngine\Model`) — описание таблиц и моделей данных поверх них: `Entity`, `Metadata`, `NamedConstants`, `Join`/`LeftJoin`/`InnerJoin`, `ModelTree`, `EntityDatabaseValidator`. Раньше это была отдельная библиотека `ggs/data-model`. Слой не знает о ресурсах, плане и JSON:API: зависимости идут только к нему, не от него.
+Слой `src/Model` (`Ggs\JsonApiEngine\Model`) — описание таблиц и моделей данных поверх них: `Entity`, `Metadata`, `NamedConstants`, `Join`/`LeftJoin`/`InnerJoin`, `ModelTree`. Раньше это была отдельная библиотека `ggs/data-model`. Слой не знает о ресурсах, плане и JSON:API: зависимости идут только к нему, не от него.
 
 PHP-класс, унаследованный от `Model\Entity`, по одному на таблицу (`example/Entity/`). В нём только константы: `TABLE`, по строковой константе на колонку и `COLUMNS` — описание колонок.
 
@@ -849,7 +849,8 @@ final class CertificateDetailsEntity extends Entity
 
 - **Одна таблица — один класс.** Связь таблиц задаёт `model()` ресурса, а не сущность. Сущность может описывать не все колонки таблицы.
 - **Первичный ключ** — ровно одна колонка `PRIMARY`; составных нет. `FOREIGN` ссылается на первичный ключ сущности из `references`, `type` совпадает.
-- **Проверки в тестах, не в рантайме.** `Entity::validate()` проверяет константы (ключи и значения `COLUMNS`, один `PRIMARY`, `references` у `FOREIGN`, константы совпадают с ключами `COLUMNS`). `EntityDatabaseValidator::validate($connection, $entity)` сверяет сущность с каталогом PostgreSQL: таблица, колонки, типы, `NOT NULL`, первичный ключ, уникальные индексы, внешние ключи (интеграционный тест `test/Integration/Model/EntityDatabaseTest`).
+- **Сущности верят.** Сущность — источник истины о таблице; с БД её никто не сверяет. Если таблица разошлась с сущностью (миграция без правки сущности), ошибки не будет: неверный `type` даст неверное приведение значения, колонка, объявленная `PRIMARY`/`unique`, но не уникальная в БД, — размноженные строки модели.
+- **Проверки в тестах, не в рантайме.** `Entity::validate()` проверяет только согласованность констант (ключи и значения `COLUMNS`, один `PRIMARY`, `references` у `FOREIGN`, константы совпадают с ключами `COLUMNS`).
 
 ### Класс ресурса
 
@@ -1117,7 +1118,6 @@ echo json_encode($document);                                            // 5–6
 ```bash
 composer install
 vendor/bin/phpunit --testsuite unit                # модульные тесты, в том числе test/Model
-vendor/bin/phpunit --testsuite integration         # test/Integration/Model: сущности против PostgreSQL (docker compose up -d), без БД пропускаются
 vendor/bin/psalm                                   # статический анализ
 php example/document.php                           # документ по дереву итераторов, собранному руками
 php example/certificates.php [URL] [--document]    # CertificatesController: план и SQL для запроса, с --document — документ (по умолчанию include=provider,detail,delivery,domains.logs)

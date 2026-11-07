@@ -15,10 +15,6 @@
     <testsuites>
         <testsuite name="unit">
             <directory>test</directory>
-            <exclude>test/Integration</exclude>
-        </testsuite>
-        <testsuite name="integration">
-            <directory>test/Integration</directory>
         </testsuite>
     </testsuites>
     <source>
@@ -26,8 +22,4 @@
             <directory>src</directory>
         </include>
     </source>
-    <php>
-        <!-- PostgreSQL для интеграционных тестов: docker compose up -d -->
-        <env name="DQI_TEST_DSN" value="host=127.0.0.1 port=55432 dbname=dqi_test user=postgres password=postgres"/>
-    </php>
 </phpunit>

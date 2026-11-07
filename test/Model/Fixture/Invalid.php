@@ -12,7 +12,7 @@ use Ggs\JsonApiEngine\Test\Model\Fixture\Model\CustomersEntity;
 use Ggs\JsonApiEngine\Test\Model\Fixture\Model\OrdersEntity;
 
 /**
- * Сущности и модели с ошибками для тестов `Entity::validate()`, `ModelTree` и `EntityDatabaseValidator`.
+ * Сущности и модели с ошибками для тестов `Entity::validate()` и `ModelTree`.
  * Подключаются через require_once: PSR-4 требует по классу на файл.
  */
 
@@ -116,43 +116,5 @@ final class BadEntity extends Entity
         self::PARENT_ID => ['type' => self::INT, 'constraint' => self::FOREIGN, 'references' => \stdClass::class],
         self::STRAY => ['type' => self::INT, 'references' => ThingsEntity::class],
         'unnamed' => ['type' => self::INT],
-    ];
-}
-
-/**
- * Сущности, не совпадающие с тестовой БД, для тестов EntityDatabaseValidator.
- */
-final class MissingTableEntity extends Entity
-{
-    public const string TABLE = 'no_such_table';
-
-    public const string ID = 'id';
-
-    public const array COLUMNS = [
-        self::ID => ['type' => self::INT, 'constraint' => self::PRIMARY],
-    ];
-}
-
-final class WrongCertificateKeysEntity extends Entity
-{
-    public const string TABLE = 'certificate_keys';
-
-    public const string KEY_ID = 'key_id';
-    public const string CERTIFICATE_ID = 'certificate_id';
-    public const string KEY_ALGORITHM = 'key_algorithm';
-    public const string KEY_SIZE = 'key_size';
-    public const string LABEL = 'label';
-
-    public const array COLUMNS = [
-        self::KEY_ID => ['column' => 'id', 'type' => self::INT],
-        self::CERTIFICATE_ID => ['type' => self::INT, 'constraint' => self::PRIMARY],
-        self::KEY_ALGORITHM => ['column' => 'algorithm', 'type' => self::STRING, 'nullable' => true, 'unique' => true],
-        self::KEY_SIZE => [
-            'column' => 'size',
-            'type' => self::STRING,
-            'constraint' => self::FOREIGN,
-            'references' => ThingsEntity::class,
-        ],
-        self::LABEL => ['type' => self::STRING],
     ];
 }
