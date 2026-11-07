@@ -553,7 +553,7 @@ echo json_encode($flow->explain(), JSON_PRETTY_PRINT);
             "attributes": {
                 "code": "CERT-2026-00001",
                 "nominal": "1000.00",
-                "currency": "RUB",
+                "currency": "USD",
                 "status": "EXPIRED",
                 "created_at": "2026-03-29 21:01:47"
             },
@@ -576,7 +576,7 @@ echo json_encode($flow->explain(), JSON_PRETTY_PRINT);
             "type": "detail",
             "attributes": {
                 "buyer_email": "buyer1@example.com",
-                "recipient_name": "Мария Кузнецова",
+                "recipient_name": "Анна Каренина",
                 "recipient_email": "recipient1@example.org",
                 "greeting_text": "С днём рождения!",
                 "design_template_id": 9
