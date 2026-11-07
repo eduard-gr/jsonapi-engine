@@ -1,6 +1,6 @@
 {
     "name": "ggs/jsonapi-engine",
-    "description": "Json API implementation for GoGetSSL",
+    "description": "Json API implementation",
     "autoload": {
         "psr-4": {
             "Ggs\\JsonApiEngine\\": "src/"

@@ -8,3 +8,4 @@ composer.phar
 
 /.idea/
 CLAUDE.md
+docker-compose.yml
