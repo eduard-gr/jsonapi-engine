@@ -157,6 +157,53 @@ GET /certificates?include=…&fields[…]=…&filter[…]=…&sort=…   + ко�
 
 Ошибки разделены по месту: ошибки клиента возникают только в парсере (`InvalidQueryException` — 400, `ResourceNotFoundException` — 404). Всё, что идёт после него, получает проверенное дерево, и несоответствие там — `LogicException`: ошибка кода, а не запроса.
 
+### Модель Volcano
+
+Исполнитель устроен по модели итераторов Volcano (Graefe), как исполнители реляционных СУБД: запрос — дерево операторов, каждый оператор — итератор, который по требованию отдаёт следующий элемент своего потока и сам берёт элементы у своих входов.
+
+| Volcano | Здесь |
+|---|---|
+| `open()` | первый вызов `getIterator()`: создаётся генератор; `SqlScanIterator` выполняет запрос только при первом шаге генератора |
+| `next()` | очередной шаг генератора (`foreach`, `current()`/`next()`) |
+| `close()` | генератор закончился; повторно не открывается |
+| оператор с 0 / 1 / 2 входами | лист `SqlScanIterator`; унарные `SerializeIterator`, `SharedDataIterator`, `SortIterator`; бинарные — соединения (`outer`, `inner`), `PreloadIterator` (`source`, `preload`), `SharedScanIterator` (`data`, `source`) |
+
+Свойства модели, на которые опирается библиотека:
+
+- **Pull, а не push.** Работу запускает потребитель: корень перебирает `json_encode()` документа, корень тянет свои входы, и так до листьев. Данные поднимаются снизу вверх по одному элементу; пока документ не начал перебор, ни один SQL-запрос не выполнен.
+- **Конвейер и блокирующие операторы.** Большинство узлов потоковые: элемент проходит наверх, не дожидаясь остальных (`SerializeIterator`, `SharedRowJoinIterator`, `MergeNestJoinIterator`). Блокирующие узлы читают один вход целиком до первого элемента наверх: `HashNestJoinIterator` — `outer` в хеш-таблицу, `HashJoinIterator` — `inner`, `SortIterator` — весь вход. Память поэтому определяется блокирующими узлами и реестром, а не числом строк в потоке.
+- **Фиксированное число входов.** Число входов узла видно по классу, и узел плана и его итератор называются по одной основе (`MergeNestJoinNode` → `MergeNestJoinIterator`): план — дерево операторов, дерево итераторов — его экземпляр на одно выполнение.
+
+Чем модель отличается от классической:
+
+- **Два вида элементов.** Снизу по потоку идут строки SQL (`array`), выше `SerializeIterator` — ресурсы (`ResourceRecord`). Какой поток у узла, написано в его описании («Поток: вход → выход»).
+- **Одна строка — несколько ресурсов.** Классический оператор читает свой вход один; здесь строку одного SQL читают несколько `SerializeIterator` через `SharedDataIterator`, а `SharedScanIterator` сдвигает её один раз за такт. Тройка работает в ногу (lockstep): каждая ветка за такт отдаёт ровно один элемент, отсутствие ресурса — `null` (см. [Одна строка — несколько ресурсов](#одна-строка--несколько-ресурсов)).
+- **Соединение не склеивает кортежи.** Выход соединения — элементы `outer`, которым дописана связь; связанные ресурсы в поток не копируются, а попадают в ответ через реестр и обход документа.
+- **Побочный эффект — реестр.** `SerializeIterator` регистрирует каждый ресурс в общем `ResourceRegistry` (один объект на `type:id`); `PreloadIterator` дочитывает свой вход только ради этого эффекта.
+- **Одноразовость.** Итераторы хранят состояние и выполняются один раз; повторный перебор молча пуст. План переиспользуется, дерево итераторов на каждое выполнение строит `ExecutorBuilder`.
+
+### Модель оптимизатора
+
+Планировщик (`Plan\Select\QueryPlanner`) — оптимизатор на правилах (rule-based), без модели стоимости и статистики: решения принимаются по форме дерева и описанию ресурсов, поэтому один запрос всегда даёт один и тот же план. План — дерево неизменяемых узлов, и оптимизация — последовательность переписываний дерева в новое дерево.
+
+- **Неизменяемые узлы.** Свойства узлов `readonly`; «изменить» узел — получить копию через `with…()` (clone with). Тот же вход — тот же объект, поэтому нетронутые поддеревья переиспользуются, а результат каждого шага остаётся целым: `plan()` возвращает дерево после каждого шага (`php example/query-plan.php --steps`).
+- **Шаг — `Pass`:** функция «дерево → дерево», `$step(plan: $plan)`. Проход видит всё дерево и может нести контекст при обходе (`SharedScanPass` знает, внутри строки он или нет; `BuildSqlPass` передаёт ключи соединений сверху вниз).
+- **`Rule` — частный случай `Pass`:** локальное правило `apply(node)` смотрит только на узел и его прямые входы и возвращает замену или `null`. Обход написан один раз в `Rule`: снизу вверх (входы уже преобразованы, как `transformUp` в Spark Catalyst), полными кругами, пока за круг не случится ни одной замены (фиксированная точка). Замены считаются, деревья не сравниваются.
+- **Порядок шагов фиксирован** (`getSteps()`), каждый рассчитан на результат предыдущих. Правило, которое меняет верх строки, должно идти до `close`: после него вход `SharedScanNode` — только `SharedRowJoinNode`/`ResourceNode`, иначе `LogicException`.
+
+Шаги идут от логического плана к физическому:
+
+| Шаг | Вид | Что решает |
+|---|---|---|
+| `nodes` — `fromTree()` | перевод | дерево запроса → узлы; вид соединения — по виду связи, include — левой цепочкой в порядке объявления |
+| `lift` — `LiftBranchFromOuterRule` | логическое переписывание | ветки владельца строки поднимаются над строкой: все 1-1 собираются в одну строку |
+| `order` — `PreloadBelowNestJoinRule` | логическое переписывание | порядок выполнения: справочник (`PreloadNode`) загружается до nest join |
+| `close` — `SharedScanPass` | границы запросов | где кончается один SQL-запрос (`SharedScanNode`) и какой алгоритм 1:N возможен внутри строки (`HashJoinNode`) |
+| `merge` — `HashToMergeRule` | выбор алгоритма | Hash → Merge, где обе стороны можно упорядочить по ключу; порядок у владельца один («интересный порядок», жадно снизу вверх) |
+| `sql` — `BuildSqlPass` | генерация | `Select` (pg_builder), параметры и карта колонок у каждого владельца |
+
+Чего оптимизатор не делает: не оценивает стоимость, не перебирает альтернативные планы, не переставляет соединения сверх `lift`/`order`. Неверное дерево на входе — ошибка кода (`LogicException`): клиентские ошибки отсеял парсер.
+
 ### 1. Парсинг и валидация
 
 `QueryParser::parse(string $resource, array $query): array` разбирает параметры запроса по корневому ресурсу endpoint'а (`CertificateResource::class`) и строит дерево запроса.
@@ -170,12 +217,12 @@ Accept: application/vnd.api+json
 
 #### Дерево запроса
 
-Корень дерева — ресурс endpoint'а, дочерние узлы — подключённые через `include` ресурсы. Для запроса выше (`php example/query-tree.php '<URL>'` печатает дерево любого запроса):
+Корень дерева — ресурс endpoint'а, дочерние узлы — подключённые через `include` ресурсы. `php example/query-tree.php` без аргумента печатает дерево для `GET /certificates?include=provider,detail,delivery,domains.logs` (без `fields`, поэтому у каждого ресурса все публичные атрибуты); `php example/query-tree.php '<URL>'` — дерево любого запроса. То же дерево записано константой `TREE` в `example/query-plan.php`, вход планировщика без парсера:
 
 ```php
 [
     'resource' => CertificateResource::class,
-    'fields' => ['code', 'status'],
+    'fields' => ['code', 'nominal', 'currency', 'status', 'created_at', 'provider'],
     'filters' => [],
     'sort' => [],
     'includes' => [
@@ -193,12 +240,24 @@ Accept: application/vnd.api+json
         'detail' => [
             'type' => QueryParser::ONE_TO_ONE,
             'relation' => ['id', 'certificate_id'],
-            'resource' => [/* DetailResource */],
+            'resource' => [
+                'resource' => DetailResource::class,
+                'fields' => ['buyer_email', 'recipient_name', 'recipient_email', 'greeting_text', 'design_template_id'],
+                'filters' => [],
+                'sort' => [],
+                'includes' => [],
+            ],
         ],
         'delivery' => [
             'type' => QueryParser::ONE_TO_ONE,
             'relation' => ['id', 'certificate_id'],
-            'resource' => [/* DeliveryResource */],
+            'resource' => [
+                'resource' => DeliveryResource::class,
+                'fields' => ['delivery_channel', 'is_sent', 'external_provider_id'],
+                'filters' => [],
+                'sort' => [],
+                'includes' => [],
+            ],
         ],
         'domains' => [
             'type' => QueryParser::ONE_TO_MANY,
@@ -212,7 +271,13 @@ Accept: application/vnd.api+json
                     'logs' => [
                         'type' => QueryParser::ONE_TO_MANY,
                         'relation' => ['id', 'domain_id'],
-                        'resource' => [/* LogResource */],
+                        'resource' => [
+                            'resource' => LogResource::class,
+                            'fields' => ['log_level', 'message', 'created_at'],
+                            'filters' => [],
+                            'sort' => [],
+                            'includes' => [],
+                        ],
                     ],
                 ],
             ],
@@ -220,6 +285,8 @@ Accept: application/vnd.api+json
     ],
 ]
 ```
+
+С `fields[certificate]=code,status` из запроса выше у корня было бы `'fields' => ['code', 'status']`; остальное дерево то же.
 
 | Поле узла | Описание |
 |---|---|
@@ -289,6 +356,8 @@ sort=-created_at,provider.name,domains.domain_name
 ### 2. Планирование
 
 План (`src/Plan`, перенесено из прототипа `../php-tests/src/test24.php`) отделён от выполнения (`src/Executor`): план — неизменяемые узлы без состояния, которые строит и переписывает планировщик; итераторы — состояние одного выполнения. План можно выполнять сколько угодно раз, дерево итераторов — один. `Executor` зависит от `Plan`, но не наоборот.
+
+Как устроены шаги и почему план без модели стоимости — [Модель оптимизатора](#модель-оптимизатора).
 
 #### Узлы плана
 
@@ -480,9 +549,138 @@ HashNestJoinIterator domains (id ← certificate_id)
     └─ SerializeIterator log ────► SqlScanIterator логов
 ```
 
+#### Пример: `example/query-plan.php`
+
+`example/query-plan.php` проходит стадии 2–6 без парсера: дерево запроса `TREE` (см. [Дерево запроса](#дерево-запроса)) → план → дерево итераторов → документ.
+
+```php
+$steps = (new QueryPlanner())->plan(tree: TREE);       // дерево после каждого шага
+$plan = $steps['sql'];                                 // план с SQL
+
+$builder = new ExecutorBuilder(pdo: getPDO());
+$flow = $builder->build(plan: $plan, registry: new ResourceRegistry());   // дерево итераторов на одно выполнение
+echo json_encode($flow->explain(), JSON_PRETTY_PRINT);                   // топология, ничего не выполняя
+
+echo json_encode($builder->document(plan: $plan));     // новое дерево итераторов, выполняется внутри json_encode()
+```
+
+`php example/query-plan.php --explain` печатает дерево итераторов для этого плана (ниже классы без пространства имён; SQL сертификатов печатается у каждого потребителя `SharedDataIterator` и здесь сокращён после первого раза):
+
+```json
+{
+    "node": "HashNestJoinIterator",
+    "name": "domains",
+    "outer_key": "id",
+    "inner_key": "certificate_id",
+    "outer": {
+        "node": "PreloadIterator",
+        "source": {
+            "node": "SharedScanIterator",
+            "data": {
+                "node": "SharedDataIterator",
+                "source": {
+                    "node": "SqlScanIterator",
+                    "sql": "select t0.id as t0_id, t0.code as t0_code, t0.nominal as t0_nominal, t0.currency as t0_currency, t0.status as t0_status, t0.created_at as t0_created_at, t0.provider_id as t0_provider_id, t1.certificate_id as t1_certificate_id, t1.buyer_email as t1_buyer_email, t1.recipient_name as t1_recipient_name, t1.recipient_email as t1_recipient_email, t1.greeting_text as t1_greeting_text, t1.design_template_id as t1_design_template_id, t2.certificate_id as t2_certificate_id, t2.delivery_channel as t2_delivery_channel, t2.is_sent as t2_is_sent, t2.external_provider_id as t2_external_provider_id from certificates as t0 left join certificate_details as t1 on t0.id = t1.certificate_id left join certificate_delivery_meta as t2 on t0.id = t2.certificate_id order by t0.id"
+                }
+            },
+            "source": {
+                "node": "SharedRowJoinIterator",
+                "name": "delivery",
+                "outer": {
+                    "node": "SharedRowJoinIterator",
+                    "name": "detail",
+                    "outer": {
+                        "node": "SerializeIterator",
+                        "resource": "CertificateResource",
+                        "alias": "t0",
+                        "fields": ["code", "nominal", "currency", "status", "created_at", "provider"],
+                        "source": {
+                            "node": "SharedDataIterator",
+                            "source": {
+                                "node": "SqlScanIterator",
+                                "sql": "… (тот же SQL сертификатов)"
+                            }
+                        }
+                    },
+                    "inner": {
+                        "node": "SerializeIterator",
+                        "resource": "DetailResource",
+                        "alias": "t1",
+                        "fields": ["buyer_email", "recipient_name", "recipient_email", "greeting_text", "design_template_id"],
+                        "source": {
+                            "node": "SharedDataIterator",
+                            "source": {
+                                "node": "SqlScanIterator",
+                                "sql": "… (тот же SQL сертификатов)"
+                            }
+                        }
+                    }
+                },
+                "inner": {
+                    "node": "SerializeIterator",
+                    "resource": "DeliveryResource",
+                    "alias": "t2",
+                    "fields": ["delivery_channel", "is_sent", "external_provider_id"],
+                    "source": {
+                        "node": "SharedDataIterator",
+                        "source": {
+                            "node": "SqlScanIterator",
+                            "sql": "… (тот же SQL сертификатов)"
+                        }
+                    }
+                }
+            }
+        },
+        "preload": {
+            "node": "SerializeIterator",
+            "resource": "ProviderResource",
+            "alias": "t0",
+            "fields": ["name", "website", "created_at"],
+            "source": {
+                "node": "SqlScanIterator",
+                "sql": "select t0.id as t0_id, t0.\"name\" as t0_name, t0.website as t0_website, t0.created_at as t0_created_at from providers as t0 order by t0.id"
+            }
+        }
+    },
+    "inner": {
+        "node": "MergeNestJoinIterator",
+        "name": "logs",
+        "outer_key": "id",
+        "inner_key": "domain_id",
+        "outer": {
+            "node": "SerializeIterator",
+            "resource": "DomainResource",
+            "alias": "t0",
+            "fields": ["domain_name", "is_primary", "created_at"],
+            "source": {
+                "node": "SqlScanIterator",
+                "sql": "select t0.id as t0_id, t0.domain_name as t0_domain_name, t0.is_primary as t0_is_primary, t0.created_at as t0_created_at, t0.certificate_id as t0_certificate_id from domains as t0 order by t0.id"
+            }
+        },
+        "inner": {
+            "node": "SerializeIterator",
+            "resource": "LogResource",
+            "alias": "t0",
+            "fields": ["log_level", "message", "created_at"],
+            "source": {
+                "node": "SqlScanIterator",
+                "sql": "select t0.id as t0_id, t0.log_level as t0_log_level, t0.message as t0_message, t0.created_at as t0_created_at, t0.domain_id as t0_domain_id from domain_logs as t0 order by t0.domain_id, t0.id"
+            }
+        }
+    }
+}
+```
+
+Что видно в описании:
+
+- `SharedDataIterator` с запросом сертификатов встречается четыре раза — у `SharedScanIterator` (`data`, он сдвигает строку) и у трёх `SerializeIterator` (`t0`, `t1`, `t2`, они читают окно на ту же строку). Это один объект и один SQL-запрос: `explain()` описывает узел у каждого потребителя.
+- `provider` — отдельный запрос под `PreloadIterator`: он только наполняет реестр, в поток корня не попадает.
+- `logs` соединяются слиянием: домены упорядочены по `id`, логи — по `domain_id`; `domains` над ними — хеш-соединение по `id` сертификата.
+- Параметров у запросов нет: в `TREE` нет фильтров. С фильтром у `SqlScanIterator` появляется ключ `parameters`.
+
 ### 5. Выполнение
 
-Исполнитель — дерево узлов-итераторов. Каждый узел — `Executor\ExecutorIterator`: `IteratorAggregate`, чей `getIterator()` отдаёт генератор, и `explain()`. Узел-родитель перебирает поток своих входов, поэтому выполнение — это перебор корня, а данные поднимаются от листьев (`SqlScanIterator`) к корню. Запросы выполняются лениво, при первом обращении к генератору; всё дерево выполняется внутри `json_encode()` документа.
+Исполнитель — дерево узлов-итераторов по [модели Volcano](#модель-volcano). Каждый узел — `Executor\ExecutorIterator`: `IteratorAggregate`, чей `getIterator()` отдаёт генератор, и `explain()`. Узел-родитель перебирает поток своих входов, поэтому выполнение — это перебор корня, а данные поднимаются от листьев (`SqlScanIterator`) к корню. Запросы выполняются лениво, при первом обращении к генератору; всё дерево выполняется внутри `json_encode()` документа.
 
 Узлы хранят состояние и **одноразовые**: дерево собирается на одно выполнение и повторно не выполняется. Второй перебор молча отдаёт пустой поток.
 
@@ -528,6 +726,8 @@ HashNestJoinIterator domains (id ← certificate_id)
 $flow = (new ExecutorBuilder($pdo))->build($plan, new ResourceRegistry());
 echo json_encode($flow->explain(), JSON_PRETTY_PRINT);
 ```
+
+Полный вывод для запроса примера — в [Пример: `example/query-plan.php`](#пример-examplequery-planphp).
 
 ### 6. Документ
 
