@@ -12,6 +12,8 @@ use sad_spirit\pg_builder\enums\JoinType;
 use sad_spirit\pg_builder\enums\LogicalOperator;
 use sad_spirit\pg_builder\enums\OrderByDirection;
 use sad_spirit\pg_builder\nodes\ColumnReference;
+use sad_spirit\pg_builder\nodes\CommonTableExpression;
+use sad_spirit\pg_builder\nodes\expressions\InExpression;
 use sad_spirit\pg_builder\nodes\expressions\IsExpression;
 use sad_spirit\pg_builder\nodes\expressions\LogicalExpression;
 use sad_spirit\pg_builder\nodes\expressions\NamedParameter;
@@ -19,8 +21,10 @@ use sad_spirit\pg_builder\nodes\expressions\OperatorExpression;
 use sad_spirit\pg_builder\nodes\Identifier;
 use sad_spirit\pg_builder\nodes\lists\TargetList;
 use sad_spirit\pg_builder\nodes\OrderByElement;
+use sad_spirit\pg_builder\nodes\QualifiedName;
 use sad_spirit\pg_builder\nodes\range\FromElement;
 use sad_spirit\pg_builder\nodes\range\JoinExpression;
+use sad_spirit\pg_builder\nodes\range\RelationReference;
 use sad_spirit\pg_builder\nodes\ScalarExpression;
 use sad_spirit\pg_builder\nodes\TargetElement;
 use sad_spirit\pg_builder\Select;
@@ -44,7 +48,8 @@ use sad_spirit\pg_builder\Select;
  * класс вместо двух, поэтому Select\HashToMergeRule, Select\BuildSqlPass и Select\QueryPlanPrinter знают одного
  * владельца. Запрос владелец собирает сам из своего поддерева (withSelect()): FROM — свёртка узлов под ним
  * (ResourceNode → модель ресурса, SharedRowJoinNode → LEFT JOIN по relation, ветка внутри строки → её outer),
- * список колонок — нужные колонки каждого ресурса строки.
+ * список колонок — нужные колонки каждого ресурса строки; условия родительских запросов — цепочкой предков
+ * (WITH p1, p2, … и IN, см. withSelect()).
  *
  * Имя «Shared» историческое: при одном ресурсе строка ни с кем не делится. При выполнении такой владелец
  * не нуждается в SharedDataIterator — это решение сборщика дерева итераторов, а не плана.
@@ -60,6 +65,12 @@ use sad_spirit\pg_builder\Select;
  * }
  * @psalm-type RowColumns = list<RowResource>
  * @psalm-type QueryParameters = array<string, int|float|string|bool>
+ * @psalm-type Ancestor = array{
+ *     node: SharedScanNode,
+ *     resource: ResourceNode,
+ *     key: string,
+ *     column: string,
+ * }
  */
 final class SharedScanNode
 {
@@ -154,30 +165,56 @@ final class SharedScanNode
      *  - первичный ключ владельца последним, если его ещё нет: порядок однозначен, и строки с одинаковым
      *    ключом не меняются местами от запуска к запуску.
      *
-     * Пока не собирается: цепочка предков (CTE + IN, см. README «Цепочка предков»).
+     * Цепочка предков ($ancestors) — условия родительских запросов вместо списка их ключей. Каждый предок —
+     * запрос родителя по соединению не 1-1 (HashNestJoinNode, MergeNestJoinNode, HashJoinNode; не PreloadNode)
+     * и становится CTE p1, p2, … (p1 — ближайший):
+     *  - тело CTE — FROM строки предка как есть (все её 1-1 ресурсы через LEFT JOIN, ничего не отбрасывается) и
+     *    WHERE строки предка целиком (фильтры владельца и группы 1-1 ресурсов), без ORDER BY; в списке колонок
+     *    только ключ связи key — колонка модели ресурса resource строки предка (владельца строки или 1-1 ресурса),
+     *    выводится под своим именем;
+     *  - предки предка — тоже его условие: тело p{n} получает WHERE <его владелец>.<column предка n+1>
+     *    IN (select <key предка n+1> from p{n+1}); список WITH плоский, от дальнего к ближнему (pn, …, p1):
+     *    CTE ссылается только на объявленные раньше;
+     *  - сам запрос получает WHERE t0.<column ближайшего предка> IN (select <key> from p1) — полусоединение:
+     *    без ограничения числа родителей, строки не размножаются, уникальность ключа не важна;
+     *  - алиасы внутри каждого CTE снова с t0 (своя область видимости); параметры фильтров предка — с префиксом
+     *    CTE (:p1_t0_status_0) и попадают в parameters этого запроса.
+     * Так база отдаёт только детей тех родителей, что попадут в ответ: условие совпадает с родительским точно.
+     * CTE ставится всегда, даже если WHERE предка пуст: таблица сущности может быть view со своими условиями
+     * (например, по активному пользователю) или таблицей под RLS, и какие строки родителя видны, знает только
+     * запрос предка. Без CTE ребёнок прочитал бы детей невидимых родителей — это и лишние строки, и обход
+     * ограничений доступа на дочерних таблицах. Не убирать как «лишний» (решение пользователя).
      *
-     * @param list<string> $keys колонки модели ресурса-владельца, нужные веткам над строкой (их relation[0])
-     *                           и соединению, в inner которого стоит этот запрос (relation[1])
-     * @throws \LogicException если внутри строки встретился другой владелец, колонки нет в модели ресурса
-     *                         или фильтр с неподдержанным оператором
+     * @param list<string>   $keys      колонки модели ресурса-владельца, нужные веткам над строкой (их relation[0])
+     *                                  и соединению, в inner которого стоит этот запрос (relation[1])
+     * @param list<Ancestor> $ancestors цепочка предков от ближайшего: запрос родителя (node, до шага sql или после —
+     *                                  нужны только его строка и фильтры), ресурс его строки с ключом связи
+     *                                  (resource — тот же объект ResourceNode, что в строке), ключ (key, relation[0])
+     *                                  и колонка ребёнка (column, relation[1]) — у владельца строки запроса
+     *                                  на уровень ниже (у этого запроса для ближайшего предка)
+     * @throws \LogicException если внутри строки встретился другой владелец, колонки нет в модели ресурса,
+     *                         фильтр с неподдержанным оператором или ресурса предка нет в его строке
      */
-    public function withSelect(array $keys = []): static
+    public function withSelect(array $keys = [], array $ancestors = []): static
     {
-        // Ресурсы строки и нужные им колонки — в порядке обхода, номер ресурса — номер его алиаса
-        $resources = [];
-        $needed = [];
-        $joinKeys = [];
-        $this->gather(node: $this->input, keys: $keys, resources: $resources, needed: $needed, joinKeys: $joinKeys);
+        // Сначала CTE: параметры нумеруются в порядке текста запроса (WITH раньше основного запроса)
+        $parameters = [];
+        $with = self::ancestry(ancestors: $ancestors, parameters: $parameters);
+
+        [$resources, $selected, $needed, $joinKeys, $conditions] = $this->row(
+            keys: $keys,
+            fields: true,
+            prefix: '',
+            parameters: $parameters,
+        );
 
         $targets = [];
         $columns = [];
-        $conditions = [];
-        $parameters = [];
         foreach ($resources as $index => $resource) {
             $alias = 't' . $index;
             $tree = ModelTree::of($resource->resource);
             $map = [];
-            foreach (array_keys($needed[$index]) as $column) {
+            foreach (array_keys($selected[$index]) as $column) {
                 $map[$column] = "{$alias}_{$column}";
                 // Вызовы pg_builder — позиционные: имена параметров библиотеки не становятся частью нашего кода
                 $targets[] = new TargetElement($tree->expression($column, $alias), new Identifier($map[$column]));
@@ -189,31 +226,21 @@ final class SharedScanNode
                 'fields' => $resource->fields,
                 'keys' => $joinKeys[$index],
             ];
+        }
 
-            // FROM нужны и колонки, которые не выводятся: фильтров ресурса и (у владельца) ORDER BY
-            foreach ($resource->filters as $filter) {
-                $needed[$index][$resource->resource::filterColumn($filter['attribute'])] = true;
-            }
-            if ($index === 0) {
-                foreach ($this->orderColumns() as $column => $direction) {
-                    $needed[$index][$column] = true;
-                }
-            }
-
-            $condition = $this->condition(resource: $resource, alias: $alias, parameters: $parameters);
-            if ($condition !== null) {
-                // 1-1 ресурс — в строке через LEFT JOIN: строку без него фильтр не трогает
-                $conditions[] = $index === 0 ? $condition : new LogicalExpression(
-                    [
-                        new IsExpression($tree->expression($resource->resource::primaryColumn(), $alias), IsPredicate::NULL),
-                        $condition,
-                    ],
-                    LogicalOperator::OR,
-                );
-            }
+        // FROM нужны колонки ORDER BY владельца и колонка связи с ближайшим предком
+        foreach ($this->orderColumns() as $column => $direction) {
+            $needed[0][$column] = true;
+        }
+        if ($ancestors !== []) {
+            $needed[0][$ancestors[0]['column']] = true;
+            $conditions[] = $this->semiJoin(column: $ancestors[0]['column'], key: $ancestors[0]['key'], cte: 'p1');
         }
 
         $select = new Select(new TargetList($targets));
+        foreach ($with as $cte) {
+            $select->with[] = $cte;
+        }
         $index = 0;
         $select->from[] = $this->from(node: $this->input, needed: $needed, index: $index)[0];
         foreach ($conditions as $condition) {
@@ -225,13 +252,155 @@ final class SharedScanNode
     }
 
     /**
+     * CTE цепочки предков (см. withSelect()) в порядке WITH: от дальнего предка (pn) к ближнему (p1).
+     *
+     * @param list<Ancestor>                       $ancestors  цепочка от ближайшего
+     * @param array<string, int|float|string|bool> $parameters по ссылке: параметры запроса, сюда добавляются
+     *                                                         значения фильтров предков
+     * @return list<CommonTableExpression>
+     * @throws \LogicException см. ancestorSelect()
+     */
+    private static function ancestry(array $ancestors, array &$parameters): array
+    {
+        $with = [];
+        for ($level = \count($ancestors) - 1; $level >= 0; $level--) {
+            $ancestor = $ancestors[$level];
+            $name = 'p' . ($level + 1);
+            $body = $ancestor['node']->ancestorSelect(
+                resource: $ancestor['resource'],
+                key: $ancestor['key'],
+                parent: $ancestors[$level + 1] ?? null,
+                parentCte: 'p' . ($level + 2),
+                prefix: $name . '_',
+                parameters: $parameters,
+            );
+            $with[] = new CommonTableExpression($body, new Identifier($name));
+        }
+
+        return $with;
+    }
+
+    /**
+     * Тело CTE предка: строка этого запроса как есть, её WHERE и связь с её собственным предком; в списке колонок —
+     * только ключ связи (см. withSelect()).
+     *
+     * @param ResourceNode                         $resource   ресурс строки, которому принадлежит ключ
+     * @param string                               $key        колонка модели этого ресурса — ключ связи с ребёнком
+     * @param Ancestor|null                        $parent     предок этого запроса или null, если его нет
+     * @param string                               $parentCte  имя CTE предка этого запроса
+     * @param string                               $prefix     префикс имён параметров (p1_)
+     * @param array<string, int|float|string|bool> $parameters по ссылке: параметры запроса, в котором стоит CTE
+     * @throws \LogicException если ресурса нет в строке, колонки нет в модели или оператор фильтра не поддержан
+     */
+    private function ancestorSelect(
+        ResourceNode $resource,
+        string $key,
+        ?array $parent,
+        string $parentCte,
+        string $prefix,
+        array &$parameters,
+    ): Select {
+        [$resources, , $needed, , $conditions] = $this->row(keys: [], fields: false, prefix: $prefix, parameters: $parameters);
+
+        $index = array_search($resource, $resources, true);
+        if (!\is_int($index)) {
+            throw new \LogicException(message: 'Ancestor key resource ' . $resource->resource . ' is not in the row of ' . $this->rowOwner()->resource);
+        }
+        $needed[$index][$key] = true;
+        if ($parent !== null) {
+            $needed[0][$parent['column']] = true;
+            $conditions[] = $this->semiJoin(column: $parent['column'], key: $parent['key'], cte: $parentCte);
+        }
+
+        $select = new Select(new TargetList([
+            new TargetElement(ModelTree::of($resource->resource)->expression($key, 't' . $index), new Identifier($key)),
+        ]));
+        $from = 0;
+        /** @var list<array<string, true>> $needed */
+        $select->from[] = $this->from(node: $this->input, needed: $needed, index: $from)[0];
+        foreach ($conditions as $condition) {
+            $select->where->and($condition);
+        }
+
+        return $select;
+    }
+
+    /**
+     * Полусоединение с предком: t0.<column> IN (select <key> from <cte>).
+     *
+     * @param string $column колонка модели ресурса-владельца строки (relation[1])
+     * @param string $key    колонка, которую выводит CTE предка (relation[0])
+     * @param string $cte    имя CTE предка
+     */
+    private function semiJoin(string $column, string $key, string $cte): InExpression
+    {
+        $subquery = new Select(new TargetList([new TargetElement(new ColumnReference($key))]));
+        $subquery->from[] = new RelationReference(new QualifiedName($cte));
+
+        return new InExpression(ModelTree::of($this->rowOwner()->resource)->expression($column, 't0'), $subquery);
+    }
+
+    /**
+     * Строка запроса: ресурсы слева направо, их колонки и WHERE из фильтров (см. withSelect()). Общая часть
+     * запроса владельца и тела CTE, в котором этот запрос — предок.
+     *
+     * @param list<string>                         $keys       ключи для ресурса-владельца
+     * @param bool                                 $fields     нужны ли колонки атрибутов fields (в CTE — нет)
+     * @param string                               $prefix     префикс имён параметров ('' или p1_)
+     * @param array<string, int|float|string|bool> $parameters по ссылке: параметры запроса
+     * @return array{list<ResourceNode>, list<array<string, true>>, list<array<string, true>>, list<list<string>>, list<ScalarExpression>}
+     *         ресурсы; колонки списка каждого ресурса; колонки FROM (ещё и колонки фильтров); ключи соединений;
+     *         условия WHERE
+     * @throws \LogicException если внутри строки другой владелец или оператор фильтра не поддержан
+     */
+    private function row(array $keys, bool $fields, string $prefix, array &$parameters): array
+    {
+        // Ресурсы строки и нужные им колонки — в порядке обхода, номер ресурса — номер его алиаса
+        $resources = [];
+        $selected = [];
+        $joinKeys = [];
+        $this->gather(node: $this->input, keys: $keys, fields: $fields, resources: $resources, needed: $selected, joinKeys: $joinKeys);
+
+        $needed = $selected;
+        $conditions = [];
+        foreach ($resources as $index => $resource) {
+            $alias = 't' . $index;
+
+            // FROM нужны и колонки фильтров, которые не выводятся
+            foreach ($resource->filters as $filter) {
+                $needed[$index][$resource->resource::filterColumn($filter['attribute'])] = true;
+            }
+
+            $condition = $this->condition(resource: $resource, alias: $alias, prefix: $prefix, parameters: $parameters);
+            if ($condition !== null) {
+                // 1-1 ресурс — в строке через LEFT JOIN: строку без него фильтр не трогает
+                $conditions[] = $index === 0 ? $condition : new LogicalExpression(
+                    [
+                        new IsExpression(
+                            ModelTree::of($resource->resource)->expression($resource->resource::primaryColumn(), $alias),
+                            IsPredicate::NULL,
+                        ),
+                        $condition,
+                    ],
+                    LogicalOperator::OR,
+                );
+            }
+        }
+
+        // Присваивание по индексу не меняет ключи, но Psalm теряет list
+        /** @var list<array<string, true>> $needed */
+        return [$resources, $selected, $needed, $joinKeys, $conditions];
+    }
+
+    /**
      * Фильтры одного ресурса строки через AND (см. withSelect()); null — фильтров нет.
      *
+     * @param string                               $prefix     префикс имён параметров ('' или p1_ в CTE предка)
      * @param array<string, int|float|string|bool> $parameters по ссылке: параметры запроса, сюда добавляются
      *                                                         значения фильтров ресурса
      * @throws \LogicException если оператор не поддержан
      */
-    private function condition(ResourceNode $resource, string $alias, array &$parameters): ?ScalarExpression
+    private function condition(ResourceNode $resource, string $alias, string $prefix, array &$parameters): ?ScalarExpression
     {
         $class = $resource->resource;
         $tree = ModelTree::of($class);
@@ -249,7 +418,7 @@ final class SharedScanNode
                 // TODO: список значений; через PDO массив одним параметром не передать
                 Operator::In => throw new \LogicException("{$class}: filter operator in is not supported yet"),
             };
-            $name = "{$alias}_{$column}_" . \count($parameters);
+            $name = "{$prefix}{$alias}_{$column}_" . \count($parameters);
             $parameters[$name] = self::parameter(value: $filter['value'], type: $class::attributeType($filter['attribute']));
             $terms[] = new OperatorExpression($sql, $tree->expression($column, $alias), new NamedParameter($name));
         }
@@ -370,6 +539,7 @@ final class SharedScanNode
      *
      * @param ResourceNode|SharedScanNode|JoinNode $node      узел внутри строки
      * @param list<string>                         $keys      ключи для самого левого ресурса узла
+     * @param bool                                 $fields    нужны ли колонки атрибутов fields
      * @param list<ResourceNode>                   $resources по ссылке: ресурсы строки
      * @param list<array<string, true>>            $needed    по ссылке: колонки модели каждого ресурса (ключи,
      *                                                        в порядке добавления)
@@ -380,6 +550,7 @@ final class SharedScanNode
     private function gather(
         ResourceNode|SharedScanNode|JoinNode $node,
         array $keys,
+        bool $fields,
         array &$resources,
         array &$needed,
         array &$joinKeys,
@@ -388,7 +559,7 @@ final class SharedScanNode
         if ($node instanceof ResourceNode) {
             $resource = $node->resource;
             $columns = [$resource::primaryColumn()];
-            foreach ($node->fields as $name) {
+            foreach ($fields ? $node->fields : [] as $name) {
                 array_push($columns, ...$resource::attributeColumns($name));
             }
 
@@ -407,6 +578,7 @@ final class SharedScanNode
         $parent = $this->gather(
             node: $node->outer,
             keys: [...$keys, $parentColumn],
+            fields: $fields,
             resources: $resources,
             needed: $needed,
             joinKeys: $joinKeys,
@@ -414,7 +586,7 @@ final class SharedScanNode
 
         // inner SharedRowJoinNode — ещё та же строка; inner ветки — отдельный запрос со своим владельцем
         if ($node instanceof SharedRowJoinNode) {
-            $this->gather(node: $node->inner, keys: [$childColumn], resources: $resources, needed: $needed, joinKeys: $joinKeys);
+            $this->gather(node: $node->inner, keys: [$childColumn], fields: $fields, resources: $resources, needed: $needed, joinKeys: $joinKeys);
         }
 
         return $parent;

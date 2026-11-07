@@ -23,7 +23,7 @@ PHP-библиотека, реализующая JSON API.
 | Описание данных: сущности и модели, ресурсы | `src/Model/`, `src/Resource*` | готово; схемы endpoint'а пока нет — всё разрешает ресурс |
 | 1. Парсер: запрос → дерево запроса | `src/Parser/` | готово |
 | 2. Планировщик: дерево запроса → узлы плана, шаги | `src/Plan/`, `src/Plan/Select/` | готово |
-| 3. SQL плана (pg_builder) | `Plan\SharedScanNode::withSelect()`, `Plan\Select\BuildSqlPass` | список колонок, FROM/ON, WHERE из фильтров, ORDER BY; нет цепочки предков, оператора `in`, параметров маршрута |
+| 3. SQL плана (pg_builder) | `Plan\SharedScanNode::withSelect()`, `Plan\Select\BuildSqlPass` | список колонок, FROM/ON, WHERE из фильтров, ORDER BY, цепочка предков (CTE + `IN`); нет оператора `in`, параметров маршрута |
 | 4. Сборка дерева итераторов по плану | `src/Executor/ExecutorBuilder.php` | готово |
 | 5. Выполнение (итераторы Volcano), сериализация | `src/Executor/` | готово |
 | 6. Документ JSON:API | `src/Document/` | готово |
@@ -127,7 +127,7 @@ certificate ──provider──► provider         (к одному, внеш�
 
 По запросу клиента и корневому ресурсу endpoint'а библиотека строит план. План — неизменяемое дерево узлов с SQL-запросами. По плану на каждое выполнение собирается дерево итераторов: SQL-запросы и операторы передают друг другу строки и ресурсы, а документ JSON:API получается обходом результата.
 
-Связи «к одному» читаются тем же SQL-запросом, что и их родитель (`LEFT JOIN`): из одной строки строится несколько ресурсов. Связь «ко многим» через `JOIN` дала бы декартово произведение, поэтому она читается отдельным SQL-запросом, а дети привязываются к родителям в PHP по ключу связи. Ключи родителей из запроса в запрос не передаются: дочерний запрос повторяет условия родителя сам (см. [Цепочка предков](#цепочка-предков), пока не реализована).
+Связи «к одному» читаются тем же SQL-запросом, что и их родитель (`LEFT JOIN`): из одной строки строится несколько ресурсов. Связь «ко многим» через `JOIN` дала бы декартово произведение, поэтому она читается отдельным SQL-запросом, а дети привязываются к родителям в PHP по ключу связи. Ключи родителей из запроса в запрос не передаются: дочерний запрос повторяет условия родителя сам (см. [Цепочка предков](#цепочка-предков)).
 
 ```
 GET /certificates?include=…&fields[…]=…&filter[…]=…&sort=…   + корневой ресурс (CertificateResource)
@@ -200,7 +200,7 @@ GET /certificates?include=…&fields[…]=…&filter[…]=…&sort=…   + ко�
 | `order` — `PreloadBelowNestJoinRule` | логическое переписывание | порядок выполнения: справочник (`PreloadNode`) загружается до nest join |
 | `close` — `SharedScanPass` | границы запросов | где кончается один SQL-запрос (`SharedScanNode`) и какой алгоритм 1:N возможен внутри строки (`HashJoinNode`) |
 | `merge` — `HashToMergeRule` | выбор алгоритма | Hash → Merge, где обе стороны можно упорядочить по ключу; порядок у владельца один («интересный порядок», жадно снизу вверх) |
-| `sql` — `BuildSqlPass` | генерация | `Select` (pg_builder), параметры и карта колонок у каждого владельца |
+| `sql` — `BuildSqlPass` | генерация | `Select` (pg_builder), параметры и карта колонок у каждого владельца; условия родителей — цепочкой предков (CTE + `IN`) |
 
 Чего оптимизатор не делает: не оценивает стоимость, не перебирает альтернативные планы, не переставляет соединения сверх `lift`/`order`. Неверное дерево на входе — ошибка кода (`LogicException`): клиентские ошибки отсеял парсер.
 
@@ -471,15 +471,23 @@ order by t0.id
 select t0.id as t0_id, t0."name" as t0_name, t0.website as t0_website, t0.created_at as t0_created_at
 from providers as t0 order by t0.id
 
--- домены: по id — для слияния с логами; certificate_id — ключ связи domains
+-- домены: по id — для слияния с логами; certificate_id — ключ связи domains;
+-- p1 — строка сертификатов как есть (цепочка предков), без фильтров у неё WHERE пуст
+with p1 as (
+    select t0.id as id from certificates as t0
+    left join certificate_details as t1 on t0.id = t1.certificate_id
+    left join certificate_delivery_meta as t2 on t0.id = t2.certificate_id
+)
 select t0.id as t0_id, t0.domain_name as t0_domain_name, t0.is_primary as t0_is_primary,
        t0.created_at as t0_created_at, t0.certificate_id as t0_certificate_id
-from domains as t0 order by t0.id
+from domains as t0 where t0.certificate_id in ( select id from p1 ) order by t0.id
 
--- логи: по domain_id (order), затем по id
+-- логи: по domain_id (order), затем по id; предки — домены (p1) и сертификаты (p2)
+with p2 as ( …та же строка сертификатов… ),
+p1 as ( select t0.id as id from domains as t0 where t0.certificate_id in ( select id from p2 ) )
 select t0.id as t0_id, t0.log_level as t0_log_level, t0.message as t0_message,
        t0.created_at as t0_created_at, t0.domain_id as t0_domain_id
-from domain_logs as t0 order by t0.domain_id, t0.id
+from domain_logs as t0 where t0.domain_id in ( select id from p1 ) order by t0.domain_id, t0.id
 ```
 
 С фильтрами (`include=delivery&fields[certificate]=code,status&fields[delivery]=is_sent&filter[status]=ACTIVE&filter[delivery.is_sent]=true`):
@@ -496,24 +504,38 @@ order by t0.id
 
 #### Цепочка предков
 
-Не реализована: сейчас дочерние запросы не повторяют условия родителя и читают таблицы целиком, а лишние дети отбрасываются при соединении. Решение принято (CTE + `IN`).
-
 Дочерний запрос не получает ключи родителей списком `IN (1, 2, …)`: он повторяет условия всех предков, и база возвращает только детей тех родителей, что попадут в ответ. Условия должны повторяться точно: слабее — лишние строки, сильнее — потерянные дети.
 
 Каждый шаг через соединение не 1-1 (`HashNestJoinNode`, `MergeNestJoinNode`, `HashJoinNode`) — CTE и `IN (подзапрос)`:
 
 - запрос outer становится CTE `p{n}` запроса inner. Outer — поддерево: его запрос — `SharedScanNode`, до которого спускаемся по outer;
-- тело CTE — FROM строки outer (целиком), её WHERE и её собственные предки; в списке колонок только ключ `relation[0]` (из ресурса, которому он принадлежит, — владельца строки или 1-1 ресурса), без `ORDER BY`;
+- тело CTE — FROM строки outer как есть (все её 1-1 ресурсы через `LEFT JOIN`, ничего не отбрасывается), её WHERE целиком (фильтры владельца и группы `(pk IS NULL OR …)` 1-1 ресурсов) и её собственные предки; в списке колонок только ключ `relation[0]` под своим именем (из ресурса, которому он принадлежит, — владельца строки или 1-1 ресурса), без `ORDER BY`;
 - inner получает `WHERE relation[1] IN (select ключ from p{n})` — полусоединение: без ограничения на число родителей, строки не размножаются, уникальность ключа не важна;
-- список `WITH` плоский, имена `p1`, `p2`… по глубине от inner; внутри каждого CTE алиасы снова с `t0` (своя область видимости).
+- список `WITH` плоский, от дальнего предка к ближнему (`pn`, …, `p1`: CTE ссылается только на объявленные раньше), имена `p1`, `p2`… по глубине от inner; внутри каждого CTE алиасы снова с `t0` (своя область видимости);
+- параметры фильтров предка получают префикс CTE (`:p1_t0_status_0`) и лежат в `parameters` дочернего запроса вместе с его собственными;
+- CTE ставится всегда, даже если у предка нет фильтров и его WHERE пуст. Таблица сущности может быть view со своими условиями (например, по активному пользователю) или таблицей под RLS: какие строки родителя видны, знает только запрос родителя. Без CTE дочерний запрос прочитал бы детей невидимых родителей — лишние строки и обход ограничений доступа.
+
+Цепочку собирает `BuildSqlPass`: она идёт сверху вниз, как ключи, — outer получает цепочку соединения как есть, inner — с новым ближайшим предком спереди. Сам запрос строит `SharedScanNode::withSelect($keys, $ancestors)`. Для `include=delivery,domains.logs&filter[status]=ACTIVE&filter[delivery.is_sent]=true` (`php example/certificates.php '<URL>'`) запрос логов:
 
 ```sql
-with p2 as (select t0.id from certificates t0 where t0.status = 'ACTIVE'),
-p1 as (select t0.id from domains t0 where t0.certificate_id in (select id from p2) and t0.is_primary)
-select t0.id as t0_id, … from logs t0 where t0.domain_id in (select id from p1) order by t0.domain_id, t0.id
+with p2 as (
+    select t0.id as id
+    from certificates as t0
+    left join certificate_delivery_meta as t1 on t0.id = t1.certificate_id
+    where t0.status = :p2_t0_status_0 and ( t1.certificate_id is null or t1.is_sent = :p2_t1_is_sent_1 )
+), p1 as (
+    select t0.id as id from domains as t0 where t0.certificate_id in ( select id from p2 )
+)
+select t0.id as t0_id, t0.log_level as t0_log_level, t0.message as t0_message, t0.created_at as t0_created_at, t0.domain_id as t0_domain_id
+from domain_logs as t0
+where t0.domain_id in ( select id from p1 )
+order by t0.domain_id, t0.id
+-- parameters: {"p2_t0_status_0": "ACTIVE", "p2_t1_is_sent_1": true}
 ```
 
-`PreloadNode` (`ManyToOne`) CTE не получает: ресурс по такой связи считается небольшим словарём и читается целиком; в `included` всё равно попадают только те, на кого ссылаются. Отбрасывать ли из тела CTE `LEFT JOIN` 1-1 ресурсов — не решено. Когда цепочка появится, ребёнок без родителя станет ошибкой плана (`LogicException`, код закомментирован в `HashNestJoinIterator`/`MergeNestJoinIterator`).
+У 1:N внутри строки (`HashJoinNode` у 1-1 ресурса) предок — запрос самой строки, а ключ берётся у 1-1 ресурса: `select t1.certificate_id as certificate_id from certificates as t0 left join certificate_delivery_meta as t1 …`.
+
+`PreloadNode` (`ManyToOne`) CTE не получает: ресурс по такой связи считается небольшим словарём и читается целиком; в `included` всё равно попадают только те, на кого ссылаются. `LEFT JOIN` 1-1 ресурсов из тела CTE пока не отбрасываются, даже без фильтров по ним (оптимизация на потом). Ребёнок без родителя — ошибка плана: `HashNestJoinIterator` и `MergeNestJoinIterator` бросают `LogicException`.
 
 ### 4. Сборка исполнителя
 
@@ -654,7 +676,7 @@ echo json_encode($builder->document(plan: $plan));     // новое дерев�
             "fields": ["domain_name", "is_primary", "created_at"],
             "source": {
                 "node": "SqlScanIterator",
-                "sql": "select t0.id as t0_id, t0.domain_name as t0_domain_name, t0.is_primary as t0_is_primary, t0.created_at as t0_created_at, t0.certificate_id as t0_certificate_id from domains as t0 order by t0.id"
+                "sql": "with p1 as ( select t0.id as id from certificates as t0 left join certificate_details as t1 on t0.id = t1.certificate_id left join certificate_delivery_meta as t2 on t0.id = t2.certificate_id ) select t0.id as t0_id, t0.domain_name as t0_domain_name, t0.is_primary as t0_is_primary, t0.created_at as t0_created_at, t0.certificate_id as t0_certificate_id from domains as t0 where t0.certificate_id in ( select id from p1 ) order by t0.id"
             }
         },
         "inner": {
@@ -664,7 +686,7 @@ echo json_encode($builder->document(plan: $plan));     // новое дерев�
             "fields": ["log_level", "message", "created_at"],
             "source": {
                 "node": "SqlScanIterator",
-                "sql": "select t0.id as t0_id, t0.log_level as t0_log_level, t0.message as t0_message, t0.created_at as t0_created_at, t0.domain_id as t0_domain_id from domain_logs as t0 order by t0.domain_id, t0.id"
+                "sql": "with p2 as ( select t0.id as id from certificates as t0 left join certificate_details as t1 on t0.id = t1.certificate_id left join certificate_delivery_meta as t2 on t0.id = t2.certificate_id ), p1 as ( select t0.id as id from domains as t0 where t0.certificate_id in ( select id from p2 ) ) select t0.id as t0_id, t0.log_level as t0_log_level, t0.message as t0_message, t0.created_at as t0_created_at, t0.domain_id as t0_domain_id from domain_logs as t0 where t0.domain_id in ( select id from p1 ) order by t0.domain_id, t0.id"
             }
         }
     }
@@ -676,7 +698,8 @@ echo json_encode($builder->document(plan: $plan));     // новое дерев�
 - `SharedDataIterator` с запросом сертификатов встречается четыре раза — у `SharedScanIterator` (`data`, он сдвигает строку) и у трёх `SerializeIterator` (`t0`, `t1`, `t2`, они читают окно на ту же строку). Это один объект и один SQL-запрос: `explain()` описывает узел у каждого потребителя.
 - `provider` — отдельный запрос под `PreloadIterator`: он только наполняет реестр, в поток корня не попадает.
 - `logs` соединяются слиянием: домены упорядочены по `id`, логи — по `domain_id`; `domains` над ними — хеш-соединение по `id` сертификата.
-- Параметров у запросов нет: в `TREE` нет фильтров. С фильтром у `SqlScanIterator` появляется ключ `parameters`.
+- У запросов доменов и логов есть `with p1 …`: цепочка предков повторяет запрос сертификатов (и доменов — для логов), даже без фильтров — сертификаты могут оказаться view или таблицей под RLS.
+- Параметров у запросов нет: в `TREE` нет фильтров. С фильтром у `SqlScanIterator` появляется ключ `parameters` (у дочерних запросов — и параметры предков, `p1_…`).
 
 ### 5. Выполнение
 
@@ -710,7 +733,7 @@ echo json_encode($builder->document(plan: $plan));     // новое дерев�
 - `HashNestJoinIterator domains`: таблица сертификатов по `id`, домены ищут родителя по `certificate_id`. Каждому сертификату сразу пишется пустая связь `domains: []`, дальше в неё дописываются домены в порядке `inner`.
 - `MergeNestJoinIterator logs`: домены и логи отсортированы по id домена, логи присоединяются за один совместный проход.
 - Соединения только пишут связи и ничего не копируют: связанные ресурсы попадают в ответ через документ (см. [Документ](#6-документ)).
-- Ребёнок без родителя сейчас пропускается. Когда дочерние SQL начнут повторять условия родителя, это станет ошибкой плана.
+- Ребёнок без родителя — `LogicException`: дочерний SQL повторяет условия родителя (цепочка предков), поэтому такой ребёнок — ошибка плана, а не данных. `MergeNestJoinIterator` после конца `outer` дочитывает `inner` до конца, чтобы это проверить.
 
 #### Связь по внешнему ключу
 
@@ -740,7 +763,7 @@ echo json_encode($flow->explain(), JSON_PRETTY_PRINT);
 - `data` — все ресурсы потока корня по порядку;
 - `included` — обход в ширину по связям от `data`: каждый identifier ищется в реестре, найденный ресурс добавляется и обходится дальше (сертификат → домен → лог). Каждый ресурс попадает в документ один раз.
 
-Ресурс, до которого нельзя дойти по связям (ребёнок без родителя), в документ не попадает. Ресурс, который не загружался (провайдер без `include`), остаётся ссылкой в `relationships`.
+Ресурс, до которого нельзя дойти по связям (провайдер справочника, на которого не ссылается ни один сертификат ответа), в документ не попадает. Ресурс, который не загружался (провайдер без `include`), остаётся ссылкой в `relationships`.
 
 Фрагмент ответа (`php example/certificates.php --document`; тот же документ даёт дерево, собранное руками, `php example/document.php`):
 
@@ -1078,7 +1101,7 @@ public static function serialize(array $tuple): ResourceRecord
 ## Открытые вопросы
 
 - **Схема endpoint'а.** Убрана, пока всё не готово: сейчас доступно всё, что объявлено в ресурсах. Вернуть как ограничения поверх ресурсов (какие связи, поля, фильтры открыты в endpoint'е, обязательные связи).
-- **Цепочка предков.** Решение принято (CTE + `IN`, см. [Цепочка предков](#цепочка-предков)), не реализовано; не решено, отбрасывать ли из тела CTE `LEFT JOIN` 1-1 ресурсов.
+- **Цепочка предков: `LEFT JOIN` в теле CTE.** Цепочка реализована (см. [Цепочка предков](#цепочка-предков)); тело CTE переносит FROM строки как есть. Не решено, отбрасывать ли `LEFT JOIN` 1-1 ресурсов без фильтров.
 - **Фильтры.** Оператор `in` в SQL плана (через PDO массив одним параметром не передать); `ne` и `NULL` (`<>` не находит строки с `NULL`, `IS DISTINCT FROM` хуже для индекса).
 - **Параметры маршрута** (`/certificates/1`): парсер их не разбирает, планировщик пока не принимает.
 - **Merge по неквалифицированным колонкам.** `HashToMergeRule` хранит порядок владельца колонкой без ресурса: одинаковый ключ разных таблиц не отличить.

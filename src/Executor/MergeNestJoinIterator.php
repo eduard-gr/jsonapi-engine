@@ -28,12 +28,11 @@ use UnexpectedValueException;
  * с пустой связью data = [] (LEFT JOIN). Ключи задаются именами $outer_key и $inner_key
  * и берутся через ResourceRecord::getKey(), значения бывают только целыми.
  *
- * Связанные без главного — пока молча пропускаются, как и в HashNestJoinIterator; позже это станет
- * исключением LogicException (код уже написан и закомментирован), потому что дочерний SQL
- * обязан повторять условия родителя. Таких случаев два:
+ * Связанный без главного — LogicException, как и в HashNestJoinIterator: дочерний SQL повторяет
+ * условия родителя (цепочка предков, Plan\SharedScanNode::withSelect()). Таких случаев два:
  *  - ключ связанного меньше ключа текущего главного: его главный уже пройден или его нет;
- *  - $outer закончился, а в $inner остались связанные. Пока они не дочитываются; когда проверка
- *    включится, узел будет дочитывать $inner до конца, и его курсор закроется позже.
+ *  - $outer закончился, а в $inner остались связанные. Поэтому после $outer узел дочитывает $inner
+ *    до конца (пустые элементы null ошибкой не считаются), и его курсор закрывается только тогда.
  *
  * Требование: оба потока отсортированы по ключу соединения по возрастанию (ORDER BY в запросах):
  *  - $outer — строго по возрастанию, ключ главного ресурса уникален;
@@ -55,7 +54,7 @@ use UnexpectedValueException;
  *
  * Алгоритм: потоки идут навстречу друг другу, как при слиянии отсортированных списков.
  * Для очередного главного ресурса с ключом K узел читает $inner, пока ключ связанного не больше K:
- * меньше K — связанному нет главного, он пропускается; равно K — присоединяется;
+ * меньше K — связанному нет главного, LogicException; равно K — присоединяется;
  * больше K — относится к следующим главным, чтение $inner останавливается до следующего шага.
  *
  * Чем отличается от HashNestJoinIterator:
@@ -111,6 +110,7 @@ class MergeNestJoinIterator implements JoinIterator
      * @return Generator<int, ResourceRecord>
      * @throws UnexpectedValueException если $outer не строго возрастает по ключу
      *         или $inner убывает по ключу
+     * @throws \LogicException если у связанного ресурса нет главного
      */
     #[\Override]
     public function getIterator(): Generator
@@ -166,10 +166,10 @@ class MergeNestJoinIterator implements JoinIterator
                     );
                 } else {
                     // Ключ меньше текущего главного: главные идут по возрастанию, и главного
-                    // с таким ключом нет. Пока связанный пропускается; позже — ошибка плана
-                    // throw new \LogicException(
-                    //     "Related resource {$related->key()} has no parent with key {$relatedKey} in MergeNestJoinIterator '{$this->name}'"
-                    // );
+                    // с таким ключом нет — ошибка плана
+                    throw new \LogicException(
+                        "Related resource {$related->key()} has no parent with key {$relatedKey} in MergeNestJoinIterator '{$this->name}'"
+                    );
                 }
 
                 $inner->next();
@@ -178,16 +178,16 @@ class MergeNestJoinIterator implements JoinIterator
             yield $record;
         }
 
-        // $outer закончился: оставшимся в $inner связанным заведомо нет главного.
-        // Пока они не дочитываются; позже — ошибка плана (пустые элементы null ошибкой не считаются)
-        // while ($inner->valid()) {
-        //     $related = $inner->current();
-        //     if ($related !== null) {
-        //         throw new \LogicException(
-        //             "Related resource {$related->key()} has no parent: outer stream of MergeNestJoinIterator '{$this->name}' is over"
-        //         );
-        //     }
-        //     $inner->next();
-        // }
+        // $outer закончился: оставшимся в $inner связанным заведомо нет главного — ошибка плана
+        // (пустые элементы null ошибкой не считаются)
+        while ($inner->valid()) {
+            $related = $inner->current();
+            if ($related !== null) {
+                throw new \LogicException(
+                    "Related resource {$related->key()} has no parent: outer stream of MergeNestJoinIterator '{$this->name}' is over"
+                );
+            }
+            $inner->next();
+        }
     }
 }

@@ -52,10 +52,9 @@ use UnexpectedValueException;
  * Семантика LEFT JOIN: главный ресурс без совпадений не пропадает, а остаётся с пустой связью
  * relationships[$name].data = [] — так JSON:API обозначает пустую to-many связь.
  *
- * Связанный ресурс, для которого нет главного, ни к чему не присоединяется: пока он молча
- * пропускается (в реестре он есть, но Document до него по связям не дойдёт). Позже это станет
- * исключением LogicException (код уже написан и закомментирован): дочерний SQL обязан повторять
- * условия родителя, поэтому связанный без главного — ошибка плана, а не данных.
+ * Связанный ресурс, для которого нет главного, — LogicException: дочерний SQL повторяет условия
+ * родителя (цепочка предков, Plan\SharedScanNode::withSelect()), поэтому связанный без главного —
+ * ошибка плана, а не данных. Поток, собранный не планировщиком, обязан соблюдать то же правило.
  *
  * Ключи соединения задаются именами $outer_key и $inner_key, а значения узел берёт
  * через ResourceRecord::getKey() (например, 'id' главного и 'certificate_id' связанного).
@@ -142,6 +141,7 @@ class HashNestJoinIterator implements JoinIterator
     /**
      * @return Generator<int, ResourceRecord>
      * @throws UnexpectedValueException если ключ главного ресурса встретился в $outer дважды
+     * @throws \LogicException если у связанного ресурса нет главного
      */
     #[\Override]
     public function getIterator(): Generator
@@ -156,14 +156,12 @@ class HashNestJoinIterator implements JoinIterator
             $key = $related->getKey($this->inner_key);
             $parent = $table->get($key, null);
 
-            // Нет главного ресурса с таким ключом. Пока связанный ресурс пропускается: в реестре
-            // он есть, но Document до него по связям не дойдёт. Позже — ошибка плана: дочерний SQL
-            // обязан повторять условия родителя
+            // Нет главного ресурса с таким ключом — ошибка плана: дочерний SQL повторяет условия родителя
+            // (цепочка предков), поэтому каждый связанный ресурс обязан найти своего главного
             if ($parent === null) {
-                // throw new \LogicException(
-                //     "Related resource {$related->key()} has no parent with key {$key} in HashNestJoinIterator '{$this->name}'"
-                // );
-                continue;
+                throw new \LogicException(
+                    "Related resource {$related->key()} has no parent with key {$key} in HashNestJoinIterator '{$this->name}'"
+                );
             }
 
             $parent->addRelationship(
