@@ -1,0 +1,33 @@
+{
+    "name": "ggs/jsonapi-engine",
+    "description": "Json API implementation for GoGetSSL",
+    "autoload": {
+        "psr-4": {
+            "Ggs\\JsonApiEngine\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Ggs\\JsonApiEngine\\Test\\": "test/",
+            "Ggs\\JsonApiEngine\\Example\\": "example/"
+        }
+    },
+    "authors": [
+        {
+            "name": "Edaurds Gruberts",
+            "email": "edaurds.gruberts@gmail.com"
+        }
+    ],
+    "require-dev": {
+        "phpunit/phpunit": "^12.5",
+        "vimeo/psalm": "^6.20"
+    },
+    "require": {
+        "php": ">=8.5",
+        "ext-pgsql": "*",
+        "ext-ds": "^2.0",
+        "ext-pdo": "*",
+        "sad_spirit/pg_builder": "^3.3",
+        "sad_spirit/pg_wrapper": "^3.3"
+    }
+}

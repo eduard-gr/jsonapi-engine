@@ -1,0 +1,113 @@
+<?php
+
+namespace Ds;
+
+/**
+ * Psalm знает только ext-ds 1.x: там `Map::values()` возвращает интерфейс `Ds\Sequence`, которого в 2.0 нет
+ * (последовательность — класс `Ds\Seq`, бывший `Ds\Vector`). Заглушка описывает классы 2.0 и только методы,
+ * которые использует код.
+ *
+ * @template TValue
+ * @implements \IteratorAggregate<int, TValue>
+ * @implements \ArrayAccess<int, TValue>
+ */
+final class Seq implements \IteratorAggregate, \Countable, \JsonSerializable, \ArrayAccess
+{
+    /**
+     * @param iterable<TValue> $values
+     */
+    public function __construct(iterable $values = []) {}
+
+    /**
+     * @param TValue ...$values
+     */
+    public function push(...$values): void {}
+
+    public function isEmpty(): bool {}
+
+    public function count(): int {}
+
+    /**
+     * @return \Traversable<int, TValue>
+     */
+    public function getIterator(): \Traversable {}
+}
+
+/**
+ * @template TKey
+ * @template TValue
+ * @implements \IteratorAggregate<TKey, TValue>
+ * @implements \ArrayAccess<TKey, TValue>
+ */
+final class Map implements \IteratorAggregate, \Countable, \JsonSerializable, \ArrayAccess
+{
+    /**
+     * @param iterable<TKey, TValue> $values
+     */
+    public function __construct(iterable $values = []) {}
+
+    /**
+     * @template TDefault
+     * @param TKey $key
+     * @param TDefault $default
+     * @return TValue|TDefault
+     */
+    public function get($key, $default = null) {}
+
+    /**
+     * @param TKey $key
+     * @param TValue $value
+     */
+    public function put($key, $value): void {}
+
+    /**
+     * @param TKey $key
+     */
+    public function hasKey($key): bool {}
+
+    /**
+     * @return Seq<TValue>
+     */
+    public function values(): Seq {}
+
+    public function isEmpty(): bool {}
+
+    public function count(): int {}
+
+    /**
+     * @return \Traversable<TKey, TValue>
+     */
+    public function getIterator(): \Traversable {}
+}
+
+/**
+ * @template TValue
+ * @implements \IteratorAggregate<int, TValue>
+ * @implements \ArrayAccess<int, TValue>
+ */
+final class Set implements \IteratorAggregate, \Countable, \JsonSerializable, \ArrayAccess
+{
+    /**
+     * @param iterable<TValue> $values
+     */
+    public function __construct(iterable $values = []) {}
+
+    /**
+     * @param TValue ...$values
+     */
+    public function add(...$values): void {}
+
+    /**
+     * @param TValue ...$values
+     */
+    public function contains(...$values): bool {}
+
+    public function isEmpty(): bool {}
+
+    public function count(): int {}
+
+    /**
+     * @return \Traversable<int, TValue>
+     */
+    public function getIterator(): \Traversable {}
+}

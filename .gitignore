@@ -1,0 +1,10 @@
+.claude
+.mcp.json
+.phpunit.cache
+
+### Composer ###
+composer.phar
+/vendor/
+
+/.idea/
+CLAUDE.md
