@@ -11,8 +11,8 @@ namespace Ggs\JsonApiEngine\Executor;
  * ответ на `POST` строится SELECT-конвейером — пока не реализовано).
  *
  * `$link` — колонки связи, общие для всех корней: значение из маршрута вложенного ресурса. `POST /certificates/1/domains`
- * создаёт домены сертификата 1: вызывающий берёт связь родителя (`CertificateResource::DOMAINS`, `relation`
- * `[id, certificate_id]`) и передаёт `['certificate_id' => 1]`. Так домену не нужна своя связь `certificate`
+ * создаёт домены сертификата 1: `InsertPlanner::routeLink()` берёт связь родителя (`CertificateResource::DOMAINS`,
+ * `relation` `[id, certificate_id]`) и даёт `['certificate_id' => 1]`; передаёт его `WriterBuilder::document()`. Так домену не нужна своя связь `certificate`
  * в ресурсе (она изменила бы вывод SELECT). Существование родителя узел не проверяет: несуществующий `id` — ошибка
  * внешнего ключа в базе. Совпадает ли `$link` с чем-то в документе, тоже не проверяет: лист берёт значения `$link`
  * поверх строки.

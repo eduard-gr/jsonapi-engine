@@ -16,7 +16,8 @@ namespace Ggs\JsonApiEngine\Executor;
  * Дерево вставки — два уровня (как SharedRowJoin и HashNestJoin в SELECT): над `InsertResourceWriter` по дереву идут
  * ресурсы (ExecutorWriter: `InsertJoinWriter` раздаёт детей по связи), под ним — строки «колонка модели → значение»
  * (TableWriter: `InsertTableJoinWriter` делит строку по таблицам модели, `InsertTableWriter` пишет одну таблицу).
- * Корень — `InsertDocument`: отправляет в дерево каждый корень документа.
+ * Корень — `InsertDocument`: отправляет в дерево каждый корень документа. По плану (`Plan\Insert\InsertPlanner`)
+ * дерево строит `WriterBuilder`.
  *
  * Общего контекста нет: ключи возвращаются из `push()` и уходят детям колонкой связи (`$link`). Узлы без состояния
  * между вызовами (кроме PDO), но дерево строится на одно выполнение, как и дерево итераторов.

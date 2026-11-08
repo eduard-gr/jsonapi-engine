@@ -9,7 +9,7 @@ PHP-библиотека, реализующая JSON API.
 | Операция | Статус         |
 |----------|----------------|
 | `select` | В разработке   |
-| `insert` | Прототип в `src/`: исполнитель и парсер документа, без планировщика |
+| `insert` | В разработке: парсер документа, планировщик, исполнитель; нет ответа и точки входа |
 | `update` | Запланировано  |
 
 Основная разработка — `select`; `insert` перенесён из прототипа (см. [Вставка](#вставка-insert)).
@@ -28,7 +28,7 @@ PHP-библиотека, реализующая JSON API.
 | 5. Выполнение (итераторы Volcano), сериализация | `src/Executor/` | готово |
 | 6. Документ JSON:API | `src/Document/` | готово |
 | Точка входа библиотеки, транзакция, пагинация | — | нет; весь путь собирает контроллер примера `example/Controller/CertificatesController` |
-| Вставка: документ → дерево новых ресурсов → дерево вставки | `Parser\DocumentParser`, `Executor\…Writer`, `Executor\TableTreeBuilder`, `Resource\Insertable` | парсер документа и исполнитель готовы; дерево уровня ресурсов собирается руками (нет планировщика), нет ответа и контроллера `POST` |
+| Вставка: документ → дерево новых ресурсов → план → дерево вставки | `Parser\DocumentParser`, `Plan\Insert\`, `Executor\WriterBuilder`, `Executor\…Writer`, `Resource\Insertable` | парсер документа, планировщик и исполнитель готовы; нет ответа и контроллера `POST` |
 
 Проверено на SQLite и PDO (`example/db`): документ по плану для запроса примера совпадает с эталоном `test/Fixture/document.json`. Целевая СУБД — PostgreSQL; против неё пока ничего не проверяется.
 
@@ -820,7 +820,15 @@ echo json_encode($flow->explain(), JSON_PRETTY_PRINT);
 
 ## Вставка (`insert`)
 
-Путь: тело `POST` (документ JSON:API) → `Parser\DocumentParser` → вложенное дерево новых ресурсов → дерево вставки (push) → строки в таблицах. Пример — `example/insert-document.php`, тесты — `test/Parser/DocumentParserTest.php`, `test/Executor/InsertWriterTest.php`.
+Путь: тело `POST` (документ JSON:API) → `Parser\DocumentParser` → вложенное дерево новых ресурсов → `Plan\Insert\InsertPlanner` (план) → `Executor\WriterBuilder` → дерево вставки (push) → строки в таблицах. Примеры — `example/insert-plan.php` (через планировщик) и `example/insert-document.php` (то же дерево руками), тесты — `test/Parser/DocumentParserTest.php`, `test/Plan/InsertPlannerTest.php`, `test/Executor/InsertWriterTest.php`.
+
+```php
+$roots = (new DocumentParser())->parse(document: $body, resource: CertificateResource::class);   // 400
+$plan = (new InsertPlanner())->plan(resource: CertificateResource::class, roots: $roots);
+$pdo->beginTransaction();
+$keys = (new WriterBuilder(pdo: $pdo))->document(plan: $plan, roots: $roots)->execute();       // ключи корней
+$pdo->commit();
+```
 
 **Что можно создавать — решает ресурс.** Маркерный интерфейс `Resource\Insertable` (потом `Updatable`, `Deletable`; чтение — свойство любого ресурса). Без него ресурс нельзя создать ни корнем, ни новым ребёнком, но сослаться на существующую запись `{type, id}` можно (`provider` у сертификата). У сущностей таких флагов нет; запрет писать колонку — `mode` READ атрибута. Ограничения точки входа или роли — будущая схема.
 
@@ -842,11 +850,17 @@ echo json_encode($flow->explain(), JSON_PRETTY_PRINT);
 
 - уровень ресурсов (`ExecutorWriter`): `InsertJoinWriter(name, relation, first, then)` вставляет владельца связи (`first`), берёт новых детей из `relationships[name]` и отправляет их в `then` с колонкой связи из ключей владельца; связи одного владельца — левый глубокий список, как в SELECT;
 - граница — `InsertResourceWriter`: ресурс → строка «колонка модели → значение» (атрибуты, внешние ключи) → поддерево таблиц;
-- уровень таблиц (`TableWriter`), строит `TableTreeBuilder` из `model()`: `InsertTableJoinWriter` делит строку между таблицами модели (сторона с первичным ключом первой — по `PRIMARY`/`references` сущностей; правая сторона `LeftJoin` пропускается, если её колонок нет в строке), `InsertTableWriter` — `INSERT … RETURNING` в одну таблицу (SQL через pg_builder, запрос — в `error_log()`).
+- уровень таблиц (`TableWriter`), по модели ресурса (`model()`): `InsertTableJoinWriter` делит строку между таблицами модели (сторона с первичным ключом первой — по `PRIMARY`/`references` сущностей; правая сторона `LeftJoin` пропускается, если её колонок нет в строке), `InsertTableWriter` — `INSERT … RETURNING` в одну таблицу (SQL через pg_builder, запрос — в `error_log()`).
 
 Ключи возвращаются из `push()` наверх, общего контекста нет. `InsertDocument` отправляет в дерево каждый корень и возвращает их ключи; транзакцию открывает вызывающий.
 
-**Вложенный маршрут.** Ресурс к существующему родителю создаётся по маршруту, а не по связи в документе: `POST /certificates/1/domains` — `InsertDocument(root, roots, link: ['certificate_id' => 1])`, где колонка — `relation[1]` связи родителя (`CertificateResource::DOMAINS`). Своя связь `certificate` у `DomainResource` не нужна (она попала бы в `fields` по умолчанию и изменила бы документ SELECT).
+**Планировщик** (`Plan\Insert\InsertPlanner::plan(resource, roots)`) строит план по форме документа, как план SELECT — по дереву запроса: в него попадают только связи, встреченные у ресурсов места хотя бы раз (объединение по всем корням и детям); план — неизменяемые узлы `InsertJoinNode`, `InsertResourceNode`, `InsertTableJoinNode`, `InsertTableNode` (исполнитель — тот же стебель с `…Writer`, собирает `WriterBuilder`). Правила порядка:
+
+- в дерево идут связи с первичным ключом на стороне владельца (`OneToMany`, обратная `OneToOne`): владелец — `first`, дети — `then`; связь по внешнему ключу ресурса пишет сама строка ресурса;
+- связи одного владельца — левый глубокий список в **порядке объявления** в `relationships()`: зависимую связь объявляют позже (`delivery` после `detail`, потому что `certificate_delivery_meta` ссылается на `certificate_details`; сущности такую ссылку не описывают);
+- внутри модели — по `PRIMARY`/`references` сущностей (`InsertPlanner::tables()`; для дерева, собранного руками, — `Executor\TableTreeBuilder`).
+
+**Вложенный маршрут.** Ресурс к существующему родителю создаётся по маршруту, а не по связи в документе: `POST /certificates/1/domains` — `InsertPlanner::routeLink(CertificateResource::class, 'domains', 1)` даёт `['certificate_id' => 1]` (`relation[1]` связи родителя), его получает `WriterBuilder::document(plan, roots, link)`; параметр — значение, а не форма плана. Своя связь `certificate` у `DomainResource` не нужна (она попала бы в `fields` по умолчанию и изменила бы документ SELECT).
 
 ```
 InsertJoinWriter domains [id, certificate_id]
@@ -1149,11 +1163,11 @@ public static function serialize(array $tuple): ResourceRecord
 - **Merge по неквалифицированным колонкам.** `HashToMergeRule` хранит порядок владельца колонкой без ресурса: одинаковый ключ разных таблиц не отличить.
 - **Обратная сторона связи.** `certificate.domains` и `domain.certificate` — стороны одного внешнего ключа; выводить одну из другой или из `FOREIGN` сущностей?
 - **Тип и `nullable` атрибута из сущности.** Атрибут повторяет `type` и `nullable` колонки; выводить или проверять совпадение в `validate()`?
-- **Вставка: планировщик.** Дерево уровня ресурсов собирается руками. Планировщику нужно выбирать сторону с первичным ключом и порядок соседних связей по `references` сущностей (`certificate_delivery_meta` ссылается на `certificate_details`, поэтому `detail` раньше `delivery`).
+- **Вставка: порядок соседних связей.** Сейчас — порядок объявления в `relationships()`. Ссылка `certificate_delivery_meta` → `certificate_details` в сущностях не описана (колонка-первичный ключ не несёт `references`), поэтому не проверяется: разрешить `references` у `PRIMARY` и сортировать соседей топологически? Та же ссылка делает `delivery` без `detail` невставляемым, а отказывает только база.
 - **Вставка: ответ и точка входа.** Ответ на `POST` (созданные ресурсы через SELECT-конвейер по ключам корней), контроллер, транзакция.
 - **Вставка: подготовленные запросы.** `InsertTableWriter` готовит запрос на каждую строку: набор колонок зависит от строки, а `DEFAULT` нельзя передать параметром. Кеш по набору колонок; многострочный `INSERT` с `DEFAULT` в `VALUES` на PostgreSQL.
 - **Вставка: ресурс с двумя родителями.** Ссылка по `lid` на ресурс из другой ветки дерева запрещена.
-- **Вставка: параметры маршрута.** `POST /certificates/1/domains` работает через `InsertDocument::$link`, который сейчас считает вызывающий код (id из URL → `relation[1]` связи родителя). Разбор маршрута и проверка существования родителя (сейчас — ошибка внешнего ключа в базе) не сделаны.
+- **Вставка: параметры маршрута.** `POST /certificates/1/domains` работает через `InsertPlanner::routeLink()`; разбор маршрута и проверка существования родителя (сейчас — ошибка внешнего ключа в базе) не сделаны.
 - **Обратные связи без `include`.** Связь, у которой ключ на другой стороне (`certificate.domains`), без `include` не известна: не отдавать её или отдавать без `data`?
 
 ## Использование
@@ -1194,7 +1208,8 @@ php example/certificates.php [URL] [--document]    # CertificatesController: п�
 php example/query-plan.php [--steps|--sql|--explain]  # дерево запроса из кода (без парсера) → план → документ; --steps — план после каждого шага
 php example/query-tree.php                         # дерево запроса для include=provider,detail,delivery,domains.logs
 php example/query-tree.php '/certificates?include=domains.logs&fields[certificate]=code'
-php example/insert-document.php                    # вставка: документ → дерево вставки (explain, ключи), SQL в stderr; транзакция откатывается
+php example/insert-plan.php                        # вставка через планировщик: документ → план → дерево вставки, ключи; SQL в stderr; транзакция откатывается
+php example/insert-document.php                    # то же дерево вставки, собранное руками
 php example/db/seed.php [количество сертификатов]  # пересоздать базу примера
 ```
 
@@ -1208,5 +1223,6 @@ php example/db/seed.php [количество сертификатов]  # пе�
 | `test/Plan/SelectWhereTest.php` | `WHERE` плана: фильтры владельца и 1-1 ресурса (`IS NULL OR`), именованные параметры, выполнение на SQLite примера; колонки фильтра и сортировки держат таблицы модели в FROM. |
 | `test/Executor/SerializeIteratorTest.php` | Сериализация по плану: ресурсы из запросов плана примера на SQLite совпадают с эталоном по атрибутам и связи `provider`; составной атрибут, приведение типов, связь по внешнему ключу, ключи, `null` у пустого `LEFT JOIN`. |
 | `test/Parser/DocumentParserTest.php` | Парсер документа вставки: дерево из `data` + `included`, порядок корней, ошибки клиента с указателем. |
+| `test/Plan/InsertPlannerTest.php` | Планировщик вставки: дерево по плану совпадает с собранным руками, только связи из документа, объединение по корням, модель из двух таблиц, `routeLink()`, выполнение плана с колонкой маршрута. |
 | `test/Executor/InsertWriterTest.php` | Дерево вставки на SQLite примера (транзакция с откатом): ключ владельца у связанных ресурсов, модель из двух таблиц и пропуск пустой LEFT-стороны, колонка связи из вложенного маршрута, `TableTreeBuilder`, ресурс без `Insertable`. |
 | `test/DocumentTreeTest.php` | Дерево из `document.php` с константами ресурсов: документ совпадает с эталоном `test/Fixture/document.json`, каждый ресурс встречается один раз, связь по внешнему ключу без и с `include`, пустая доставка, топология `explain()`. |

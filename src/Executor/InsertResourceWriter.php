@@ -10,7 +10,7 @@ use LogicException;
 
 /**
  * Граница уровней дерева вставки: ресурс JSON:API → строка «колонка модели → значение» → поддерево таблиц (`input`,
- * обычно из `TableTreeBuilder::build()`). Зеркало SerializeIterator: тот собирает ресурс из строки, этот — строку
+ * обычно из `WriterBuilder` по плану `InsertPlanner`). Зеркало SerializeIterator: тот собирает ресурс из строки, этот — строку
  * из ресурса.
  *
  * Поток: ресурс из дерева `DocumentParser` + колонки связи → строка: атрибуты из `attributes` (по
