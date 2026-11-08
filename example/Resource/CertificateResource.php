@@ -15,12 +15,15 @@ use Ggs\JsonApiEngine\Resource\ManyToOne;
 use Ggs\JsonApiEngine\Resource\OneToMany;
 use Ggs\JsonApiEngine\Resource\OneToOne;
 use Ggs\JsonApiEngine\Resource;
+use Ggs\JsonApiEngine\Resource\Insertable;
 
 /**
  * `certificate`: таблица `certificates`. Связи: `provider` (внешний ключ), `detail` и `delivery` (1:1, обратная
  * сторона), `domains` (1:N).
+ *
+ * Можно создавать (`Insertable`): вставку см. `Executor\InsertResourceWriter`.
  */
-final class CertificateResource extends Resource
+final class CertificateResource extends Resource implements Insertable
 {
     public const string TYPE = 'certificate';
 

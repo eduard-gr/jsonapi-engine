@@ -8,11 +8,14 @@ use Ggs\JsonApiEngine\Document\ResourceRecord;
 use Ggs\JsonApiEngine\Example\Entity\CertificateDeliveryMetaEntity;
 use Ggs\JsonApiEngine\Operator;
 use Ggs\JsonApiEngine\Resource;
+use Ggs\JsonApiEngine\Resource\Insertable;
 
 /**
  * `delivery`: таблица `certificate_delivery_meta`, идентификатор — её первичный ключ `certificate_id`.
+ *
+ * Можно создавать (`Insertable`): вставку см. `Executor\InsertResourceWriter`.
  */
-final class DeliveryResource extends Resource
+final class DeliveryResource extends Resource implements Insertable
 {
     public const string TYPE = 'delivery';
 

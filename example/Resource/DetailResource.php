@@ -7,11 +7,14 @@ namespace Ggs\JsonApiEngine\Example\Resource;
 use Ggs\JsonApiEngine\Document\ResourceRecord;
 use Ggs\JsonApiEngine\Example\Entity\CertificateDetailsEntity;
 use Ggs\JsonApiEngine\Resource;
+use Ggs\JsonApiEngine\Resource\Insertable;
 
 /**
  * `detail`: таблица `certificate_details`, идентификатор — её первичный ключ `certificate_id`.
+ *
+ * Можно создавать (`Insertable`): вставку см. `Executor\InsertResourceWriter`.
  */
-final class DetailResource extends Resource
+final class DetailResource extends Resource implements Insertable
 {
     public const string TYPE = 'detail';
 

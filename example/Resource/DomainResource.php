@@ -9,11 +9,14 @@ use Ggs\JsonApiEngine\Example\Entity\DomainLogsEntity;
 use Ggs\JsonApiEngine\Example\Entity\DomainsEntity;
 use Ggs\JsonApiEngine\Resource\OneToMany;
 use Ggs\JsonApiEngine\Resource;
+use Ggs\JsonApiEngine\Resource\Insertable;
 
 /**
  * `domain`: таблица `domains` (QUERY2). Связь `logs` (1:N).
+ *
+ * Можно создавать (`Insertable`): вставку см. `Executor\InsertResourceWriter`.
  */
-final class DomainResource extends Resource
+final class DomainResource extends Resource implements Insertable
 {
     public const string TYPE = 'domain';
 
