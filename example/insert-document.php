@@ -3,7 +3,7 @@
 /**
  * Прототип INSERT: входной документ JSON:API → дерево вставляемых ресурсов (парсер документа) → дерево вставки
  * (push) → строки в таблицах. Основной код (`src/`), `example/Resource` и `example/Entity` не меняются; все классы
- * прототипа живут в этом файле.
+ * прототипа живут в этом файле, ресурсы примера, которые можно создавать, — копиями с `Insertable` (см. ниже).
  *
  *     php example/insert-document.php
  *
@@ -76,12 +76,15 @@
  * связи из ключей первой. `LeftJoin` делает правую сторону необязательной: если в строке нет ни одной её колонки,
  * она не вставляется (в SELECT это отсутствующая часть, `null`); `InnerJoin` вставляет всегда.
  *
- * **Сущности только для чтения** (`READ_ONLY_ENTITIES`): в таблицу такой сущности вставки нет (справочник,
- * таблица другой системы). В основном коде это будет флаг в классе сущности (например
- * `public const bool READ_ONLY = true;`, по умолчанию false); в прототипе — список, чтобы не менять `example/Entity`.
- * Для таблицы только для чтения нет листа: присоединённая выпадает из поддерева таблиц, её колонки писать нельзя;
- * основная (крайняя левая) делает ресурс несоздаваемым — ни корнем, ни ребёнком по `lid` (парсер отказывает),
- * но сослаться на существующую запись `{type, id}` можно (`provider` у сертификата).
+ * **Что можно создавать — решает ресурс**: маркерный интерфейс `Insertable` (потом `Updatable`, `Deletable`;
+ * чтение — свойство любого ресурса, ответ после вставки строится SELECT-ом). Без интерфейса ресурс создать нельзя —
+ * ни корнем, ни ребёнком по `lid` (парсер отказывает), но сослаться на существующую запись `{type, id}` можно
+ * (`provider` у сертификата: `ProviderResource` не `Insertable`). Сущности таких флагов не несут; запрет писать
+ * отдельную колонку — `mode` READ атрибута. Интерфейс задаёт, что ресурс умеет в принципе; что разрешено точке
+ * входа или роли, будет решать будущая схема ограничений (она только сужает). В основном коде интерфейсы лягут
+ * рядом с `Resource` и ресурсы примера объявят `implements Insertable`; в прототипе, чтобы не менять
+ * `example/Resource`, это копии в пространстве имён прототипа (`CertificateResource`, `DetailResource`,
+ * `DeliveryResource`, `DomainResource`) поверх оригиналов (`Source\…`), со связями, переназначенными на копии.
  *
  * Ограничения прототипа:
  * - дерево вставляемых ресурсов — дерево: каждый `lid` из `included` указан ровно в одном месте. Ссылка по `lid`
@@ -91,8 +94,10 @@
  * - порядок «сторона с первичным ключом первой» на уровне ресурсов задан положением ветки `first`, его должен
  *   выбирать планировщик;
  * - вставка по одной строке, без многострочного `INSERT` и без одного SQL с изменяющими данные CTE на модель;
+ *   запрос готовится заново на каждую строку (TODO в `InsertTableNode`);
  * - типы значений и обязательные атрибуты парсер не проверяет;
- * - ответ (созданные ресурсы через SELECT-конвейер) не строится: печатаются ключи и строки из базы.
+ * - ответ (созданные ресурсы через SELECT-конвейер) не строится: печатаются ключи корней, а каждый выполненный
+ *   `INSERT` с параметрами и полученным ключом пишется в `error_log()` (в CLI — stderr).
  */
 
 declare(strict_types=1);
@@ -103,12 +108,7 @@ use Ggs\JsonApiEngine\Example\Entity\CertificateDetailsEntity;
 use Ggs\JsonApiEngine\Example\Entity\CertificateDeliveryMetaEntity;
 use Ggs\JsonApiEngine\Example\Entity\CertificatesEntity;
 use Ggs\JsonApiEngine\Example\Entity\DomainsEntity;
-use Ggs\JsonApiEngine\Example\Entity\ProvidersEntity;
-use Ggs\JsonApiEngine\Example\Resource\CertificateResource;
-use Ggs\JsonApiEngine\Example\Resource\DeliveryResource;
-use Ggs\JsonApiEngine\Example\Resource\DetailResource;
-use Ggs\JsonApiEngine\Example\Resource\DomainResource;
-use Ggs\JsonApiEngine\Example\Resource\ProviderResource;
+use Ggs\JsonApiEngine\Example\Resource as Source;
 use Ggs\JsonApiEngine\Model\Entity;
 use Ggs\JsonApiEngine\Model\Join;
 use Ggs\JsonApiEngine\Model\LeftJoin;
@@ -116,7 +116,7 @@ use Ggs\JsonApiEngine\Model\ModelTree;
 use Ggs\JsonApiEngine\Resource;
 use Ggs\JsonApiEngine\Resource\ManyToOne;
 use Ggs\JsonApiEngine\Resource\OneToMany;
-use Ggs\JsonApiEngine\Resource\OneToOne;
+use Ggs\JsonApiEngine\Resource\Relationship;
 use LogicException;
 use PDO;
 use RuntimeException;
@@ -124,21 +124,23 @@ use RuntimeException;
 require __DIR__ . '/../vendor/autoload.php';
 require __DIR__ . '/db/connection.php';
 
-// --- сущности только для чтения ---
+// --- возможности ресурса ---
 
 /**
- * Сущности только для чтения: вставки в их таблицы нет. Замена флага в классе сущности, см. docblock файла.
- *
- * @var list<class-string<Entity>>
+ * Ресурс можно создавать (`POST`): маркер возможности на классе ресурса, проверяется `is_a($class, Insertable::class,
+ * true)` (экземпляров у ресурсов нет). Без него парсер отказывает, а узел вставки не строится. Рядом будут
+ * `Updatable` и `Deletable`; они могут потребовать статические методы (какие атрибуты можно менять и т. п.).
  */
-const READ_ONLY_ENTITIES = [ProvidersEntity::class];
-
-/**
- * @param class-string<Entity> $entity
- */
-function isReadOnly(string $entity): bool
+interface Insertable
 {
-    return in_array($entity, READ_ONLY_ENTITIES, true);
+}
+
+/**
+ * @param class-string<Resource> $resource
+ */
+function insertable(string $resource): bool
+{
+    return is_a($resource, Insertable::class, true);
 }
 
 /**
@@ -152,27 +154,30 @@ function leaves(Join|string $model): array
 }
 
 /**
- * Можно ли создать ресурс: основная таблица его модели не только для чтения.
+ * Связи оригинального ресурса с целями, переназначенными на копии прототипа (`Source\DomainResource` →
+ * `DomainResource`); цели без копии (`provider`, `logs`) остаются оригиналами — они не `Insertable`.
  *
- * @param class-string<Resource> $resource
+ * @param array<string, Relationship>                                  $relationships
+ * @param array<class-string<Resource>, class-string<Resource>>        $map оригинал → копия
+ * @return array<string, Relationship>
  */
-function insertable(string $resource): bool
+function remap(array $relationships, array $map): array
 {
-    return !isReadOnly(leaves($resource::model())[0]);
+    return array_map(
+        static fn(Relationship $relationship): Relationship => isset($map[$relationship->resource])
+            ? new ($relationship::class)(resource: $map[$relationship->resource], relation: $relationship->relation)
+            : $relationship,
+        $relationships,
+    );
 }
 
-/**
- * Можно ли писать колонку модели ресурса: её таблица не только для чтения.
- *
- * @param class-string<Resource> $resource
- */
-function writableColumn(string $resource, string $column): bool
-{
-    $leaf = ModelTree::of($resource)->columnTable($column)
-        ?? throw new LogicException("{$resource}: unknown model column {$column}");
-
-    return !isReadOnly(leaves($resource::model())[$leaf]);
-}
+/** Оригинал → копия прототипа с `Insertable`. */
+const COPIES = [
+    Source\CertificateResource::class => CertificateResource::class,
+    Source\DetailResource::class => DetailResource::class,
+    Source\DeliveryResource::class => DeliveryResource::class,
+    Source\DomainResource::class => DomainResource::class,
+];
 
 // --- документы ---
 
@@ -337,10 +342,10 @@ const INVALID_DOCUMENTS = [
             'relationships' => ['domains' => ['data' => [['type' => 'domain', 'id' => '7']]]],
         ],
     ]],
-    'read-only entity as root (POST /providers)' => [ProviderResource::class, [
+    'not insertable resource as root (POST /providers)' => [Source\ProviderResource::class, [
         'data' => ['type' => 'provider', 'lid' => 'p1', 'attributes' => ['name' => 'New provider']],
     ]],
-    'read-only entity as new related resource' => [CertificateResource::class, [
+    'not insertable resource as new related resource' => [CertificateResource::class, [
         'data' => [
             'type' => 'certificate',
             'lid' => 'c1',
@@ -349,30 +354,97 @@ const INVALID_DOCUMENTS = [
         ],
         'included' => [['type' => 'provider', 'lid' => 'p1', 'attributes' => ['name' => 'New provider']]],
     ]],
+    'not insertable child (log via sideposting)' => [DomainResource::class, [
+        'data' => [
+            'type' => 'domain',
+            'lid' => 'd1',
+            'attributes' => ['domain_name' => 'a.com'],
+            'relationships' => ['logs' => ['data' => [['type' => 'log', 'lid' => 'l1']]]],
+        ],
+        'included' => [['type' => 'log', 'lid' => 'l1', 'attributes' => ['message' => 'created']]],
+    ]],
 ];
 
 // --- ресурсы прототипа ---
 
 /**
- * `DomainResource` со связью по внешнему ключу `certificate` (`domains.certificate_id → certificates.id`): нужна,
- * чтобы домен можно было вставить отдельно, к существующему сертификату. Объявлен в прототипе, чтобы не менять
- * `example/Resource`.
+ * `Source\CertificateResource` с `Insertable`: атрибуты и модель те же, связи `detail`, `delivery`, `domains`
+ * указывают на копии прототипа.
  */
-final class DomainWithCertificateResource extends Resource
+final class CertificateResource extends Resource implements Insertable
 {
-    public const string TYPE = DomainResource::TYPE;
+    public const string TYPE = Source\CertificateResource::TYPE;
 
+    public const string PROVIDER = Source\CertificateResource::PROVIDER;
+    public const string DETAIL = Source\CertificateResource::DETAIL;
+    public const string DELIVERY = Source\CertificateResource::DELIVERY;
+    public const string DOMAINS = Source\CertificateResource::DOMAINS;
+
+    public const array ATTRIBUTES = Source\CertificateResource::ATTRIBUTES;
+
+    #[\Override]
+    public static function relationships(): array
+    {
+        return remap(Source\CertificateResource::relationships(), COPIES);
+    }
+
+    public static function model(): string
+    {
+        return Source\CertificateResource::model();
+    }
+}
+
+/**
+ * `Source\DetailResource` с `Insertable`.
+ */
+final class DetailResource extends Resource implements Insertable
+{
+    public const string TYPE = Source\DetailResource::TYPE;
+
+    public const array ATTRIBUTES = Source\DetailResource::ATTRIBUTES;
+
+    public static function model(): string
+    {
+        return Source\DetailResource::model();
+    }
+}
+
+/**
+ * `Source\DeliveryResource` с `Insertable`.
+ */
+final class DeliveryResource extends Resource implements Insertable
+{
+    public const string TYPE = Source\DeliveryResource::TYPE;
+
+    public const array ATTRIBUTES = Source\DeliveryResource::ATTRIBUTES;
+
+    public static function model(): string
+    {
+        return Source\DeliveryResource::model();
+    }
+}
+
+/**
+ * `Source\DomainResource` с `Insertable` и связью по внешнему ключу `certificate` (`domains.certificate_id →
+ * certificates.id`): нужна, чтобы домен можно было вставить отдельно, к существующему сертификату. `logs` остаётся
+ * на `Source\LogResource` — он не `Insertable`.
+ */
+final class DomainResource extends Resource implements Insertable
+{
+    public const string TYPE = Source\DomainResource::TYPE;
+
+    public const string LOGS = Source\DomainResource::LOGS;
     public const string CERTIFICATE = 'certificate';
 
-    public const array ATTRIBUTES = DomainResource::ATTRIBUTES;
+    public const array ATTRIBUTES = Source\DomainResource::ATTRIBUTES;
 
     #[\Override]
     public static function relationships(): array
     {
         return [
-            ...DomainResource::relationships(),
+            ...remap(Source\DomainResource::relationships(), COPIES),
             self::CERTIFICATE => new ManyToOne(
-                resource: CertificateResource::class,
+                resource: Source\CertificateResource::class,
                 relation: [DomainsEntity::CERTIFICATE_ID, CertificatesEntity::ID],
             ),
         ];
@@ -386,12 +458,11 @@ final class DomainWithCertificateResource extends Resource
 
 /**
  * Сертификат из двух таблиц: `LeftJoin(certificates, certificate_details, [id, certificate_id])`; атрибуты деталей —
- * атрибуты сертификата. Связи — как у `CertificateResource`, без `detail` (детали теперь внутри модели). Объявлен
- * в прототипе, чтобы не менять `example/Resource`.
+ * атрибуты сертификата. Связи — как у `CertificateResource`, без `detail` (детали теперь внутри модели).
  */
-final class CertificateWithDetailResource extends Resource
+final class CertificateWithDetailResource extends Resource implements Insertable
 {
-    public const string TYPE = CertificateResource::TYPE;
+    public const string TYPE = Source\CertificateResource::TYPE;
 
     public const string BUYER_EMAIL = 'buyer_email';
     public const string RECIPIENT_NAME = 'recipient_name';
@@ -400,7 +471,7 @@ final class CertificateWithDetailResource extends Resource
     public const string DESIGN_TEMPLATE_ID = 'design_template_id';
 
     public const array ATTRIBUTES = [
-        ...CertificateResource::ATTRIBUTES,
+        ...Source\CertificateResource::ATTRIBUTES,
         self::BUYER_EMAIL => ['column' => CertificateDetailsEntity::BUYER_EMAIL, 'type' => self::STRING],
         self::RECIPIENT_NAME => [
             'column' => CertificateDetailsEntity::RECIPIENT_NAME,
@@ -469,9 +540,8 @@ final class InvalidDocumentException extends RuntimeException
  *
  * Проверки (всё — `InvalidDocumentException`): `data` — ресурс или список ресурсов; у каждого нового ресурса есть
  * `lid`, без `id`; `type:lid` уникален в документе; `type` совпадает с ресурсом места (корень — корневой ресурс,
- * ребёнок — цель связи); ресурс можно создать (основная таблица модели не только для чтения); атрибут существует
- * и записываемый (не первичный ключ, не `mode` READ, все его колонки — в таблицах не только для чтения); связь
- * существует; связь по внешнему ключу — только `{type, id}`, остальные — только `{type, lid}` из `included`; каждый
+ * ребёнок — цель связи); ресурс можно создать (`Insertable`); атрибут существует и записываемый (не первичный
+ * ключ, не `mode` READ); связь существует; связь по внешнему ключу — только `{type, id}`, остальные — только `{type, lid}` из `included`; каждый
  * ресурс из `included` указан ровно один раз и достижим из `data` (поэтому циклов нет: корни в `included` не лежат).
  *
  * Не проверяет: типы значений атрибутов, обязательные атрибуты (`NOT NULL` без значения по умолчанию упадёт
@@ -546,19 +616,13 @@ final class DocumentParser
             throw new InvalidDocumentException("expected type {$class::type()}, got {$item['type']}", "{$pointer}/type");
         }
         if (!insertable($class)) {
-            throw new InvalidDocumentException("resource {$class::type()} is read-only and can not be created", $pointer);
+            throw new InvalidDocumentException("resource {$class::type()} can not be created", $pointer);
         }
 
         foreach (array_keys($item['attributes'] ?? []) as $name) {
             $at = "{$pointer}/attributes/{$name}";
             $attribute = $class::ATTRIBUTES[$name] ?? throw new InvalidDocumentException("unknown attribute {$name}", $at);
-            $writable = $name !== $class::primaryAttribute()
-                && ($attribute['mode'] ?? null) !== Resource::READ
-                && array_all(
-                    $class::attributeColumns($name),
-                    static fn(string $column): bool => writableColumn($class, $column),
-                );
-            if (!$writable) {
+            if ($name === $class::primaryAttribute() || ($attribute['mode'] ?? null) === Resource::READ) {
                 throw new InvalidDocumentException("attribute {$name} is read-only", $at);
             }
         }
@@ -607,7 +671,7 @@ final class DocumentParser
         if (!isset($identifier['id']) || isset($identifier['lid'])) {
             if (!insertable($class)) {
                 throw new InvalidDocumentException(
-                    "resource {$class::type()} is read-only: only an existing resource {type, id} can be linked",
+                    "resource {$class::type()} can not be created: only an existing resource {type, id} can be linked",
                     $pointer,
                 );
             }
@@ -656,15 +720,6 @@ final class DocumentParser
 // --- уровень таблиц ---
 
 /**
- * Журнал выполненных `INSERT` для печати; удобство прототипа, не часть замысла.
- */
-final class StatementLog
-{
-    /** @var list<array{sql: string, parameters: array<string, mixed>, table: string, primary: string, id: int}> */
-    public array $statements = [];
-}
-
-/**
  * Узел уровня таблиц: получает строку одного ресурса «колонка модели → значение», вставляет её части в таблицы
  * своего поддерева, возвращает их ключи.
  *
@@ -697,7 +752,14 @@ interface TableInsertNode
  * Поток: строка + `link` → свои колонки (колонки модели этой таблицы из строки, колонки связи, которые есть
  * в сущности) → `INSERT INTO <table> (…) VALUES (…) RETURNING <pk>` → ключи: записанные колонки и первичный ключ
  * (по именам колонок сущности, ключам `COLUMNS`). Нет ни одной колонки — `INSERT … DEFAULT VALUES`. Имя колонки
- * в базе — `Entity::column()`.
+ * в базе — `Entity::column()`. Выполненный запрос с параметрами и ключом — в `error_log()` (отладка прототипа).
+ *
+ * TODO: `prepare()` на каждый `push()`. Один запрос в конструкторе подготовить нельзя: набор колонок зависит от
+ * строки — неприсланная колонка не упоминается, чтобы база поставила `DEFAULT` (`NULL` вместо неё — другое значение,
+ * а `DEFAULT` нельзя передать параметром PDO: это ключевое слово, а не значение, и в выражениях вроде `COALESCE`
+ * оно запрещено). Улучшения: кеш подготовленных запросов по набору колонок (следующие строки той же формы — только
+ * `bindValue()` + `execute()`); для многострочного `INSERT` на PostgreSQL — колонки как объединение по строкам,
+ * недостающие значения — `DEFAULT` в `VALUES` (pg_builder `SetToDefault`; SQLite `DEFAULT` в `VALUES` не понимает).
  */
 final class InsertTableNode implements TableInsertNode
 {
@@ -709,11 +771,7 @@ final class InsertTableNode implements TableInsertNode
         private readonly PDO $pdo,
         private readonly string $entity,
         private readonly array $columns,
-        private readonly StatementLog $log,
     ) {
-        if (isReadOnly($entity)) {
-            throw new LogicException("{$entity}: entity is read-only, no insert node for it");
-        }
     }
 
     #[\Override]
@@ -749,13 +807,7 @@ final class InsertTableNode implements TableInsertNode
         $id = (int) $statement->fetchColumn();
         $statement->closeCursor();
 
-        $this->log->statements[] = [
-            'sql' => $sql,
-            'parameters' => $values,
-            'table' => $entity::TABLE,
-            'primary' => $entity::column($primary),
-            'id' => $id,
-        ];
+        error_log("{$sql}\n    " . json_encode($values) . " → {$id}");
 
         return [...$values, $primary => $id];
     }
@@ -850,22 +902,23 @@ final class InsertTableJoinNode implements TableInsertNode
  * `relation` `[l, r]`, левая первой, если `l` — первичный ключ левой сущности или `r` ссылается на неё
  * (`references`); правая первой, если `r` — первичный ключ правой или `l` ссылается на неё; иначе `LogicException`.
  * Сущность колонки `relation` ищется по имени в своём поддереве (первая таблица слева, где она есть), как
- * в `ModelTree`. Таблицы только для чтения листа не получают: присоединённая сторона выпадает (остаётся другая),
- * основная — `LogicException` (такой ресурс парсер не пропускает).
+ * в `ModelTree`. Ресурс не `Insertable` — `LogicException` (такой ресурс парсер не пропускает).
  */
 final class TableTreeBuilder
 {
     public function __construct(
         private readonly PDO $pdo,
-        private readonly StatementLog $log,
     ) {
     }
 
     /**
-     * @param class-string<Resource> $resource
+     * @param class-string<Resource&Insertable> $resource
      */
     public function build(string $resource): TableInsertNode
     {
+        if (!insertable($resource)) {
+            throw new LogicException("{$resource} is not Insertable");
+        }
         $tree = ModelTree::of($resource);
         $columns = [];
         foreach ($tree->columns() as $column) {
@@ -873,27 +926,23 @@ final class TableTreeBuilder
         }
         $leaf = 0;
 
-        return $this->node($resource::model(), $columns, $leaf)
-            ?? throw new LogicException("{$resource}: main table is read-only, nothing to insert");
+        return $this->node($resource::model(), $columns, $leaf);
     }
 
     /**
      * @param array<int, list<string>> $columns номер таблицы → её колонки модели
      * @param int                      $leaf    номер следующей таблицы слева направо
      */
-    private function node(Join|string $model, array $columns, int &$leaf): ?TableInsertNode
+    private function node(Join|string $model, array $columns, int &$leaf): TableInsertNode
     {
         if (is_string($model)) {
             $number = $leaf++;
 
-            return isReadOnly($model) ? null : new InsertTableNode($this->pdo, $model, $columns[$number] ?? [], $this->log);
+            return new InsertTableNode($this->pdo, $model, $columns[$number] ?? []);
         }
 
         $left = $this->node($model->left, $columns, $leaf);
         $right = $this->node($model->right, $columns, $leaf);
-        if ($left === null || $right === null) {
-            return $left;
-        }
 
         [$l, $r] = $model->relation;
         $leftEntity = self::owner($model->left, $l);
@@ -962,12 +1011,15 @@ interface InsertNode
 final class InsertResourceNode implements InsertNode
 {
     /**
-     * @param class-string<Resource> $resource
+     * @param class-string<Resource&Insertable> $resource
      */
     public function __construct(
         private readonly string $resource,
         private readonly TableInsertNode $input,
     ) {
+        if (!insertable($resource)) {
+            throw new LogicException("{$resource} is not Insertable");
+        }
     }
 
     #[\Override]
@@ -1142,8 +1194,7 @@ $run = static function (string $title, array $document, string $resource, callab
 
     $roots = new DocumentParser()->parse($document, $resource);
 
-    $log = new StatementLog();
-    $builder = new TableTreeBuilder($pdo, $log);
+    $builder = new TableTreeBuilder($pdo);
     $insert = new InsertDocument(
         root: $tree(static fn(string $class): InsertNode => new InsertResourceNode($class, $builder->build($class))),
         roots: $roots,
@@ -1152,22 +1203,12 @@ $run = static function (string $title, array $document, string $resource, callab
 
     $pdo->beginTransaction();
     try {
+        echo "== statements (error_log)\n";
         $keys = $insert->execute();
 
-        echo "== statements\n";
-        foreach ($log->statements as $statement) {
-            echo $statement['sql'], "\n    ", json_encode($statement['parameters']), " → {$statement['id']}\n";
-        }
         echo "\n== root keys\n";
         foreach ($keys as $key) {
             echo json_encode($key), "\n";
-        }
-
-        echo "\n== rows in database\n";
-        foreach ($log->statements as $statement) {
-            $select = $pdo->prepare("SELECT * FROM {$statement['table']} WHERE {$statement['primary']} = :id");
-            $select->execute([':id' => $statement['id']]);
-            echo $statement['table'], ': ', json_encode($select->fetch(PDO::FETCH_ASSOC)), "\n";
         }
         echo "\n";
     } finally {
@@ -1217,8 +1258,8 @@ $run(
 $run(
     title: 'POST /domains: 2 domains of existing certificate 1',
     document: DOMAINS_DOCUMENT,
-    resource: DomainWithCertificateResource::class,
-    tree: static fn(callable $resource): InsertNode => $resource(DomainWithCertificateResource::class),
+    resource: DomainResource::class,
+    tree: static fn(callable $resource): InsertNode => $resource(DomainResource::class),
 );
 
 echo "######## invalid documents\n\n";
