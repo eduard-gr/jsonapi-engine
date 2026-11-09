@@ -1245,6 +1245,7 @@ php example/query-tree.php '/certificates?include=domains.logs&fields[certificat
 php example/insert-plan.php                        # вставка через планировщик: документ → план → дерево вставки, ключи; SQL в stderr; транзакция откатывается
 php example/insert-document.php                    # то же дерево вставки, собранное руками
 php example/insert-route.php                       # вложенный маршрут POST /certificates/1/domains: routeLink → InsertRouteLinkWriter над деревом
+php example/update-document.php                    # прототип UPDATE (PATCH /certificates/{id}): дерево …Writer руками, всё в одном файле; SQL в stderr; транзакции откатываются
 php example/db/seed.php [количество сертификатов]  # пересоздать базу примера
 ```
 
