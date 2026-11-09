@@ -172,9 +172,9 @@ final class ModelTree
         if (!isset($this->columns[$column])) {
             throw new \LogicException("column {$column} is not a model column");
         }
-        [$leaf, $tableColumn] = $this->columns[$column];
+        [$leaf, $table_column] = $this->columns[$column];
 
-        return new ColumnReference(self::alias($alias, $leaf), $tableColumn);
+        return new ColumnReference(self::alias($alias, $leaf), $table_column);
     }
 
     /**
@@ -217,13 +217,13 @@ final class ModelTree
         // соединению нужна левая колонка relation: её таблица в левом поддереве должна остаться
         $left = $this->render($node['left'], $alias, $needed + [$node['relation'] => true]);
         $right = $this->render($node['right'], $alias, $needed);
-        [$leftLeaf, $leftColumn, $rightLeaf, $rightColumn] = $node['on'];
+        [$left_leaf, $left_column, $right_leaf, $right_column] = $node['on'];
 
         $expression = new JoinExpression($left, $right, $join->type());
         $expression->on = new OperatorExpression(
             '=',
-            new ColumnReference(self::alias($alias, $rightLeaf), $rightColumn),
-            new ColumnReference(self::alias($alias, $leftLeaf), $leftColumn),
+            new ColumnReference(self::alias($alias, $right_leaf), $right_column),
+            new ColumnReference(self::alias($alias, $left_leaf), $left_column),
         );
 
         return $expression;
@@ -236,11 +236,11 @@ final class ModelTree
      *                                                                        (колонка → номер таблицы) и номер
      *                                                                        его основной таблицы
      */
-    private function analyze(mixed $model, string $at): array
+    private function analyze(mixed $model, string $location): array
     {
         if (\is_string($model)) {
             if (!is_subclass_of($model, Entity::class)) {
-                $this->errors[] = "model {$at}: {$model} is not a subclass of " . Entity::class;
+                $this->errors[] = "model {$location}: {$model} is not a subclass of " . Entity::class;
 
                 return [null, [], null];
             }
@@ -250,58 +250,58 @@ final class ModelTree
             return [['leaf' => $leaf], array_fill_keys(array_keys($model::COLUMNS), $leaf), $leaf];
         }
         if (!$model instanceof Join) {
-            $this->errors[] = "model {$at}: expected an entity class or a Join, got " . get_debug_type($model);
+            $this->errors[] = "model {$location}: expected an entity class or a Join, got " . get_debug_type($model);
 
             return [null, [], null];
         }
 
-        [$left, $leftVisible, $leftMain] = $this->analyze($model->left, "{$at}.left");
-        [$right, $rightVisible, $rightMain] = $this->analyze($model->right, "{$at}.right");
+        [$left, $left_visible, $left_main] = $this->analyze($model->left, "{$location}.left");
+        [$right, $right_visible, $right_main] = $this->analyze($model->right, "{$location}.right");
 
         $relation = $model->relation;
         if (\count($relation) !== 2) {
-            $this->errors[] = "model {$at}: relation must be [left column, right column]";
+            $this->errors[] = "model {$location}: relation must be [left column, right column]";
 
-            return [null, $leftVisible + $rightVisible, $leftMain];
+            return [null, $left_visible + $right_visible, $left_main];
         }
 
-        [$leftColumn, $rightColumn] = $relation;
+        [$left_column, $right_column] = $relation;
         $valid = $left !== null && $right !== null;
-        if (!isset($leftVisible[$leftColumn]) && $left !== null) {
-            $this->errors[] = "model {$at}: column {$leftColumn} is missing in the left subtree";
+        if (!isset($left_visible[$left_column]) && $left !== null) {
+            $this->errors[] = "model {$location}: column {$left_column} is missing in the left subtree";
             $valid = false;
         }
-        if (!isset($rightVisible[$rightColumn]) && $right !== null) {
-            $this->errors[] = "model {$at}: column {$rightColumn} is missing in the right subtree";
+        if (!isset($right_visible[$right_column]) && $right !== null) {
+            $this->errors[] = "model {$location}: column {$right_column} is missing in the right subtree";
             $valid = false;
-        } elseif ($right !== null && $rightVisible[$rightColumn] !== $rightMain) {
-            $this->errors[] = "model {$at}: column {$rightColumn} must belong to the main table of the right subtree";
+        } elseif ($right !== null && $right_visible[$right_column] !== $right_main) {
+            $this->errors[] = "model {$location}: column {$right_column} must belong to the main table of the right subtree";
             $valid = false;
         }
 
         if ($valid) {
-            $leftEntity = $this->entities[$leftVisible[$leftColumn]];
-            $rightEntity = $this->entities[$rightVisible[$rightColumn]];
-            if (!$rightEntity::isUnique($rightColumn)) {
-                $this->errors[] = "model {$at}: column {$rightColumn} must be PRIMARY or unique in {$rightEntity}"
+            $left_entity = $this->entities[$left_visible[$left_column]];
+            $right_entity = $this->entities[$right_visible[$right_column]];
+            if (!$right_entity::isUnique($right_column)) {
+                $this->errors[] = "model {$location}: column {$right_column} must be PRIMARY or unique in {$right_entity}"
                     . ' (relation must be to-one)';
             }
-            if (($leftEntity::COLUMNS[$leftColumn]['type'] ?? null)
-                !== ($rightEntity::COLUMNS[$rightColumn]['type'] ?? null)) {
-                $this->errors[] = "model {$at}: columns {$leftColumn} and {$rightColumn} must have the same type";
+            if (($left_entity::COLUMNS[$left_column]['type'] ?? null)
+                !== ($right_entity::COLUMNS[$right_column]['type'] ?? null)) {
+                $this->errors[] = "model {$location}: columns {$left_column} and {$right_column} must have the same type";
             }
         }
 
-        $rightLeaf = $rightVisible[$rightColumn] ?? $rightMain;
+        $right_leaf = $right_visible[$right_column] ?? $right_main;
         // правая колонка relation равна левой: колонкой модели она не считается
-        unset($rightVisible[$rightColumn]);
-        foreach (array_intersect_key($rightVisible, $leftVisible) as $column => $leaf) {
-            $this->errors[] = "model {$at}: column {$column} is defined in both "
-                . $this->entities[$leftVisible[$column]] . ' and ' . $this->entities[$leaf];
+        unset($right_visible[$right_column]);
+        foreach (array_intersect_key($right_visible, $left_visible) as $column => $leaf) {
+            $this->errors[] = "model {$location}: column {$column} is defined in both "
+                . $this->entities[$left_visible[$column]] . ' and ' . $this->entities[$leaf];
         }
 
         if (!$valid) {
-            return [null, $leftVisible + $rightVisible, $leftMain];
+            return [null, $left_visible + $right_visible, $left_main];
         }
 
         return [
@@ -310,16 +310,16 @@ final class ModelTree
                 'left' => $left,
                 'right' => $right,
                 'on' => [
-                    $leftVisible[$leftColumn],
-                    $this->entities[$leftVisible[$leftColumn]]::column($leftColumn),
-                    $rightLeaf,
-                    $this->entities[$rightLeaf]::column($rightColumn),
+                    $left_visible[$left_column],
+                    $this->entities[$left_visible[$left_column]]::column($left_column),
+                    $right_leaf,
+                    $this->entities[$right_leaf]::column($right_column),
                 ],
-                'relation' => $leftColumn,
-                'columns' => $rightVisible,
+                'relation' => $left_column,
+                'columns' => $right_visible,
             ],
-            $leftVisible + $rightVisible,
-            $leftMain,
+            $left_visible + $right_visible,
+            $left_main,
         ];
     }
 }

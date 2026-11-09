@@ -13,7 +13,7 @@ use Ggs\JsonApiEngine\Resource\Insertable;
 /**
  * `delivery`: таблица `certificate_delivery_meta`, идентификатор — её первичный ключ `certificate_id`.
  *
- * Можно создавать (`Insertable`): вставку см. `Executor\InsertResourceWriter`.
+ * Можно создавать (`Insertable`): вставку см. `Executor\Insert\InsertResourceWriter`.
  */
 final class DeliveryResource extends Resource implements Insertable
 {

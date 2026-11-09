@@ -19,7 +19,7 @@ declare(strict_types=1);
 use Ggs\JsonApiEngine\Example\Controller\CertificatesController;
 use Ggs\JsonApiEngine\Parser\InvalidQueryException;
 use Ggs\JsonApiEngine\Parser\ResourceNotFoundException;
-use Ggs\JsonApiEngine\Plan\Select\QueryPlanPrinter;
+use Ggs\JsonApiEngine\Plan\Select\SelectPlanPrinter;
 
 require __DIR__ . '/../vendor/autoload.php';
 require __DIR__ . '/db/connection.php';
@@ -45,14 +45,14 @@ try {
         exit(0);
     }
     $plan = $controller->plan(query: $query);
-} catch (InvalidQueryException $e) {
-    fwrite(STDERR, "400 Bad Request: {$e->getMessage()}\n");
+} catch (InvalidQueryException $exception) {
+    fwrite(STDERR, "400 Bad Request: {$exception->getMessage()}\n");
     exit(1);
-} catch (ResourceNotFoundException $e) {
-    fwrite(STDERR, "404 Not Found: {$e->getMessage()}\n");
+} catch (ResourceNotFoundException $exception) {
+    fwrite(STDERR, "404 Not Found: {$exception->getMessage()}\n");
     exit(1);
 }
 
 echo "GET {$url}\n\n";
-echo QueryPlanPrinter::tree(node: $plan), "\n";
-echo QueryPlanPrinter::queries(node: $plan);
+echo SelectPlanPrinter::tree(node: $plan), "\n";
+echo SelectPlanPrinter::queries(node: $plan);

@@ -22,11 +22,11 @@ final class EntityValidationTest extends TestCase
      */
     public static function entities(): iterable
     {
-        foreach (['Entity', 'Model'] as $dir) {
-            foreach (glob(__DIR__ . "/Fixture/{$dir}/*.php") ?: [] as $file) {
+        foreach (['Entity', 'Model'] as $directory) {
+            foreach (glob(__DIR__ . "/Fixture/{$directory}/*.php") ?: [] as $file) {
                 /** @var class-string<Entity> $class */
-                $class = "Ggs\\JsonApiEngine\\Test\\Model\\Fixture\\{$dir}\\" . basename($file, '.php');
-                yield "{$dir}/" . basename($file, '.php') => [$class];
+                $class = "Ggs\\JsonApiEngine\\Test\\Model\\Fixture\\{$directory}\\" . basename($file, '.php');
+                yield "{$directory}/" . basename($file, '.php') => [$class];
             }
         }
     }
@@ -72,9 +72,9 @@ final class EntityValidationTest extends TestCase
         try {
             $class::validate();
             self::fail("{$class}::validate() did not throw");
-        } catch (\LogicException $e) {
+        } catch (\LogicException $exception) {
             foreach ($messages as $message) {
-                self::assertStringContainsString($message, $e->getMessage());
+                self::assertStringContainsString($message, $exception->getMessage());
             }
         }
     }

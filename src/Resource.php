@@ -17,7 +17,7 @@ use Ggs\JsonApiEngine\Resource\Relationship;
  *
  * Наследник объявляет константы `TYPE`, `ATTRIBUTES` и имён, `relationships()` и `model()`; по желанию —
  * `serialize<Атрибут>()` (свой формат атрибута, у составного обязателен) и ручной `serialize()`. Ресурс из строки
- * запроса плана собирает `Executor\SerializeIterator` по этому описанию. Описание статическое: экземпляров нет, класс
+ * запроса плана собирает `Executor\Select\SerializeIterator` по этому описанию. Описание статическое: экземпляров нет, класс
  * передаётся как `::class`.
  */
 abstract class Resource implements Metadata
@@ -33,7 +33,7 @@ abstract class Resource implements Metadata
     private const array ATTRIBUTE_KEYS = ['column', 'columns', 'type', 'constraint', 'nullable', 'mode', 'filter', 'sort'];
 
     /** @var array<class-string, array<string, Relationship>> класс → имя связи → связь */
-    private static array $relationshipMaps = [];
+    private static array $relationship_maps = [];
 
     /**
      * Связи ресурса: имя связи в API (константа ресурса, `self::DOMAINS`) → связь. Метод, а не константа: PHP не
@@ -51,9 +51,9 @@ abstract class Resource implements Metadata
      */
     public static function relationship(string $name): ?Relationship
     {
-        self::$relationshipMaps[static::class] ??= static::relationships();
+        self::$relationship_maps[static::class] ??= static::relationships();
 
-        return self::$relationshipMaps[static::class][$name] ?? null;
+        return self::$relationship_maps[static::class][$name] ?? null;
     }
 
     /**
@@ -276,9 +276,9 @@ abstract class Resource implements Metadata
      * Ручная сериализация: ресурс из одной строки источника; `null` — ресурса в строке нет (например, `LEFT JOIN`
      * не нашёл запись).
      *
-     * Нужна только ручному режиму `Executor\SerializeIterator` (без карты колонок плана): так собраны
-     * `example/document.php` и `DocumentTreeTest` по алиасам `QUERY1`–`QUERY4`. Ресурс из строки запроса плана
-     * собирает сам `SerializeIterator` по `ATTRIBUTES` (свой формат атрибута — `serialize<Атрибут>()`), этот метод
+     * Нужна только `Executor\Select\ManualSerializeIterator` (дерево без плана): так собраны `example/document.php`
+     * и `DocumentTreeTest` по алиасам `QUERY1`–`QUERY4`. Ресурс из строки запроса плана собирает
+     * `Executor\Select\SerializeIterator` по `ATTRIBUTES` (свой формат атрибута — `serialize<Атрибут>()`), этот метод
      * ему не нужен. По умолчанию бросает `LogicException`.
      *
      * Строка — ассоциативный массив `колонка или алиас запроса → значение` целиком, в том числе с колонками
@@ -291,7 +291,7 @@ abstract class Resource implements Metadata
      */
     public static function serialize(array $tuple): ?ResourceRecord
     {
-        throw new \LogicException(static::class . ' has no hand-written serialize(), build SerializeIterator with plan columns');
+        throw new \LogicException(static::class . ' has no hand-written serialize(), use SerializeIterator with plan columns instead of ManualSerializeIterator');
     }
 
     /**
@@ -336,53 +336,53 @@ abstract class Resource implements Metadata
         $primary = [];
         $serializable = [];
         foreach (static::ATTRIBUTES as $name => $attribute) {
-            $at = "attribute {$name}";
+            $location = "attribute {$name}";
             if (!\is_array($attribute)) {
-                $errors[] = "{$at}: description must be an array";
+                $errors[] = "{$location}: description must be an array";
                 continue;
             }
             foreach (array_diff(array_keys($attribute), self::ATTRIBUTE_KEYS) as $key) {
-                $errors[] = "{$at}: unknown key {$key}";
+                $errors[] = "{$location}: unknown key {$key}";
             }
             $composite = isset($attribute['columns']);
             if ($composite && isset($attribute['column'])) {
-                $errors[] = "{$at}: column and columns are exclusive";
+                $errors[] = "{$location}: column and columns are exclusive";
             }
             if ($composite && (!\is_array($attribute['columns']) || $attribute['columns'] === []
                     || !array_is_list($attribute['columns']))) {
-                $errors[] = "{$at}: columns must be a non-empty list";
+                $errors[] = "{$location}: columns must be a non-empty list";
             }
             if (isset($attribute['column']) && !\is_string($attribute['column'])) {
-                $errors[] = "{$at}: column must be a string";
+                $errors[] = "{$location}: column must be a string";
             }
             if (!isset($attribute['type']) && !$composite) {
-                $errors[] = "{$at}: type is required";
+                $errors[] = "{$location}: type is required";
             }
             if (isset($attribute['type']) && !\in_array($attribute['type'], self::TYPES, true)) {
-                $errors[] = "{$at}: unknown type {$attribute['type']}";
+                $errors[] = "{$location}: unknown type {$attribute['type']}";
             }
             if (isset($attribute['mode']) && !\in_array($attribute['mode'], [self::READ, self::READ_WRITE], true)) {
-                $errors[] = "{$at}: unknown mode {$attribute['mode']}";
+                $errors[] = "{$location}: unknown mode {$attribute['mode']}";
             }
             if (isset($attribute['nullable']) && !\is_bool($attribute['nullable'])) {
-                $errors[] = "{$at}: nullable must be bool";
+                $errors[] = "{$location}: nullable must be bool";
             }
-            array_push($errors, ...self::searchErrors($at, $attribute['filter'] ?? null, $attribute['sort'] ?? null, $composite));
+            array_push($errors, ...self::searchErrors($location, $attribute['filter'] ?? null, $attribute['sort'] ?? null, $composite));
 
             $constraint = $attribute['constraint'] ?? null;
             // JSON:API: type и id — члены идентификатора ресурса, атрибут или связь так называться не могут
             if ($name === 'type' || ($name === 'id' && $constraint !== self::PRIMARY)) {
-                $errors[] = "{$at}: name {$name} is reserved by JSON:API";
+                $errors[] = "{$location}: name {$name} is reserved by JSON:API";
             }
             if ($constraint === self::FOREIGN) {
-                $errors[] = "{$at}: FOREIGN is not an attribute constraint, declare a ManyToOne in relationships()";
+                $errors[] = "{$location}: FOREIGN is not an attribute constraint, declare a ManyToOne in relationships()";
             } elseif ($constraint !== null && $constraint !== self::PRIMARY) {
-                $errors[] = "{$at}: unknown constraint {$constraint}";
+                $errors[] = "{$location}: unknown constraint {$constraint}";
             }
             if ($constraint === self::PRIMARY) {
                 $primary[] = $name;
                 if ($composite) {
-                    $errors[] = "{$at}: PRIMARY can not be composite";
+                    $errors[] = "{$location}: PRIMARY can not be composite";
                 }
             }
             if ($constraint === null) {
@@ -390,7 +390,7 @@ abstract class Resource implements Metadata
             }
 
             if ($composite && !self::declaresSerializer($class, self::serializerName($name))) {
-                $errors[] = "{$at}: composite attribute requires method " . self::serializerName($name) . '()';
+                $errors[] = "{$location}: composite attribute requires method " . self::serializerName($name) . '()';
             }
         }
 
@@ -435,18 +435,18 @@ abstract class Resource implements Metadata
      *
      * @return list<string>
      */
-    private static function searchErrors(string $at, mixed $filter, mixed $sort, bool $composite): array
+    private static function searchErrors(string $location, mixed $filter, mixed $sort, bool $composite): array
     {
         $errors = [];
         if ($filter !== null && (!\is_array($filter) || $filter === [] || !array_is_list($filter)
-                || array_filter($filter, fn ($o) => !$o instanceof Operator) !== [])) {
-            $errors[] = "{$at}: filter must be a non-empty list of " . Operator::class . ' cases';
+                || array_filter($filter, fn ($filter_operator) => !$filter_operator instanceof Operator) !== [])) {
+            $errors[] = "{$location}: filter must be a non-empty list of " . Operator::class . ' cases';
         }
         if ($sort !== null && !\is_bool($sort)) {
-            $errors[] = "{$at}: sort must be bool";
+            $errors[] = "{$location}: sort must be bool";
         }
         if ($composite && ($filter !== null || $sort !== null)) {
-            $errors[] = "{$at}: composite attribute can not be filtered or sorted";
+            $errors[] = "{$location}: composite attribute can not be filtered or sorted";
         }
 
         return $errors;
@@ -474,45 +474,45 @@ abstract class Resource implements Metadata
                     . get_debug_type($relationship);
                 continue;
             }
-            $at = "relationship {$name}";
+            $location = "relationship {$name}";
             if ($name === '' || $name === 'type' || $name === 'id') {
-                $errors[] = "{$at}: name must be non-empty and not reserved by JSON:API";
+                $errors[] = "{$location}: name must be non-empty and not reserved by JSON:API";
             }
             if (isset(static::ATTRIBUTES[$name])) {
-                $errors[] = "{$at}: an attribute has the same name";
+                $errors[] = "{$location}: an attribute has the same name";
             }
             $names[] = $name;
 
             $target = $relationship->resource;
             if (!is_subclass_of($target, self::class)) {
-                $errors[] = "{$at}: resource {$target} is not a subclass of " . self::class;
+                $errors[] = "{$location}: resource {$target} is not a subclass of " . self::class;
                 continue;
             }
             $relation = $relationship->relation;
             if (\count($relation) !== 2) {
-                $errors[] = "{$at}: relation must be [own column, column of {$target}]";
+                $errors[] = "{$location}: relation must be [own column, column of {$target}]";
                 continue;
             }
-            [$own, $other] = $relation;
+            [$own_column, $target_column] = $relation;
             // ключи связей сравнивает PHP: только у int порядок и равенство те же, что в PostgreSQL
-            $ownType = self::columnType(static::class, $own, $at, $errors);
-            if ($ownType !== null && $ownType !== self::INT) {
-                $errors[] = "{$at}: column {$own} must be INT, got {$ownType}";
+            $own_column_type = self::columnType(static::class, $own_column, $location, $errors);
+            if ($own_column_type !== null && $own_column_type !== self::INT) {
+                $errors[] = "{$location}: column {$own_column} must be INT, got {$own_column_type}";
             }
-            $otherType = self::columnType($target, $other, $at, $errors);
-            if ($otherType !== null && $otherType !== self::INT) {
-                $errors[] = "{$at}: column {$other} of {$target} must be INT, got {$otherType}";
+            $target_column_type = self::columnType($target, $target_column, $location, $errors);
+            if ($target_column_type !== null && $target_column_type !== self::INT) {
+                $errors[] = "{$location}: column {$target_column} of {$target} must be INT, got {$target_column_type}";
             }
-            if ($relationship instanceof OneToOne && !self::isUniqueColumn($target, $other)) {
-                $errors[] = "{$at}: column {$other} must be the primary key or a unique column of {$target}"
+            if ($relationship instanceof OneToOne && !self::isUniqueColumn($target, $target_column)) {
+                $errors[] = "{$location}: column {$target_column} must be the primary key or a unique column of {$target}"
                     . ' (OneToOne)';
             }
             if ($relationship instanceof OneToOne && ($relationship->filter !== [] || $relationship->sort)) {
                 if (!self::isForeignKey($relationship)) {
-                    $errors[] = "{$at}: only a foreign-key relationship can be filtered or sorted";
+                    $errors[] = "{$location}: only a foreign-key relationship can be filtered or sorted";
                 }
                 array_push($errors, ...self::searchErrors(
-                    $at,
+                    $location,
                     $relationship->filter === [] ? null : $relationship->filter,
                     null,
                     false,
@@ -530,11 +530,11 @@ abstract class Resource implements Metadata
      * @param class-string<self> $resource
      * @param list<string>       $errors
      */
-    private static function columnType(string $resource, string $column, string $at, array &$errors): ?string
+    private static function columnType(string $resource, string $column, string $location, array &$errors): ?string
     {
         $tree = $resource::modelTree();
         if ($tree !== null && !$tree->hasColumn($column)) {
-            $errors[] = "{$at}: column {$column} is missing in the model of {$resource}";
+            $errors[] = "{$location}: column {$column} is missing in the model of {$resource}";
 
             return null;
         }

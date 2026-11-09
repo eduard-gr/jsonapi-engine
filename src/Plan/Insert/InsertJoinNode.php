@@ -5,11 +5,11 @@ declare(strict_types=1);
 namespace Ggs\JsonApiEngine\Plan\Insert;
 
 /**
- * Узел плана вставки: связь `name` между ресурсами. Исполнитель — `Executor\InsertJoinWriter`.
+ * Узел плана вставки: связь `name` между ресурсами. Исполнитель — `Executor\Insert\InsertJoinWriter`.
  *
- * `first` вставляет владельца связи (сторона с первичным ключом: `relation[0]` — ключ владельца), `then` — новых детей
- * из `relationships[name]` с колонкой `relation[1]`. Связи одного владельца — левый глубокий список: `first` может быть
- * другим `InsertJoinNode` того же владельца; порядок списка — порядок вставки (см. `InsertPlanner`).
+ * `parent` вставляет владельца связи (родитель — сторона с первичным ключом: `relation[0]` — ключ владельца), `child` —
+ * его новых детей из `relationships[name]` с колонкой `relation[1]`. Связи одного владельца — левый глубокий список:
+ * `parent` может быть другим `InsertJoinNode` того же владельца; порядок списка — порядок вставки (см. `InsertPlanner`).
  */
 final readonly class InsertJoinNode
 {
@@ -19,7 +19,7 @@ final readonly class InsertJoinNode
     public function __construct(
         public string $name,
         public array $relation,
-        public InsertJoinNode|InsertResourceNode $first,
-        public InsertJoinNode|InsertResourceNode $then,
+        public InsertJoinNode|InsertResourceNode $parent,
+        public InsertJoinNode|InsertResourceNode $child,
     ) {}
 }

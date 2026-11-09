@@ -4,11 +4,6 @@ declare(strict_types=1);
 
 namespace Ggs\JsonApiEngine\Plan\Select;
 
-use Ggs\JsonApiEngine\Plan\JoinNode;
-use Ggs\JsonApiEngine\Plan\ResourceNode;
-use Ggs\JsonApiEngine\Plan\Rule;
-use Ggs\JsonApiEngine\Plan\SharedRowJoinNode;
-use Ggs\JsonApiEngine\Plan\SharedScanNode;
 
 /**
  * Ветка в outer общей строки поднимается над ней:
@@ -24,7 +19,7 @@ use Ggs\JsonApiEngine\Plan\SharedScanNode;
 final class LiftBranchFromOuterRule extends Rule
 {
     #[\Override]
-    public function apply(ResourceNode|SharedScanNode|JoinNode $node): ResourceNode|SharedScanNode|JoinNode|null
+    public function apply(ResourceNode|SharedScanNode|SqlScanNode|JoinNode $node): ResourceNode|SharedScanNode|SqlScanNode|JoinNode|null
     {
         // Ветка — любое соединение, кроме SharedRowJoinNode: её inner читается отдельным запросом
         if (!$node instanceof SharedRowJoinNode || !$node->outer instanceof JoinNode || $node->outer instanceof SharedRowJoinNode) {

@@ -12,14 +12,14 @@ use Ggs\JsonApiEngine\Example\Resource\DetailResource;
 use Ggs\JsonApiEngine\Example\Resource\DomainResource;
 use Ggs\JsonApiEngine\Example\Resource\LogResource;
 use Ggs\JsonApiEngine\Example\Resource\ProviderResource;
-use Ggs\JsonApiEngine\Executor\HashNestJoinIterator;
-use Ggs\JsonApiEngine\Executor\MergeNestJoinIterator;
-use Ggs\JsonApiEngine\Executor\PreloadIterator;
-use Ggs\JsonApiEngine\Executor\SerializeIterator;
-use Ggs\JsonApiEngine\Executor\SharedDataIterator;
-use Ggs\JsonApiEngine\Executor\SharedRowJoinIterator;
-use Ggs\JsonApiEngine\Executor\SharedScanIterator;
-use Ggs\JsonApiEngine\Executor\SqlScanIterator;
+use Ggs\JsonApiEngine\Executor\Select\HashNestJoinIterator;
+use Ggs\JsonApiEngine\Executor\Select\ManualSerializeIterator;
+use Ggs\JsonApiEngine\Executor\Select\MergeNestJoinIterator;
+use Ggs\JsonApiEngine\Executor\Select\PreloadIterator;
+use Ggs\JsonApiEngine\Executor\Select\SharedDataIterator;
+use Ggs\JsonApiEngine\Executor\Select\SharedRowJoinIterator;
+use Ggs\JsonApiEngine\Executor\Select\SharedScanIterator;
+use Ggs\JsonApiEngine\Executor\Select\SqlScanIterator;
 use PHPUnit\Framework\TestCase;
 
 require_once __DIR__ . '/../example/db/connection.php';
@@ -190,26 +190,26 @@ final class DocumentTreeTest extends TestCase
      * Сертификаты с деталями и доставкой из одного SQL (QUERY1), провайдеры (QUERY4) загружаются в реестр,
      * домены (QUERY2) с логами (QUERY3) вкладываются в сертификаты.
      *
-     * Публичный: `PlanTreeTest` сравнивает с ним топологию дерева, которое `ExecutorBuilder` собирает по плану.
+     * Публичный: `PlanTreeTest` сравнивает с ним топологию дерева, которое `IteratorBuilder` собирает по плану.
      */
     public static function tree(\PDO $pdo, ResourceRegistry $registry): HashNestJoinIterator
     {
         return new HashNestJoinIterator(
             outer: new PreloadIterator(
                 source: self::certificates($pdo, $registry),
-                preload: new SerializeIterator(
+                preload: new ManualSerializeIterator(
                     source: new SqlScanIterator(pdo: $pdo, sql: QUERY4),
                     resource: ProviderResource::class,
                     registry: $registry,
                 ),
             ),
             inner: new MergeNestJoinIterator(
-                outer: new SerializeIterator(
+                outer: new ManualSerializeIterator(
                     source: new SqlScanIterator(pdo: $pdo, sql: QUERY2),
                     resource: DomainResource::class,
                     registry: $registry,
                 ),
-                inner: new SerializeIterator(
+                inner: new ManualSerializeIterator(
                     source: new SqlScanIterator(pdo: $pdo, sql: QUERY3),
                     resource: LogResource::class,
                     registry: $registry,
@@ -235,11 +235,11 @@ final class DocumentTreeTest extends TestCase
             data: $data,
             source: new SharedRowJoinIterator(
                 outer: new SharedRowJoinIterator(
-                    outer: new SerializeIterator(source: $data, resource: CertificateResource::class, registry: $registry),
-                    inner: new SerializeIterator(source: $data, resource: DetailResource::class, registry: $registry),
+                    outer: new ManualSerializeIterator(source: $data, resource: CertificateResource::class, registry: $registry),
+                    inner: new ManualSerializeIterator(source: $data, resource: DetailResource::class, registry: $registry),
                     name: CertificateResource::DETAIL,
                 ),
-                inner: new SerializeIterator(source: $data, resource: DeliveryResource::class, registry: $registry),
+                inner: new ManualSerializeIterator(source: $data, resource: DeliveryResource::class, registry: $registry),
                 name: CertificateResource::DELIVERY,
             ),
         );

@@ -1,7 +1,7 @@
 <?php
 
 /**
- * Стадии 2–6 выполнения запроса без парсера: дерево запроса → QueryPlanner (шаги плана, SQL) → ExecutorBuilder
+ * Стадии 2–6 выполнения запроса без парсера: дерево запроса → SelectPlanner (шаги плана, SQL) → IteratorBuilder
  * → документ JSON:API по SQLite базе example/db.
  *
  * Дерево в TREE — то, что QueryParser возвращает для `/certificates?include=provider,detail,delivery,domains.logs`
@@ -25,15 +25,15 @@ use Ggs\JsonApiEngine\Example\Resource\DetailResource;
 use Ggs\JsonApiEngine\Example\Resource\DomainResource;
 use Ggs\JsonApiEngine\Example\Resource\LogResource;
 use Ggs\JsonApiEngine\Example\Resource\ProviderResource;
-use Ggs\JsonApiEngine\Executor\ExecutorBuilder;
+use Ggs\JsonApiEngine\Executor\Select\IteratorBuilder;
 use Ggs\JsonApiEngine\Parser\QueryParser;
-use Ggs\JsonApiEngine\Plan\Select\QueryPlanner;
-use Ggs\JsonApiEngine\Plan\Select\QueryPlanPrinter;
+use Ggs\JsonApiEngine\Plan\Select\SelectPlanner;
+use Ggs\JsonApiEngine\Plan\Select\SelectPlanPrinter;
 
 require __DIR__ . '/../vendor/autoload.php';
 require_once __DIR__ . '/db/connection.php';
 
-/** вход QueryPlanner: дерево запроса от QueryParser */
+/** вход SelectPlanner: дерево запроса от QueryParser */
 const TREE = [
     'resource' => CertificateResource::class,
     'fields' => ['code', 'nominal', 'currency', 'status', 'created_at', 'provider'],
@@ -100,23 +100,23 @@ const TREE = [
 ];
 
 // Стадии 2–3: дерево после каждого шага планировщика; последнее ('sql') — план с SQL у каждого владельца запроса
-$steps = (new QueryPlanner())->plan(tree: TREE);
+$steps = (new SelectPlanner())->plan(tree: TREE);
 $plan = $steps['sql'];
 
 if (in_array('--steps', $argv, true)) {
     foreach ($steps as $name => $root) {
-        echo "== {$name}\n", QueryPlanPrinter::tree(node: $root), "\n";
+        echo "== {$name}\n", SelectPlanPrinter::tree(node: $root), "\n";
     }
     exit;
 }
 
 if (in_array('--sql', $argv, true)) {
-    echo QueryPlanPrinter::queries(node: $plan);
+    echo SelectPlanPrinter::queries(node: $plan);
     exit;
 }
 
 // Стадия 4: дерево итераторов на одно выполнение
-$builder = new ExecutorBuilder(pdo: getPDO());
+$builder = new IteratorBuilder(pdo: getPDO());
 
 if (in_array('--explain', $argv, true)) {
     $flow = $builder->build(plan: $plan, registry: new ResourceRegistry());

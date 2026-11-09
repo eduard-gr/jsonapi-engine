@@ -12,7 +12,7 @@ use Ggs\JsonApiEngine\Resource\Insertable;
 /**
  * `detail`: таблица `certificate_details`, идентификатор — её первичный ключ `certificate_id`.
  *
- * Можно создавать (`Insertable`): вставку см. `Executor\InsertResourceWriter`.
+ * Можно создавать (`Insertable`): вставку см. `Executor\Insert\InsertResourceWriter`.
  */
 final class DetailResource extends Resource implements Insertable
 {

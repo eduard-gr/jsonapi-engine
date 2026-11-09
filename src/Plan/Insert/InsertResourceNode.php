@@ -9,7 +9,7 @@ use Ggs\JsonApiEngine\Resource\Insertable;
 
 /**
  * Узел плана вставки: граница уровней — ресурс и поддерево таблиц его модели (`input`). Исполнитель —
- * `Executor\InsertResourceWriter` (ресурс JSON:API → строка «колонка модели → значение» → поддерево таблиц).
+ * `Executor\Insert\InsertResourceWriter` (ресурс JSON:API → строка «колонка модели → значение» → поддерево таблиц).
  *
  * Неизменяемый, без состояния. Ресурс — `Insertable` (проверяет планировщик).
  */

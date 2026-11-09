@@ -21,7 +21,7 @@ use Ggs\JsonApiEngine\Resource\Insertable;
  * `certificate`: таблица `certificates`. Связи: `provider` (внешний ключ), `detail` и `delivery` (1:1, обратная
  * сторона), `domains` (1:N).
  *
- * Можно создавать (`Insertable`): вставку см. `Executor\InsertResourceWriter`.
+ * Можно создавать (`Insertable`): вставку см. `Executor\Insert\InsertResourceWriter`.
  */
 final class CertificateResource extends Resource implements Insertable
 {

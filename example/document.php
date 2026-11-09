@@ -17,21 +17,21 @@ use Ggs\JsonApiEngine\Example\Resource\DetailResource;
 use Ggs\JsonApiEngine\Example\Resource\DomainResource;
 use Ggs\JsonApiEngine\Example\Resource\LogResource;
 use Ggs\JsonApiEngine\Example\Resource\ProviderResource;
-use Ggs\JsonApiEngine\Executor\HashNestJoinIterator;
-use Ggs\JsonApiEngine\Executor\MergeNestJoinIterator;
-use Ggs\JsonApiEngine\Executor\PreloadIterator;
-use Ggs\JsonApiEngine\Executor\SerializeIterator;
-use Ggs\JsonApiEngine\Executor\SharedDataIterator;
-use Ggs\JsonApiEngine\Executor\SharedRowJoinIterator;
-use Ggs\JsonApiEngine\Executor\SharedScanIterator;
-use Ggs\JsonApiEngine\Executor\SqlScanIterator;
+use Ggs\JsonApiEngine\Executor\Select\HashNestJoinIterator;
+use Ggs\JsonApiEngine\Executor\Select\ManualSerializeIterator;
+use Ggs\JsonApiEngine\Executor\Select\MergeNestJoinIterator;
+use Ggs\JsonApiEngine\Executor\Select\PreloadIterator;
+use Ggs\JsonApiEngine\Executor\Select\SharedDataIterator;
+use Ggs\JsonApiEngine\Executor\Select\SharedRowJoinIterator;
+use Ggs\JsonApiEngine\Executor\Select\SharedScanIterator;
+use Ggs\JsonApiEngine\Executor\Select\SqlScanIterator;
 
 require __DIR__ . '/../vendor/autoload.php';
 require_once __DIR__ . '/db/connection.php';
 
 $pdo = getPDO();
 
-// Реестр ресурсов этого выполнения: один на всё дерево. Его получают все SerializeIterator
+// Реестр ресурсов этого выполнения: один на всё дерево. Его получают все ManualSerializeIterator
 // (каждый ресурс существует в одном экземпляре) и Document (по нему собирается included)
 $registry = new ResourceRegistry();
 
@@ -46,16 +46,16 @@ $certificates = new SharedScanIterator(
     data: $data,
     source: new SharedRowJoinIterator(
         outer:new SharedRowJoinIterator(
-            outer: new SerializeIterator( // Использование $data
+            outer: new ManualSerializeIterator( // Использование $data
                 source: $data,
                 resource: CertificateResource::class,
                 registry: $registry),
-            inner: new SerializeIterator( // Тот же самый $data!
+            inner: new ManualSerializeIterator( // Тот же самый $data!
                 source: $data,
                 resource: DetailResource::class,
                 registry: $registry),
             name: 'detail'),
-        inner: new SerializeIterator( // Тот же самый $data! Без доставки (LEFT JOIN) — null
+        inner: new ManualSerializeIterator( // Тот же самый $data! Без доставки (LEFT JOIN) — null
             source: $data,
             resource: DeliveryResource::class,
             registry: $registry),
@@ -64,7 +64,7 @@ $certificates = new SharedScanIterator(
 
 // Справочник провайдеров: PreloadIterator вычитывает его целиком, и каждый провайдер
 // регистрируется в реестре
-$flow4 = new SerializeIterator(
+$flow4 = new ManualSerializeIterator(
     source: new SqlScanIterator(
         pdo: $pdo,
         sql: QUERY4),
@@ -81,7 +81,7 @@ $flow1 = new PreloadIterator(
 
 
 // Домены: служебный ключ certificate_id — ключ соединения с сертификатом для HashNestJoinIterator
-$flow2 = new SerializeIterator(
+$flow2 = new ManualSerializeIterator(
     source: new SqlScanIterator(
         pdo: $pdo,
         sql: QUERY2),
@@ -90,7 +90,7 @@ $flow2 = new SerializeIterator(
 
 
 // Логи: служебный ключ domain_id — ключ соединения с доменом для MergeNestJoinIterator
-$flow3 = new SerializeIterator(
+$flow3 = new ManualSerializeIterator(
     source: new SqlScanIterator(
         pdo: $pdo,
         sql: QUERY3),

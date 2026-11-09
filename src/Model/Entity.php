@@ -77,34 +77,34 @@ abstract class Entity implements Metadata
 
         $primary = [];
         foreach (static::COLUMNS as $name => $description) {
-            $at = "column {$name}";
+            $location = "column {$name}";
             if (!\is_array($description)) {
-                $errors[] = "{$at}: description must be an array";
+                $errors[] = "{$location}: description must be an array";
                 continue;
             }
             foreach (array_diff(array_keys($description), self::COLUMN_KEYS) as $key) {
-                $errors[] = "{$at}: unknown key {$key}";
+                $errors[] = "{$location}: unknown key {$key}";
             }
             if (isset($description['column']) && !\is_string($description['column'])) {
-                $errors[] = "{$at}: column must be a string";
+                $errors[] = "{$location}: column must be a string";
             }
             if (!isset($description['type'])) {
-                $errors[] = "{$at}: type is required";
+                $errors[] = "{$location}: type is required";
             } elseif (!\in_array($description['type'], self::TYPES, true)) {
-                $errors[] = "{$at}: unknown type {$description['type']}";
+                $errors[] = "{$location}: unknown type {$description['type']}";
             }
             if (isset($description['mode']) && !\in_array($description['mode'], [self::READ, self::READ_WRITE], true)) {
-                $errors[] = "{$at}: unknown mode {$description['mode']}";
+                $errors[] = "{$location}: unknown mode {$description['mode']}";
             }
             foreach (['nullable', 'unique'] as $flag) {
                 if (isset($description[$flag]) && !\is_bool($description[$flag])) {
-                    $errors[] = "{$at}: {$flag} must be bool";
+                    $errors[] = "{$location}: {$flag} must be bool";
                 }
             }
 
             $constraint = $description['constraint'] ?? null;
             if ($constraint !== null && !\in_array($constraint, [self::PRIMARY, self::FOREIGN], true)) {
-                $errors[] = "{$at}: unknown constraint {$constraint}";
+                $errors[] = "{$location}: unknown constraint {$constraint}";
             }
             if ($constraint === self::PRIMARY) {
                 $primary[] = $name;
@@ -112,19 +112,19 @@ abstract class Entity implements Metadata
             if ($constraint === self::FOREIGN) {
                 $references = $description['references'] ?? null;
                 if (!\is_string($references) || !is_subclass_of($references, self::class)) {
-                    $errors[] = "{$at}: FOREIGN requires references, a subclass of " . self::class;
+                    $errors[] = "{$location}: FOREIGN requires references, a subclass of " . self::class;
                 } else {
                     try {
                         $target = $references::COLUMNS[$references::primaryColumn()];
                         if (($description['type'] ?? null) !== ($target['type'] ?? null)) {
-                            $errors[] = "{$at}: type must match the primary key type of {$references}";
+                            $errors[] = "{$location}: type must match the primary key type of {$references}";
                         }
                     } catch (\LogicException) {
-                        $errors[] = "{$at}: {$references} has no PRIMARY column";
+                        $errors[] = "{$location}: {$references} has no PRIMARY column";
                     }
                 }
             } elseif (isset($description['references'])) {
-                $errors[] = "{$at}: references is allowed only with FOREIGN";
+                $errors[] = "{$location}: references is allowed only with FOREIGN";
             }
         }
 

@@ -4,16 +4,11 @@ declare(strict_types=1);
 
 namespace Ggs\JsonApiEngine\Plan\Select;
 
-use Ggs\JsonApiEngine\Plan\JoinNode;
-use Ggs\JsonApiEngine\Plan\Pass;
-use Ggs\JsonApiEngine\Plan\PreloadNode;
-use Ggs\JsonApiEngine\Plan\ResourceNode;
-use Ggs\JsonApiEngine\Plan\SharedRowJoinNode;
-use Ggs\JsonApiEngine\Plan\SharedScanNode;
 
 /**
- * Каждому владельцу запроса (SharedScanNode) — его Select (pg_builder) и карта колонок строки
- * (SharedScanNode::withSelect()). Сам проход обходит дерево и находит владельцев: вне строк — в обеих сторонах
+ * Каждый владелец запроса (SharedScanNode) заменяется на SqlScanNode — тот же вход и order плюс его Select
+ * (pg_builder), карта колонок строки и параметры (SharedScanNode::withSelect()). После прохода в дереве нет
+ * SharedScanNode: план без этого шага IteratorBuilder и SelectPlanPrinter::queries() отвергают по классу узла. Сам проход обходит дерево и находит владельцев: вне строк — в обеих сторонах
  * соединений, внутри строк — в inner веток 1-1 ресурсов (отдельный запрос со своим владельцем).
  *
  * По пути сверху вниз проход собирает то, что владелец сам не видит, потому что ветки стоят над ним:
@@ -35,7 +30,7 @@ use Ggs\JsonApiEngine\Plan\SharedScanNode;
 final class BuildSqlPass implements Pass
 {
     #[\Override]
-    public function __invoke(ResourceNode|SharedScanNode|JoinNode $plan): ResourceNode|SharedScanNode|JoinNode
+    public function __invoke(ResourceNode|SharedScanNode|SqlScanNode|JoinNode $plan): ResourceNode|SharedScanNode|SqlScanNode|JoinNode
     {
         return $this->build(node: $plan, keys: [], ancestors: []);
     }
@@ -43,14 +38,14 @@ final class BuildSqlPass implements Pass
     /**
      * Вызывается только вне строк.
      *
-     * @param ResourceNode|SharedScanNode|JoinNode $node      корень поддерева вне строк
-     * @param list<string>                         $keys      колонки, нужные соединениям над узлом, — для ресурса, к
-     *                                                        которому по outer приходит поток узла
-     * @param list<Ancestor>                       $ancestors цепочка предков запроса, к которому по outer приходит
-     *                                                        поток узла, от ближайшего
+     * @param ResourceNode|SharedScanNode|SqlScanNode|JoinNode $node      корень поддерева вне строк
+     * @param list<string>                                     $keys      колонки, нужные соединениям над узлом, — для ресурса, к
+     *                                                                    которому по outer приходит поток узла
+     * @param list<Ancestor>                                   $ancestors цепочка предков запроса, к которому по outer приходит
+     *                                                                    поток узла, от ближайшего
      * @throws \LogicException если вне строки встретился ResourceNode без владельца
      */
-    private function build(ResourceNode|SharedScanNode|JoinNode $node, array $keys, array $ancestors): ResourceNode|SharedScanNode|JoinNode
+    private function build(ResourceNode|SharedScanNode|SqlScanNode|JoinNode $node, array $keys, array $ancestors): ResourceNode|SharedScanNode|SqlScanNode|JoinNode
     {
         // Владелец: сначала запросы веток внутри его строки, потом его собственный
         if ($node instanceof SharedScanNode) {
@@ -63,19 +58,23 @@ final class BuildSqlPass implements Pass
             throw new \LogicException(message: 'Resource without query owner: ' . $node->resource . ', run SharedScanPass first');
         }
 
+        if ($node instanceof SqlScanNode) {
+            throw new \LogicException(message: 'Query owner already has a select: the sql step runs once, row ' . $node->rowOwner()->resource);
+        }
+
         // Ветка: обе стороны — самостоятельные поддеревья со своими владельцами запросов
-        [$parentColumn, $childColumn] = $node->relation;
+        [$parent_column, $child_column] = $node->relation;
 
         // inner повторяет условия запроса outer (кроме справочника PreloadNode)
         $outer = self::owner(node: $node->outer);
         $inner = $node instanceof PreloadNode ? [] : [
-            ['node' => $outer, 'resource' => $outer->rowOwner(), 'key' => $parentColumn, 'column' => $childColumn],
+            ['node' => $outer, 'resource' => $outer->rowOwner(), 'key' => $parent_column, 'column' => $child_column],
             ...$ancestors,
         ];
 
         return $node
-            ->withOuter(outer: $this->build(node: $node->outer, keys: [...$keys, $parentColumn], ancestors: $ancestors))
-            ->withInner(inner: $this->build(node: $node->inner, keys: [$childColumn], ancestors: $inner));
+            ->withOuter(outer: $this->build(node: $node->outer, keys: [...$keys, $parent_column], ancestors: $ancestors))
+            ->withInner(inner: $this->build(node: $node->inner, keys: [$child_column], ancestors: $inner));
     }
 
     /**
@@ -83,10 +82,13 @@ final class BuildSqlPass implements Pass
      *
      * @throws \LogicException если по outer нет владельца (дерево не прошло SharedScanPass)
      */
-    private static function owner(ResourceNode|SharedScanNode|JoinNode $node): SharedScanNode
+    private static function owner(ResourceNode|SharedScanNode|SqlScanNode|JoinNode $node): SharedScanNode
     {
         while ($node instanceof JoinNode) {
             $node = $node->outer;
+        }
+        if ($node instanceof SqlScanNode) {
+            throw new \LogicException(message: 'Query owner already has a select: the sql step runs once, row ' . $node->rowOwner()->resource);
         }
         if (!$node instanceof SharedScanNode) {
             throw new \LogicException(message: 'Resource without query owner: ' . $node->resource . ', run SharedScanPass first');
@@ -122,11 +124,11 @@ final class BuildSqlPass implements Pass
      * собирает сам (SharedScanNode::withSelect()). Таблицы самой строки (ResourceNode) Select не получают:
      * они часть FROM владельца. Возвращает узел того же класса, что пришёл (with…() — static).
      *
-     * @param ResourceNode|SharedScanNode|JoinNode $node      узел внутри строки (SharedScanNode там не бывает)
-     * @param SharedScanNode                       $scan      владелец строки
-     * @param list<Ancestor>                       $ancestors цепочка предков владельца строки
+     * @param ResourceNode|SharedScanNode|SqlScanNode|JoinNode $node      узел внутри строки (SharedScanNode там не бывает)
+     * @param SharedScanNode                                   $scan      владелец строки
+     * @param list<Ancestor>                                   $ancestors цепочка предков владельца строки
      */
-    private function inRow(ResourceNode|SharedScanNode|JoinNode $node, SharedScanNode $scan, array $ancestors): ResourceNode|SharedScanNode|JoinNode
+    private function inRow(ResourceNode|SharedScanNode|SqlScanNode|JoinNode $node, SharedScanNode $scan, array $ancestors): ResourceNode|SharedScanNode|SqlScanNode|JoinNode
     {
         if (!$node instanceof JoinNode) {
             return $node;
@@ -139,13 +141,13 @@ final class BuildSqlPass implements Pass
             return $node->withInner(inner: $this->inRow(node: $node->inner, scan: $scan, ancestors: $ancestors));
         }
 
-        [$parentColumn, $childColumn] = $node->relation;
+        [$parent_column, $child_column] = $node->relation;
         $inner = $node instanceof PreloadNode ? [] : [
-            ['node' => $scan, 'resource' => self::leftmost(node: $node->outer), 'key' => $parentColumn, 'column' => $childColumn],
+            ['node' => $scan, 'resource' => self::leftmost(node: $node->outer), 'key' => $parent_column, 'column' => $child_column],
             ...$ancestors,
         ];
 
-        return $node->withInner(inner: $this->build(node: $node->inner, keys: [$childColumn], ancestors: $inner));
+        return $node->withInner(inner: $this->build(node: $node->inner, keys: [$child_column], ancestors: $inner));
     }
 
     /**
@@ -153,7 +155,7 @@ final class BuildSqlPass implements Pass
      *
      * @throws \LogicException если слева не ResourceNode
      */
-    private static function leftmost(ResourceNode|SharedScanNode|JoinNode $node): ResourceNode
+    private static function leftmost(ResourceNode|SharedScanNode|SqlScanNode|JoinNode $node): ResourceNode
     {
         while ($node instanceof JoinNode) {
             $node = $node->outer;

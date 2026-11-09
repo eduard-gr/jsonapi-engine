@@ -7,7 +7,7 @@ namespace Ggs\JsonApiEngine\Plan\Insert;
 use Ggs\JsonApiEngine\Model\Entity;
 
 /**
- * Узел плана вставки: одна таблица модели ресурса (лист уровня таблиц). Исполнитель — `Executor\InsertTableWriter`.
+ * Узел плана вставки: одна таблица модели ресурса (лист уровня таблиц). Исполнитель — `Executor\Insert\InsertTableWriter`.
  *
  * Неизменяемый, без состояния: только сущность и колонки модели ресурса, которые лежат в её таблице
  * (`ModelTree::columnTable()`). Правая колонка `relation` соединения в `columns` не входит: её значение приходит колонкой

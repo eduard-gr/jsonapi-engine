@@ -4,13 +4,6 @@ declare(strict_types=1);
 
 namespace Ggs\JsonApiEngine\Plan\Select;
 
-use Ggs\JsonApiEngine\Plan\HashNestJoinNode;
-use Ggs\JsonApiEngine\Plan\JoinNode;
-use Ggs\JsonApiEngine\Plan\MergeNestJoinNode;
-use Ggs\JsonApiEngine\Plan\ResourceNode;
-use Ggs\JsonApiEngine\Plan\Rule;
-use Ggs\JsonApiEngine\Plan\SharedRowJoinNode;
-use Ggs\JsonApiEngine\Plan\SharedScanNode;
 
 /**
  * HashNestJoinNode → MergeNestJoinNode, если обе стороны можно упорядочить по ключу связи:
@@ -33,18 +26,18 @@ use Ggs\JsonApiEngine\Plan\SharedScanNode;
 final class HashToMergeRule extends Rule
 {
     #[\Override]
-    public function apply(ResourceNode|SharedScanNode|JoinNode $node): ResourceNode|SharedScanNode|JoinNode|null
+    public function apply(ResourceNode|SharedScanNode|SqlScanNode|JoinNode $node): ResourceNode|SharedScanNode|SqlScanNode|JoinNode|null
     {
         if (!$node instanceof HashNestJoinNode) {
             return null;
         }
 
-        // $parentKey — порядок для outer, $childKey — для inner
-        [$parentKey, $childKey] = $node->relation;
+        // $parent_key — порядок для outer, $child_key — для inner
+        [$parent_key, $child_key] = $node->relation;
 
         // Обе стороны должны принять порядок; если хоть одна не может — остаётся Hash
-        $outer = $this->claim(node: $node->outer, key: $parentKey);
-        $inner = $this->claim(node: $node->inner, key: $childKey);
+        $outer = $this->claim(node: $node->outer, key: $parent_key);
+        $inner = $this->claim(node: $node->inner, key: $child_key);
         if ($outer === null || $inner === null) {
             return null;
         }
@@ -56,11 +49,11 @@ final class HashToMergeRule extends Rule
     /**
      * Закрепляет за владельцем потока порядок по ключу.
      *
-     * @param ResourceNode|SharedScanNode|JoinNode $node корень стороны соединения
-     * @param string                               $key  колонка, по которой должен быть упорядочен поток
-     * @return ResourceNode|SharedScanNode|JoinNode|null сторона с порядком у владельца или null, если владелец занят
+     * @param ResourceNode|SharedScanNode|SqlScanNode|JoinNode $node корень стороны соединения
+     * @param string                                           $key  колонка, по которой должен быть упорядочен поток
+     * @return ResourceNode|SharedScanNode|SqlScanNode|JoinNode|null сторона с порядком у владельца или null, если владелец занят
      */
-    private function claim(ResourceNode|SharedScanNode|JoinNode $node, string $key): ResourceNode|SharedScanNode|JoinNode|null
+    private function claim(ResourceNode|SharedScanNode|SqlScanNode|JoinNode $node, string $key): ResourceNode|SharedScanNode|SqlScanNode|JoinNode|null
     {
         // После SharedScanPass у каждого запроса есть владелец; голый ресурс или строка — ошибка порядка шагов
         if ($node instanceof SharedRowJoinNode) {

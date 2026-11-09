@@ -13,8 +13,8 @@ use Ggs\JsonApiEngine\Resource\Insertable;
 use LogicException;
 
 /**
- * Планировщик вставки: корневой ресурс точки входа + дерево документа (`Parser\DocumentParser::parse()`) → план
- * (неизменяемые узлы `Plan\Insert`). Исполнителей по плану строит `Executor\WriterBuilder`.
+ * Планировщик вставки: корневой ресурс точки входа + дерево документа (`Parser\Insert\DocumentParser::parse()`) → план
+ * (неизменяемые узлы `Plan\Insert`). Исполнителей по плану строит `Executor\Insert\WriterBuilder`.
  *
  * Поток: класс корневого ресурса, `list<ресурс>` корней → `InsertJoinNode|InsertResourceNode`.
  *
@@ -25,7 +25,7 @@ use LogicException;
  *
  * Уровень ресурсов:
  *  - ресурс → `InsertResourceNode(resource, input)`, `input` — поддерево таблиц его модели (`tables()`);
- *  - связи владельца — левый глубокий список `InsertJoinNode(name, relation, first: владелец…, then: дети)`
+ *  - связи владельца — левый глубокий список `InsertJoinNode(name, relation, parent: владелец…, child: дети)`
  *    в порядке объявления в `relationships()` ресурса. Порядок объявления — порядок вставки: связь, таблицы которой
  *    ссылаются на таблицы другой связи того же владельца, объявляется позже (`delivery` после `detail`:
  *    `certificate_delivery_meta.certificate_id` ссылается на `certificate_details`). Сущности такую ссылку не описывают
@@ -35,25 +35,28 @@ use LogicException;
  *    ресурса (`InsertResourceWriter`), узла у неё нет. Связь, у которой ни то ни другое, — `LogicException`.
  *
  * Уровень таблиц (`tables()`): сущность → `InsertTableNode` со своими колонками модели (`ModelTree::columnTable()`),
- * соединение → `InsertTableJoinNode`. Порядок сторон — по метаданным сущностей: для `relation` `[l, r]` левая первой,
- * если `l` — первичный ключ левой сущности или `r` ссылается на неё (`references`); правая первой, если `r` — первичный
- * ключ правой или `l` ссылается на неё; иначе `LogicException`. Сущность колонки `relation` ищется по имени в своём
- * поддереве (первая таблица слева, где она есть), как в `ModelTree`. Правая сторона `LeftJoin` необязательная.
+ * соединение → `InsertTableJoinNode(relation: [колонка родителя, колонка ребёнка], parent, child)`.
+ * Родитель — сторона, от которой зависит другая, определяется по метаданным сущностей: для `relation`
+ * `[left_column, right_column]` модели родитель левая сторона, если `left_column` — первичный ключ левой сущности или
+ * `right_column` ссылается на неё (`references`); правая, если наоборот; иначе `LogicException`. Сущность колонки
+ * `relation` ищется по имени в своём поддереве (первая таблица слева, где она есть), как в `ModelTree`. Правая сторона
+ * `LeftJoin` необязательная: она оборачивается в `InsertOptionalTableNode` и родителем может оказаться так же, как
+ * и ребёнком.
  *
  * Вход проверен парсером; несоответствие (ресурс не `Insertable`, неизвестная связь) — `LogicException`.
  *
  * Параметр маршрута вложенного ресурса — значение, а не форма плана: `routeLink()` превращает его в колонки связи,
- * которые получает `WriterBuilder::document()`.
+ * которые получает `WriterBuilder::root()`.
  */
 final class InsertPlanner
 {
     /**
      * @param class-string<Resource> $resource корневой ресурс точки входа
-     * @param list<array>            $roots    корни из `DocumentParser::parse()`
+     * @param list<array>            $data     ресурсы `data` документа из `DocumentParser::parse()`
      */
-    public function plan(string $resource, array $roots): InsertJoinNode|InsertResourceNode
+    public function plan(string $resource, array $data): InsertJoinNode|InsertResourceNode
     {
-        return $this->resource(resource: $resource, items: $roots);
+        return $this->resource(resource: $resource, items: $data);
     }
 
     /**
@@ -77,7 +80,9 @@ final class InsertPlanner
      */
     private function resource(string $resource, array $items): InsertJoinNode|InsertResourceNode
     {
-        $node = new InsertResourceNode(resource: self::insertable($resource), input: $this->tables(resource: $resource));
+        $node = new InsertResourceNode(
+            resource: self::insertable($resource),
+            input: $this->tables(resource: $resource));
 
         foreach (array_keys($resource::relationships()) as $name) {
             $name = (string) $name;
@@ -94,8 +99,8 @@ final class InsertPlanner
             $node = new InsertJoinNode(
                 name: $name,
                 relation: $relation,
-                first: $node,
-                then: $this->resource(resource: $target, items: $children),
+                parent: $node,
+                child: $this->resource(resource: $target, items: $children),
             );
         }
 
@@ -137,24 +142,39 @@ final class InsertPlanner
             return new InsertTableNode(entity: $model, columns: $columns[$number] ?? []);
         }
 
-        $left = $this->table(model: $model->left, columns: $columns, leaf: $leaf);
-        $right = $this->table(model: $model->right, columns: $columns, leaf: $leaf);
+        $left_subtree = $this->table(model: $model->left, columns: $columns, leaf: $leaf);
+        $right_subtree = $this->table(model: $model->right, columns: $columns, leaf: $leaf);
+        // Правая сторона LeftJoin необязательна: её может не быть в строке, как в SELECT. Она может оказаться и
+        // родителем, и ребёнком — обёртка остаётся на ней в любом случае
+        if ($model instanceof LeftJoin) {
+            $right_subtree = new InsertOptionalTableNode(input: $right_subtree);
+        }
 
         /** @var array{0: string, 1: string} $relation */
         $relation = $model->relation;
-        [$l, $r] = $relation;
-        $leftEntity = self::owner(model: $model->left, column: $l);
-        $rightEntity = self::owner(model: $model->right, column: $r);
-        $optional = $model instanceof LeftJoin;
+        [$left_column, $right_column] = $relation;
+        $left_entity = self::owner(model: $model->left, column: $left_column);
+        $right_entity = self::owner(model: $model->right, column: $right_column);
+        // Родитель — сторона, от которой зависит другая: её колонка — первичный ключ, или на неё ссылается колонка
+        // другой стороны. Родитель вставляется первым, его ключ уходит ребёнку колонкой связи
+        $left_is_parent = $left_entity::primaryColumn() === $left_column
+            || ($right_entity::COLUMNS[$right_column]['references'] ?? null) === $left_entity;
+        $right_is_parent = $right_entity::primaryColumn() === $right_column
+            || ($left_entity::COLUMNS[$left_column]['references'] ?? null) === $right_entity;
 
-        if ($leftEntity::primaryColumn() === $l || ($rightEntity::COLUMNS[$r]['references'] ?? null) === $leftEntity) {
-            return new InsertTableJoinNode(relation: [$l, $r], first: $left, then: $right, optional: $optional ? 'then' : null);
-        }
-        if ($rightEntity::primaryColumn() === $r || ($leftEntity::COLUMNS[$l]['references'] ?? null) === $rightEntity) {
-            return new InsertTableJoinNode(relation: [$r, $l], first: $right, then: $left, optional: $optional ? 'first' : null);
-        }
+        [$parent_column, $child_column, $parent_subtree, $child_subtree] = match (true) {
+            $left_is_parent => [$left_column, $right_column, $left_subtree, $right_subtree],
+            $right_is_parent => [$right_column, $left_column, $right_subtree, $left_subtree],
+            default => throw new LogicException(
+                "Can not order join on [{$left_column}, {$right_column}]: no primary key or reference between the tables",
+            ),
+        };
 
-        throw new LogicException("Can not order join on [{$l}, {$r}]: no primary key or reference between the tables");
+        return new InsertTableJoinNode(
+            relation: [$parent_column, $child_column],
+            parent: $parent_subtree,
+            child: $child_subtree,
+        );
     }
 
     /**

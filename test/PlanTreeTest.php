@@ -9,22 +9,25 @@ use Ggs\JsonApiEngine\Example\Controller\CertificatesController;
 use Ggs\JsonApiEngine\Example\Resource\CertificateResource;
 use Ggs\JsonApiEngine\Example\Resource\DeliveryResource;
 use Ggs\JsonApiEngine\Example\Resource\DomainResource;
-use Ggs\JsonApiEngine\Executor\ExecutorBuilder;
-use Ggs\JsonApiEngine\Executor\HashJoinIterator;
-use Ggs\JsonApiEngine\Plan\HashJoinNode;
-use Ggs\JsonApiEngine\Plan\HashNestJoinNode;
-use Ggs\JsonApiEngine\Plan\JoinNode;
-use Ggs\JsonApiEngine\Plan\ResourceNode;
+use Ggs\JsonApiEngine\Executor\Select\HashJoinIterator;
+use Ggs\JsonApiEngine\Executor\Select\IteratorBuilder;
+use Ggs\JsonApiEngine\Executor\Select\ManualSerializeIterator;
+use Ggs\JsonApiEngine\Executor\Select\SerializeIterator;
 use Ggs\JsonApiEngine\Plan\Select\BuildSqlPass;
-use Ggs\JsonApiEngine\Plan\SharedRowJoinNode;
-use Ggs\JsonApiEngine\Plan\SharedScanNode;
+use Ggs\JsonApiEngine\Plan\Select\HashJoinNode;
+use Ggs\JsonApiEngine\Plan\Select\HashNestJoinNode;
+use Ggs\JsonApiEngine\Plan\Select\JoinNode;
+use Ggs\JsonApiEngine\Plan\Select\ResourceNode;
+use Ggs\JsonApiEngine\Plan\Select\SharedRowJoinNode;
+use Ggs\JsonApiEngine\Plan\Select\SharedScanNode;
+use Ggs\JsonApiEngine\Plan\Select\SqlScanNode;
 use LogicException;
 use PHPUnit\Framework\TestCase;
 
 require_once __DIR__ . '/../example/db/connection.php';
 
 /**
- * Запрос → план → `ExecutorBuilder` → документ на SQLite базе `example/db`.
+ * Запрос → план → `IteratorBuilder` → документ на SQLite базе `example/db`.
  *
  * Для `GET /certificates?include=provider,detail,delivery,domains.logs` (дерево `example/document.php`) дерево
  * итераторов по плану совпадает по топологии с собранным руками (`DocumentTreeTest::tree()`), а документ —
@@ -48,7 +51,7 @@ final class PlanTreeTest extends TestCase
     public function testTopologyMatchesHandMadeTree(): void
     {
         $plan = (new CertificatesController(pdo: getPDO()))->plan(query: self::EXAMPLE);
-        $built = (new ExecutorBuilder(pdo: getPDO()))->build(plan: $plan, registry: new ResourceRegistry());
+        $built = (new IteratorBuilder(pdo: getPDO()))->build(plan: $plan, registry: new ResourceRegistry());
 
         self::assertSame(
             self::topology(DocumentTreeTest::tree(getPDO(), new ResourceRegistry())->explain()),
@@ -62,7 +65,7 @@ final class PlanTreeTest extends TestCase
     public function testPlanRunsTwice(): void
     {
         $plan = (new CertificatesController(pdo: getPDO()))->plan(query: self::EXAMPLE);
-        $builder = new ExecutorBuilder(pdo: getPDO());
+        $builder = new IteratorBuilder(pdo: getPDO());
 
         self::assertSame(
             json_encode($builder->document(plan: $plan), \JSON_THROW_ON_ERROR),
@@ -105,7 +108,7 @@ final class PlanTreeTest extends TestCase
                 inner: new SharedScanNode(input: new ResourceNode(resource: DomainResource::class, fields: ['domain_name'])),
             ),
         )));
-        $builder = new ExecutorBuilder(pdo: getPDO());
+        $builder = new IteratorBuilder(pdo: getPDO());
 
         $explain = $builder->build(plan: $plan, registry: new ResourceRegistry())->explain();
         self::assertSame(HashJoinIterator::class, $explain['source']['inner']['node']);
@@ -130,7 +133,7 @@ final class PlanTreeTest extends TestCase
     public function testPlanWithoutSqlStepFails(): void
     {
         $this->expectException(LogicException::class);
-        (new ExecutorBuilder(pdo: getPDO()))->build(
+        (new IteratorBuilder(pdo: getPDO()))->build(
             plan: new SharedScanNode(input: new ResourceNode(resource: CertificateResource::class)),
             registry: new ResourceRegistry(),
         );
@@ -139,7 +142,7 @@ final class PlanTreeTest extends TestCase
     public function testResourceOutsideQueryOwnerFails(): void
     {
         $this->expectException(LogicException::class);
-        (new ExecutorBuilder(pdo: getPDO()))->build(
+        (new IteratorBuilder(pdo: getPDO()))->build(
             plan: new ResourceNode(resource: CertificateResource::class),
             registry: new ResourceRegistry(),
         );
@@ -158,20 +161,27 @@ final class PlanTreeTest extends TestCase
                 inner: new SharedScanNode(input: new ResourceNode(resource: DomainResource::class)),
             ),
         )));
-        self::assertInstanceOf(SharedScanNode::class, $plan);
+        self::assertInstanceOf(SqlScanNode::class, $plan);
         self::assertInstanceOf(SharedRowJoinNode::class, $plan->input);
         self::assertInstanceOf(JoinNode::class, $plan->input->inner);
         // Тот же план, но 1:N внутри строки — HashNestJoinNode (SharedScanPass так не оставляет)
         $inner = $plan->input->inner;
-        $broken = $plan->withInput(input: $plan->input->withInner(inner: new HashNestJoinNode(
-            name: $inner->name,
-            relation: $inner->relation,
-            outer: $inner->outer,
-            inner: $inner->inner,
-        )));
+        // SqlScanNode неизменяем и без with…(): испорченную копию собираем конструктором
+        $broken = new SqlScanNode(
+            input: $plan->input->withInner(inner: new HashNestJoinNode(
+                name: $inner->name,
+                relation: $inner->relation,
+                outer: $inner->outer,
+                inner: $inner->inner,
+            )),
+            order: $plan->order,
+            select: $plan->select,
+            columns: $plan->columns,
+            parameters: $plan->parameters,
+        );
 
         $this->expectException(LogicException::class);
-        (new ExecutorBuilder(pdo: getPDO()))->build(plan: $broken, registry: new ResourceRegistry());
+        (new IteratorBuilder(pdo: getPDO()))->build(plan: $broken, registry: new ResourceRegistry());
     }
 
     /**
@@ -187,6 +197,10 @@ final class PlanTreeTest extends TestCase
             if (isset($explain[$key])) {
                 $result[$key] = $explain[$key];
             }
+        }
+        // Ручное дерево собирает ресурсы ManualSerializeIterator, план — SerializeIterator: место в дереве одно и то же
+        if (($result['node'] ?? null) === ManualSerializeIterator::class) {
+            $result['node'] = SerializeIterator::class;
         }
         foreach (['data', 'source', 'outer', 'inner', 'preload'] as $key) {
             if (isset($explain[$key])) {

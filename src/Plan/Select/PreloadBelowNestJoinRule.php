@@ -4,13 +4,6 @@ declare(strict_types=1);
 
 namespace Ggs\JsonApiEngine\Plan\Select;
 
-use Ggs\JsonApiEngine\Plan\HashNestJoinNode;
-use Ggs\JsonApiEngine\Plan\JoinNode;
-use Ggs\JsonApiEngine\Plan\MergeNestJoinNode;
-use Ggs\JsonApiEngine\Plan\PreloadNode;
-use Ggs\JsonApiEngine\Plan\ResourceNode;
-use Ggs\JsonApiEngine\Plan\Rule;
-use Ggs\JsonApiEngine\Plan\SharedScanNode;
 
 /**
  * PreloadNode опускается под nest join, ближе к строке:
@@ -22,15 +15,15 @@ use Ggs\JsonApiEngine\Plan\SharedScanNode;
 final class PreloadBelowNestJoinRule extends Rule
 {
     #[\Override]
-    public function apply(ResourceNode|SharedScanNode|JoinNode $node): ResourceNode|SharedScanNode|JoinNode|null
+    public function apply(ResourceNode|SharedScanNode|SqlScanNode|JoinNode $node): ResourceNode|SharedScanNode|SqlScanNode|JoinNode|null
     {
         if (!$node instanceof PreloadNode
             || !($node->outer instanceof HashNestJoinNode || $node->outer instanceof MergeNestJoinNode)) {
             return null;
         }
 
-        $nest = $node->outer;                                                    // NestJoin(A, B)
+        $nest_join = $node->outer;                                                    // NestJoin(A, B)
 
-        return $nest->withOuter(outer: $node->withOuter(outer: $nest->outer));    // NestJoin(Preload(A, C), B)
+        return $nest_join->withOuter(outer: $node->withOuter(outer: $nest_join->outer));    // NestJoin(Preload(A, C), B)
     }
 }

@@ -14,7 +14,7 @@ use Ggs\JsonApiEngine\Resource\Insertable;
 /**
  * `domain`: таблица `domains` (QUERY2). Связь `logs` (1:N).
  *
- * Можно создавать (`Insertable`): вставку см. `Executor\InsertResourceWriter`.
+ * Можно создавать (`Insertable`): вставку см. `Executor\Insert\InsertResourceWriter`.
  */
 final class DomainResource extends Resource implements Insertable
 {

@@ -23,12 +23,12 @@ PHP-библиотека, реализующая JSON API.
 | Описание данных: сущности и модели, ресурсы | `src/Model/`, `src/Resource*` | готово; схемы endpoint'а пока нет — всё разрешает ресурс |
 | 1. Парсер: запрос → дерево запроса | `src/Parser/` | готово |
 | 2. Планировщик: дерево запроса → узлы плана, шаги | `src/Plan/`, `src/Plan/Select/` | готово |
-| 3. SQL плана (pg_builder) | `Plan\SharedScanNode::withSelect()`, `Plan\Select\BuildSqlPass` | список колонок, FROM/ON, WHERE из фильтров, ORDER BY, цепочка предков (CTE + `IN`); нет оператора `in`, параметров маршрута |
-| 4. Сборка дерева итераторов по плану | `src/Executor/ExecutorBuilder.php` | готово |
-| 5. Выполнение (итераторы Volcano), сериализация | `src/Executor/` | готово |
+| 3. SQL плана (pg_builder) | `Plan\Select\SharedScanNode::withSelect()`, `Plan\Select\BuildSqlPass` | список колонок, FROM/ON, WHERE из фильтров, ORDER BY, цепочка предков (CTE + `IN`); нет оператора `in`, параметров маршрута |
+| 4. Сборка дерева итераторов по плану | `src/Executor/Select/IteratorBuilder.php` | готово |
+| 5. Выполнение (итераторы Volcano), сериализация | `src/Executor/Select/` | готово |
 | 6. Документ JSON:API | `src/Document/` | готово |
 | Точка входа библиотеки, транзакция, пагинация | — | нет; весь путь собирает контроллер примера `example/Controller/CertificatesController` |
-| Вставка: документ → дерево новых ресурсов → план → дерево вставки | `Parser\DocumentParser`, `Plan\Insert\`, `Executor\WriterBuilder`, `Executor\…Writer`, `Resource\Insertable` | парсер документа, планировщик и исполнитель готовы; нет ответа и контроллера `POST` |
+| Вставка: документ → дерево новых ресурсов → план → дерево вставки | `Parser\Insert\DocumentParser`, `Plan\Insert\`, `Executor\Insert\WriterBuilder`, `Executor\…Writer`, `Resource\Insertable` | парсер документа, планировщик и исполнитель готовы; нет ответа и контроллера `POST` |
 
 Проверено на SQLite и PDO (`example/db`): документ по плану для запроса примера совпадает с эталоном `test/Fixture/document.json`. Целевая СУБД — PostgreSQL; против неё пока ничего не проверяется.
 
@@ -137,15 +137,15 @@ GET /certificates?include=…&fields[…]=…&filter[…]=…&sort=…   + ко�
 1. Парсинг и валидация   QueryParser::parse()            ──►  дерево запроса (массив)
         │                                                      ошибки клиента: 400 / 404
         ▼
-2. Планирование          QueryPlanner: fromTree()         ──►  узлы плана (src/Plan)
+2. Планирование          SelectPlanner: fromTree()         ──►  узлы плана (src/Plan/Select)
                          шаги lift → order → close → merge
         │
         ▼
-3. SQL                   шаг sql: BuildSqlPass             ──►  у каждого SharedScanNode: Select, parameters, columns
+3. SQL                   шаг sql: BuildSqlPass             ──►  SharedScanNode → SqlScanNode: Select, parameters, columns
                          → SharedScanNode::withSelect()
         │
         ▼
-4. Сборка исполнителя    ExecutorBuilder                   ──►  дерево итераторов (src/Executor) + ResourceRegistry
+4. Сборка исполнителя    IteratorBuilder                   ──►  дерево итераторов (src/Executor/Select) + ResourceRegistry
         │
         ▼
 5. Выполнение            перебор корня (Volcano)           ──►  поток ResourceRecord, связи записаны
@@ -181,11 +181,11 @@ GET /certificates?include=…&fields[…]=…&filter[…]=…&sort=…   + ко�
 - **Одна строка — несколько ресурсов.** Классический оператор читает свой вход один; здесь строку одного SQL читают несколько `SerializeIterator` через `SharedDataIterator`, а `SharedScanIterator` сдвигает её один раз за такт. Тройка работает в ногу (lockstep): каждая ветка за такт отдаёт ровно один элемент, отсутствие ресурса — `null` (см. [Одна строка — несколько ресурсов](#одна-строка--несколько-ресурсов)).
 - **Соединение не склеивает кортежи.** Выход соединения — элементы `outer`, которым дописана связь; связанные ресурсы в поток не копируются, а попадают в ответ через реестр и обход документа.
 - **Побочный эффект — реестр.** `SerializeIterator` регистрирует каждый ресурс в общем `ResourceRegistry` (один объект на `type:id`); `PreloadIterator` дочитывает свой вход только ради этого эффекта.
-- **Одноразовость.** Итераторы хранят состояние и выполняются один раз; повторный перебор молча пуст. План переиспользуется, дерево итераторов на каждое выполнение строит `ExecutorBuilder`.
+- **Одноразовость.** Итераторы хранят состояние и выполняются один раз; повторный перебор молча пуст. План переиспользуется, дерево итераторов на каждое выполнение строит `IteratorBuilder`.
 
 ### Модель оптимизатора
 
-Планировщик (`Plan\Select\QueryPlanner`) — оптимизатор на правилах (rule-based), без модели стоимости и статистики: решения принимаются по форме дерева и описанию ресурсов, поэтому один запрос всегда даёт один и тот же план. План — дерево неизменяемых узлов, и оптимизация — последовательность переписываний дерева в новое дерево.
+Планировщик (`Plan\Select\SelectPlanner`) — оптимизатор на правилах (rule-based), без модели стоимости и статистики: решения принимаются по форме дерева и описанию ресурсов, поэтому один запрос всегда даёт один и тот же план. План — дерево неизменяемых узлов, и оптимизация — последовательность переписываний дерева в новое дерево.
 
 - **Неизменяемые узлы.** Свойства узлов `readonly`; «изменить» узел — получить копию через `with…()` (clone with). Тот же вход — тот же объект, поэтому нетронутые поддеревья переиспользуются, а результат каждого шага остаётся целым: `plan()` возвращает дерево после каждого шага (`php example/query-plan.php --steps`).
 - **Шаг — `Pass`:** функция «дерево → дерево», `$step(plan: $plan)`. Проход видит всё дерево и может нести контекст при обходе (`SharedScanPass` знает, внутри строки он или нет; `BuildSqlPass` передаёт ключи соединений сверху вниз).
@@ -356,7 +356,7 @@ sort=-created_at,provider.name,domains.domain_name
 
 ### 2. Планирование
 
-План (`src/Plan`, перенесено из прототипа `../php-tests/src/test24.php`) отделён от выполнения (`src/Executor`): план — неизменяемые узлы без состояния, которые строит и переписывает планировщик; итераторы — состояние одного выполнения. План можно выполнять сколько угодно раз, дерево итераторов — один. `Executor` зависит от `Plan`, но не наоборот.
+План (`src/Plan`, по операторам: `Plan/Select/`, `Plan/Insert/`; перенесено из прототипа `../php-tests/src/test24.php`) отделён от выполнения (`src/Executor`; как и планировщики, по операторам: итераторы выборки — `Executor/Select/`, исполнители вставки — `Executor/Insert/`): план — неизменяемые узлы без состояния, которые строит и переписывает планировщик; итераторы — состояние одного выполнения. План можно выполнять сколько угодно раз, дерево итераторов — один. `Executor` зависит от `Plan`, но не наоборот.
 
 Как устроены шаги и почему план без модели стоимости — [Модель оптимизатора](#модель-оптимизатора).
 
@@ -367,7 +367,8 @@ sort=-created_at,provider.name,domains.domain_name
 | Узел | Входы | Что значит | Откуда берётся |
 |---|---|---|---|
 | `ResourceNode(resource, fields, filters, sort)` | 0 | Таблица ресурса: модель данных ресурса в FROM запроса, которым владеет ближайший `SharedScanNode` над ним. Своего запроса нет. | ресурс дерева запроса |
-| `SharedScanNode(input, order, select, columns, parameters)` | 1 | Владелец одного SQL-запроса, даже из одного ресурса. Вход — верх строки: `SharedRowJoinNode` (ресурс со своими 1-1) или `ResourceNode`. Самый левый `ResourceNode` — владелец строки (`rowOwner()`). Хранит порядок потока, `Select`, его параметры и карту колонок строки. | шаг `close` |
+| `SharedScanNode(input, order)` | 1 | Владелец одного SQL-запроса, даже из одного ресурса. Вход — верх строки: `SharedRowJoinNode` (ресурс со своими 1-1) или `ResourceNode`. Самый левый `ResourceNode` — владелец строки (`rowOwner()`). Хранит порядок потока и собирает свой запрос (`withSelect()`). | шаг `close` |
+| `SqlScanNode(input, order, select, columns, parameters)` | 1 | Тот же владелец после шага `sql`: вход и порядок как у `SharedScanNode`, плюс собранный `Select`, его параметры и карта колонок строки — все обязательные. План без шага `sql` виден по классу: в нём остались `SharedScanNode`, и `IteratorBuilder` его не выполняет. | шаг `sql` |
 | `SharedRowJoinNode` | 2 | 1-1 в той же строке: inner присоединяется `LEFT JOIN`. | `ONE_TO_ONE` |
 | `PreloadNode` | 2 | Многие к одному: inner — отдельный запрос, загружается в реестр после outer. | `MANY_TO_ONE` |
 | `HashNestJoinNode` | 2 | 1:N над строкой: хеш по outer, inner — отдельный запрос. | `ONE_TO_MANY` |
@@ -378,7 +379,7 @@ sort=-created_at,provider.name,domains.domain_name
 
 #### Шаги
 
-`QueryPlanner::plan($tree)` возвращает дерево после каждого шага (`nodes`, `lift`, `order`, `close`, `merge`, `sql`); `QueryPlanPrinter::tree()` печатает любое из них. Шаг — `Pass` (дерево → дерево); `Rule` — локальное правило, которое применяется снизу вверх до фиксированной точки.
+`SelectPlanner::plan($tree)` возвращает дерево после каждого шага (`nodes`, `lift`, `order`, `close`, `merge`, `sql`); `SelectPlanPrinter::tree()` печатает любое из них. Шаг — `Pass` (дерево → дерево); `Rule` — локальное правило, которое применяется снизу вверх до фиксированной точки.
 
 **`nodes` — `fromTree()`.** Ресурс дерева запроса становится `ResourceNode`, каждый include — соединением по виду связи. Include навешиваются левой цепочкой в порядке объявления: каждый следующий — новый корень, всё построенное до него — его outer.
 
@@ -428,7 +429,7 @@ HashNestJoinNode domains
 
 ### 3. SQL
 
-Последний шаг `sql` — `BuildSqlPass`: SQL появляется в плане только здесь, когда дерево уже окончательное. Проход идёт сверху вниз и передаёт ключи соединений к владельцам, которые сами их не видят: соединение отдаёт в outer пришедшие сверху ключи и свой `relation[0]`, в inner — только `relation[1]`. По outer ключи доходят до владельца строки, к которой присоединяется ветка (`provider_id` и `id` — до строки сертификатов). Каждый владелец собирает свой запрос сам: `SharedScanNode::withSelect($keys)` обходит свою строку слева направо, ресурсы получают алиасы `t0`, `t1`… (таблицы внутри модели ресурса — `t0_1`, `t0_2`…, их задаёт `ModelTree`). SQL строится узлами [pg_builder](https://github.com/sad-spirit/pg-builder), без склейки строк.
+Последний шаг `sql` — `BuildSqlPass`: SQL появляется в плане только здесь, когда дерево уже окончательное. Проход идёт сверху вниз и передаёт ключи соединений к владельцам, которые сами их не видят: соединение отдаёт в outer пришедшие сверху ключи и свой `relation[0]`, в inner — только `relation[1]`. По outer ключи доходят до владельца строки, к которой присоединяется ветка (`provider_id` и `id` — до строки сертификатов). Каждый владелец собирает свой запрос сам и заменяется на `SqlScanNode`: `SharedScanNode::withSelect($keys)` обходит свою строку слева направо, ресурсы получают алиасы `t0`, `t1`… (таблицы внутри модели ресурса — `t0_1`, `t0_2`…, их задаёт `ModelTree`). SQL строится узлами [pg_builder](https://github.com/sad-spirit/pg-builder), без склейки строк.
 
 #### Список колонок и FROM
 
@@ -443,7 +444,7 @@ HashNestJoinNode domains
 
 - фильтр владельца строки (`t0`) — условие как есть: `t0.status = :t0_status_0`;
 - фильтры 1-1 ресурса — одной группой `(t1.pk IS NULL OR (…))`: строка без этого ресурса остаётся, а строка, где ресурс есть, но не прошёл фильтр, выпадает;
-- значение — именованный параметр `:<алиас>_<колонка>_<номер>`; значения лежат в `SharedScanNode::parameters` уже скалярами (`date` — `Y-m-d`, `datetime` — `Y-m-d H:i:s.uP`) и привязываются при выполнении.
+- значение — именованный параметр `:<алиас>_<колонка>_<номер>`; значения лежат в `SqlScanNode::parameters` уже скалярами (`date` — `Y-m-d`, `datetime` — `Y-m-d H:i:s.uP`) и привязываются при выполнении.
 
 #### ORDER BY
 
@@ -455,7 +456,7 @@ HashNestJoinNode domains
 
 #### Результат
 
-У каждого владельца после шага: `select` (pg_builder `Select`), `parameters` и `columns` — по ресурсу строки слева направо: класс, алиас, карта «колонка модели → колонка строки», `fields` и ключи соединений. По `columns` итераторы собирают ресурсы из строки (см. [Сериализация](#сериализация)). `QueryPlanPrinter::queries()` печатает SQL и параметры:
+У каждого владельца после шага: `select` (pg_builder `Select`), `parameters` и `columns` — по ресурсу строки слева направо: класс, алиас, карта «колонка модели → колонка строки», `fields` и ключи соединений. По `columns` итераторы собирают ресурсы из строки (см. [Сериализация](#сериализация)). `SelectPlanPrinter::queries()` печатает SQL и параметры:
 
 ```sql
 -- сертификаты с деталями и доставкой (одна строка — три ресурса)
@@ -540,12 +541,12 @@ order by t0.domain_id, t0.id
 
 ### 4. Сборка исполнителя
 
-`ExecutorBuilder(PDO)` собирает по плану после шага `sql` дерево итераторов: `build($plan, $registry)` — само дерево, `document($plan)` — `Document` над ним с новым `ResourceRegistry`. Сборщик состояния выполнения не хранит; на каждое выполнение — новый вызов.
+`IteratorBuilder(PDO)` собирает по плану после шага `sql` дерево итераторов: `build($plan, $registry)` — само дерево, `document($plan)` — `Document` над ним с новым `ResourceRegistry`. Сборщик состояния выполнения не хранит; на каждое выполнение — новый вызов.
 
 | Узел плана | Итераторы |
 |---|---|
-| `SharedScanNode` с одним ресурсом | `SerializeIterator(SqlScanIterator(pdo, sql, parameters), resource, registry, columns[0])` |
-| `SharedScanNode` со строкой | `SqlScanIterator` → `SharedDataIterator`; поток строки по её узлам; сверху `SharedScanIterator(data, поток строки)` |
+| `SqlScanNode` с одним ресурсом | `SerializeIterator(SqlScanIterator(pdo, sql, parameters), resource, registry, columns[0])` |
+| `SqlScanNode` со строкой | `SqlScanIterator` → `SharedDataIterator`; поток строки по её узлам; сверху `SharedScanIterator(data, поток строки)` |
 | `ResourceNode` внутри строки | `SerializeIterator(SharedDataIterator, resource, registry, следующая запись columns)` — записи идут в порядке обхода строки (outer раньше inner), как их записал `withSelect()` |
 | `SharedRowJoinNode` | `SharedRowJoinIterator(outer, inner, name)` |
 | `HashJoinNode` (внутри строки) | `HashJoinIterator(поток строки, запрос inner, relation[0], relation[1], name)` |
@@ -553,7 +554,7 @@ order by t0.domain_id, t0.id
 | `HashNestJoinNode` | `HashNestJoinIterator(outer, inner, relation[0], relation[1], name)` |
 | `MergeNestJoinNode` | `MergeNestJoinIterator(outer, inner, relation[0], relation[1], name)` |
 
-Ошибки плана — `LogicException` при сборке, до выполнения: план без шага `sql`, `ResourceNode`/`SharedRowJoinNode`/`HashJoinNode` вне строки, `HashNestJoinNode`/`MergeNestJoinNode`/`SharedScanNode` внутри строки, записи `columns` не того ресурса.
+Ошибки плана — `LogicException` при сборке, до выполнения: план без шага `sql` (в нём остался `SharedScanNode`), `ResourceNode`/`SharedRowJoinNode`/`HashJoinNode` вне строки, `HashNestJoinNode`/`MergeNestJoinNode`/владелец запроса внутри строки, записи `columns` не того ресурса.
 
 Дерево итераторов для плана выше (топология та же, что у дерева, собранного руками в `example/document.php`):
 
@@ -577,10 +578,10 @@ HashNestJoinIterator domains (id ← certificate_id)
 `example/query-plan.php` проходит стадии 2–6 без парсера: дерево запроса `TREE` (см. [Дерево запроса](#дерево-запроса)) → план → дерево итераторов → документ.
 
 ```php
-$steps = (new QueryPlanner())->plan(tree: TREE);       // дерево после каждого шага
+$steps = (new SelectPlanner())->plan(tree: TREE);       // дерево после каждого шага
 $plan = $steps['sql'];                                 // план с SQL
 
-$builder = new ExecutorBuilder(pdo: getPDO());
+$builder = new IteratorBuilder(pdo: getPDO());
 $flow = $builder->build(plan: $plan, registry: new ResourceRegistry());   // дерево итераторов на одно выполнение
 echo json_encode($flow->explain(), JSON_PRETTY_PRINT);                   // топология, ничего не выполняя
 
@@ -704,7 +705,7 @@ echo json_encode($builder->document(plan: $plan));     // новое дерев�
 
 ### 5. Выполнение
 
-Исполнитель — дерево узлов-итераторов по [модели Volcano](#модель-volcano). Каждый узел — `Executor\ExecutorIterator`: `IteratorAggregate`, чей `getIterator()` отдаёт генератор, и `explain()`. Узел-родитель перебирает поток своих входов, поэтому выполнение — это перебор корня, а данные поднимаются от листьев (`SqlScanIterator`) к корню. Запросы выполняются лениво, при первом обращении к генератору; всё дерево выполняется внутри `json_encode()` документа.
+Исполнитель — дерево узлов-итераторов по [модели Volcano](#модель-volcano). Каждый узел — `Executor\PullExecutor`: `IteratorAggregate`, чей `getIterator()` отдаёт генератор, и `explain()`. Узел-родитель перебирает поток своих входов, поэтому выполнение — это перебор корня, а данные поднимаются от листьев (`SqlScanIterator`) к корню. Запросы выполняются лениво, при первом обращении к генератору; всё дерево выполняется внутри `json_encode()` документа.
 
 Узлы хранят состояние и **одноразовые**: дерево собирается на одно выполнение и повторно не выполняется. Второй перебор молча отдаёт пустой поток.
 
@@ -713,7 +714,8 @@ echo json_encode($builder->document(plan: $plan));     // новое дерев�
 | Узел | Поток | Что делает |
 |---|---|---|
 | `SqlScanIterator(PDO, sql, parameters)` | — → строки | Выполняет запрос при первом обращении к генератору, отдаёт строки по одной. Именованные параметры привязывает `bindValue()` с типом по типу PHP (не `execute($массив)`: он передал бы `false` как `''`). |
-| `SerializeIterator(source, resource, registry, columns)` | строки → `?ResourceRecord` | Строит ресурс из строки по описанию ресурса и записи `SharedScanNode::columns` (без неё — ручным `resource::serialize($tuple)`); `null` — ресурса в строке нет (пустой `LEFT JOIN`). Регистрирует ресурс в `ResourceRegistry`: для повторного `type:id` дальше идёт уже зарегистрированный объект. |
+| `SerializeIterator(source, resource, registry, columns)` | строки → `?ResourceRecord` | Строит ресурс из строки по описанию ресурса и записи `SqlScanNode::columns`; `null` — ресурса в строке нет (пустой `LEFT JOIN`). Регистрирует ресурс в `ResourceRegistry`: для повторного `type:id` дальше идёт уже зарегистрированный объект. |
+| `ManualSerializeIterator(source, resource, registry)` | строки → `?ResourceRecord` | То же для деревьев без плана (`example/document.php`, `DocumentTreeTest`): ресурс собирает написанный им `resource::serialize($tuple)` по алиасам своего запроса. Регистрирует ресурс в `ResourceRegistry`, как `SerializeIterator`. |
 | `SharedDataIterator(source)` | строки → строки | Раздаёт одну строку нескольким `SerializeIterator`: каждый получает своё «окно» на текущую строку и не может её сдвинуть. |
 | `SharedScanIterator(data, source)` | ресурсы → ресурсы | Корень поддерева одного SQL: отдаёт ресурс наверх и сдвигает общий источник на следующую строку. |
 | `SharedRowJoinIterator(outer, inner, name)` | ресурсы × ресурсы → ресурсы | Склеивает n-й элемент `outer` с n-м элементом `inner` (как `zip`) и пишет связь «к одному»: `outer.relationships[name] = inner` или `null`. |
@@ -747,7 +749,7 @@ echo json_encode($builder->document(plan: $plan));     // новое дерев�
 `explain()` описывает узел и его поддерево массивом, ничего не выполняя: класс узла, параметры и входы под именами параметров конструктора; у `SerializeIterator` — класс ресурса (по плану — ещё алиас и `fields`), у `SqlScanIterator` — SQL и параметры.
 
 ```php
-$flow = (new ExecutorBuilder($pdo))->build($plan, new ResourceRegistry());
+$flow = (new IteratorBuilder($pdo))->build($plan, new ResourceRegistry());
 echo json_encode($flow->explain(), JSON_PRETTY_PRINT);
 ```
 
@@ -820,13 +822,13 @@ echo json_encode($flow->explain(), JSON_PRETTY_PRINT);
 
 ## Вставка (`insert`)
 
-Путь: тело `POST` (документ JSON:API) → `Parser\DocumentParser` → вложенное дерево новых ресурсов → `Plan\Insert\InsertPlanner` (план) → `Executor\WriterBuilder` → дерево вставки (push) → строки в таблицах. Примеры — `example/insert-plan.php` (через планировщик) и `example/insert-document.php` (то же дерево руками), тесты — `test/Parser/DocumentParserTest.php`, `test/Plan/InsertPlannerTest.php`, `test/Executor/InsertWriterTest.php`.
+Путь: тело `POST` (документ JSON:API) → `Parser\Insert\DocumentParser` → вложенное дерево новых ресурсов → `Plan\Insert\InsertPlanner` (план) → `Executor\Insert\WriterBuilder` → дерево вставки (push) → строки в таблицах. Примеры — `example/insert-plan.php` (через планировщик) и `example/insert-document.php` (то же дерево руками), тесты — `test/Parser/Insert/DocumentParserTest.php`, `test/Plan/Insert/InsertPlannerTest.php`, `test/Executor/Insert/InsertWriterTest.php`.
 
 ```php
-$roots = (new DocumentParser())->parse(document: $body, resource: CertificateResource::class);   // 400
-$plan = (new InsertPlanner())->plan(resource: CertificateResource::class, roots: $roots);
+$data = (new DocumentParser())->parse(document: $body, resource: CertificateResource::class);   // 400
+$plan = (new InsertPlanner())->plan(resource: CertificateResource::class, data: $data);
 $pdo->beginTransaction();
-$keys = (new WriterBuilder(pdo: $pdo))->document(plan: $plan, roots: $roots)->execute();       // ключи корней
+$keys = (new WriterBuilder(pdo: $pdo))->root(plan: $plan, data: $data)->execute();       // ключи корней
 $pdo->commit();
 ```
 
@@ -848,29 +850,29 @@ $pdo->commit();
 
 **Дерево вставки** — два уровня, исполнители с суффиксом `…Writer` (у чтения — `…Iterator`, `…Node` остаётся за планом):
 
-- уровень ресурсов (`ExecutorWriter`): `InsertJoinWriter(name, relation, first, then)` вставляет владельца связи (`first`), берёт новых детей из `relationships[name]` и отправляет их в `then` с колонкой связи из ключей владельца; связи одного владельца — левый глубокий список, как в SELECT;
+- уровень ресурсов (`PushExecutor`): `InsertJoinWriter(name, relation, parent, child)` вставляет владельца связи (`parent`), берёт новых детей из `relationships[name]` и отправляет их в `child` с колонкой связи из ключей владельца; связи одного владельца — левый глубокий список, как в SELECT;
 - граница — `InsertResourceWriter`: ресурс → строка «колонка модели → значение» (атрибуты, внешние ключи) → поддерево таблиц;
-- уровень таблиц (`TableWriter`), по модели ресурса (`model()`): `InsertTableJoinWriter` делит строку между таблицами модели (сторона с первичным ключом первой — по `PRIMARY`/`references` сущностей; правая сторона `LeftJoin` пропускается, если её колонок нет в строке), `InsertTableWriter` — `INSERT … RETURNING` в одну таблицу (SQL через pg_builder, запрос — в `error_log()`).
+- уровень таблиц (`TableWriter`), по модели ресурса (`model()`): `InsertTableJoinWriter` делит строку между таблицами модели (родитель — сторона с первичным ключом — первым, по `PRIMARY`/`references` сущностей), `InsertOptionalTableWriter` оборачивает правую сторону `LeftJoin` и пропускает её, если её колонок нет в строке, `InsertTableWriter` — `INSERT … RETURNING` в одну таблицу (SQL через pg_builder, запрос — в `error_log()`).
 
-Ключи возвращаются из `push()` наверх, общего контекста нет. `InsertDocument` отправляет в дерево каждый корень и возвращает их ключи; транзакцию открывает вызывающий.
+Ключи возвращаются из `push()` наверх, общего контекста нет. `InsertRootWriter` отправляет в дерево каждый корень и возвращает их ключи; транзакцию открывает вызывающий. Колонки связи из маршрута вложенного ресурса добавляет к корням отдельный узел `InsertRouteLinkWriter` над деревом.
 
-**Планировщик** (`Plan\Insert\InsertPlanner::plan(resource, roots)`) строит план по форме документа, как план SELECT — по дереву запроса: в него попадают только связи, встреченные у ресурсов места хотя бы раз (объединение по всем корням и детям); план — неизменяемые узлы `InsertJoinNode`, `InsertResourceNode`, `InsertTableJoinNode`, `InsertTableNode` (исполнитель — тот же стебель с `…Writer`, собирает `WriterBuilder`). Правила порядка:
+**Планировщик** (`Plan\Insert\InsertPlanner::plan(resource, data)`) строит план по форме документа, как план SELECT — по дереву запроса: в него попадают только связи, встреченные у ресурсов места хотя бы раз (объединение по всем корням и детям); план — неизменяемые узлы `InsertJoinNode`, `InsertResourceNode`, `InsertTableJoinNode`, `InsertOptionalTableNode`, `InsertTableNode` (исполнитель — тот же стебель с `…Writer`, собирает `WriterBuilder`). Правила порядка:
 
-- в дерево идут связи с первичным ключом на стороне владельца (`OneToMany`, обратная `OneToOne`): владелец — `first`, дети — `then`; связь по внешнему ключу ресурса пишет сама строка ресурса;
+- в дерево идут связи с первичным ключом на стороне владельца (`OneToMany`, обратная `OneToOne`): владелец — `parent`, дети — `child`; связь по внешнему ключу ресурса пишет сама строка ресурса;
 - связи одного владельца — левый глубокий список в **порядке объявления** в `relationships()`: зависимую связь объявляют позже (`delivery` после `detail`, потому что `certificate_delivery_meta` ссылается на `certificate_details`; сущности такую ссылку не описывают);
-- внутри модели — по `PRIMARY`/`references` сущностей (`InsertPlanner::tables()`; для дерева, собранного руками, — `Executor\TableTreeBuilder`).
+- внутри модели — по `PRIMARY`/`references` сущностей: `InsertTableJoinNode(relation, parent, child)`, родитель — сторона, от которой зависит другая, вставляется первым (`InsertPlanner::tables()`; для дерева, собранного руками, — `Executor\Insert\TableTreeBuilder`).
 
-**Вложенный маршрут.** Ресурс к существующему родителю создаётся по маршруту, а не по связи в документе: `POST /certificates/1/domains` — `InsertPlanner::routeLink(CertificateResource::class, 'domains', 1)` даёт `['certificate_id' => 1]` (`relation[1]` связи родителя), его получает `WriterBuilder::document(plan, roots, link)`; параметр — значение, а не форма плана. Своя связь `certificate` у `DomainResource` не нужна (она попала бы в `fields` по умолчанию и изменила бы документ SELECT).
+**Вложенный маршрут.** Ресурс к существующему родителю создаётся по маршруту, а не по связи в документе: `POST /certificates/1/domains` — `InsertPlanner::routeLink(CertificateResource::class, 'domains', 1)` даёт `['certificate_id' => 1]` (`relation[1]` связи родителя), его получает `WriterBuilder::root(plan, data, link)` и ставит над деревом узел `InsertRouteLinkWriter(link, input)`; параметр — значение, а не форма плана, поэтому узел есть только в дереве исполнителей. Своя связь `certificate` у `DomainResource` не нужна (она попала бы в `fields` по умолчанию и изменила бы документ SELECT).
 
 ```
 InsertJoinWriter domains [id, certificate_id]
-├─ first: InsertJoinWriter delivery [id, certificate_id]
-│  ├─ first: InsertResourceWriter CertificateWithDetailResource
-│  │  └─ InsertTableJoinWriter [id → certificate_id] optional=then
-│  │     ├─ first: InsertTableWriter certificates
-│  │     └─ then:  InsertTableWriter certificate_details
-│  └─ then:  InsertResourceWriter DeliveryResource └─ InsertTableWriter certificate_delivery_meta
-└─ then:  InsertResourceWriter DomainResource └─ InsertTableWriter domains
+├─ parent: InsertJoinWriter delivery [id, certificate_id]
+│  ├─ parent: InsertResourceWriter CertificateWithDetailResource
+│  │  └─ InsertTableJoinWriter [id → certificate_id]
+│  │     ├─ parent: InsertTableWriter certificates
+│  │     └─ child:  InsertOptionalTableWriter └─ InsertTableWriter certificate_details
+│  └─ child:  InsertResourceWriter DeliveryResource └─ InsertTableWriter certificate_delivery_meta
+└─ child:  InsertResourceWriter DomainResource └─ InsertTableWriter domains
 ```
 
 ## Описание данных
@@ -1103,7 +1105,7 @@ certificates AS cc JOIN certificate_details AS cc_1 ON cc_1.certificate_id = cc.
 
 #### Сериализация
 
-Ресурс из строки запроса плана собирает `SerializeIterator` по описанию ресурса. Сборщик дерева передаёт ему запись `SharedScanNode::columns` этого ресурса: алиас, карту «колонка модели → колонка строки» (`t1_buyer_email`), `fields` и ключи соединений. Всё, что не зависит от строки, итератор готовит один раз в конструкторе; на каждой строке:
+Ресурс из строки запроса плана собирает `SerializeIterator` по описанию ресурса. Сборщик дерева передаёт ему запись `SqlScanNode::columns` этого ресурса: алиас, карту «колонка модели → колонка строки» (`t1_buyer_email`), `fields` и ключи соединений. Всё, что не зависит от строки, итератор готовит один раз в конструкторе; на каждой строке:
 
 - первичный ключ `NULL` — ресурса в строке нет (`LEFT JOIN`), `null`; иначе он — `id`;
 - атрибуты `fields` по порядку: если ресурс объявил `serialize<Атрибут>(array $values)` — его результат (`$values` — все колонки атрибута по именам модели, так собирается составной атрибут), иначе единственная колонка, приведённая по `type` (`date`/`datetime` — как есть, `NULL` — `null`);
@@ -1118,7 +1120,7 @@ public static function serializeNominal(array $values): string
 }
 ```
 
-**Ручной режим.** Без записи плана `SerializeIterator` вызывает статический `serialize(array $tuple): ?ResourceRecord` ресурса (в базовом классе бросает `LogicException`). Так собраны ручные деревья `example/document.php` и `DocumentTreeTest`: их SQL написан руками (`QUERY1`–`QUERY4` в `example/db/connection.php`), ресурсы читают колонки по алиасам этих запросов. Строка — вся строка SQL-запроса, ресурс читает свои колонки, `null` — ресурса в строке нет.
+**Ручная сериализация.** Дерево без плана собирает ресурсы `ManualSerializeIterator(source, resource, registry)`: он вызывает статический `serialize(array $tuple): ?ResourceRecord` ресурса (в базовом классе бросает `LogicException`). Так собраны ручные деревья `example/document.php` и `DocumentTreeTest`: их SQL написан руками (`QUERY1`–`QUERY4` в `example/db/connection.php`), ресурсы читают колонки по алиасам этих запросов. Строка — вся строка SQL-запроса, ресурс читает свои колонки, `null` — ресурса в строке нет.
 
 ```php
 // DomainResource
@@ -1175,11 +1177,11 @@ public static function serialize(array $tuple): ResourceRecord
 Точки входа в самой библиотеке пока нет: стадии соединяет вызывающий код, как контроллер примера (`example/Controller/CertificatesController`):
 
 ```php
-use Ggs\JsonApiEngine\Executor\ExecutorBuilder;
+use Ggs\JsonApiEngine\Executor\Select\IteratorBuilder;
 use Ggs\JsonApiEngine\Parser\InvalidQueryException;
 use Ggs\JsonApiEngine\Parser\QueryParser;
 use Ggs\JsonApiEngine\Parser\ResourceNotFoundException;
-use Ggs\JsonApiEngine\Plan\Select\QueryPlanner;
+use Ggs\JsonApiEngine\Plan\Select\SelectPlanner;
 
 try {
     $tree = (new QueryParser())->parse(resource: CertificateResource::class, query: $_GET);   // 1
@@ -1189,13 +1191,13 @@ try {
     // 404
 }
 
-$plan = (new QueryPlanner())->plan(tree: $tree)['sql'];                  // 2–3: план с SQL; можно кешировать
-$document = (new ExecutorBuilder(pdo: $pdo))->document(plan: $plan);     // 4: новое дерево итераторов и реестр
+$plan = (new SelectPlanner())->plan(tree: $tree)['sql'];                  // 2–3: план с SQL; можно кешировать
+$document = (new IteratorBuilder(pdo: $pdo))->document(plan: $plan);     // 4: новое дерево итераторов и реестр
 
 echo json_encode($document);                                            // 5–6: запросы выполняются здесь
 ```
 
-Отладка: `QueryPlanPrinter::tree($plan)` — дерево плана, `QueryPlanPrinter::queries($plan)` — SQL и параметры каждого запроса, `ExecutorBuilder::build()->explain()` — дерево итераторов.
+Отладка: `SelectPlanPrinter::tree($plan)` — дерево плана, `SelectPlanPrinter::queries($plan)` — SQL и параметры каждого запроса, `IteratorBuilder::build()->explain()` — дерево итераторов.
 
 ## Разработка
 
@@ -1217,12 +1219,13 @@ php example/db/seed.php [количество сертификатов]  # пе�
 |---|---|
 | `example/db/` | SQLite база примера: схема, генератор данных, запросы `QUERY1`–`QUERY4`, `getPDO()`. |
 | `example/Entity/`, `example/Resource/` | Сущности и ресурсы над базой примера. |
-| `example/Controller/CertificatesController.php` | Точка входа `GET /certificates`: `get($query)` — парсер по `CertificateResource`, планировщик и `ExecutorBuilder::document()`, возвращает `Document`; `plan($query)` — только план. |
-| `test/PlanTreeTest.php` | Запрос → план → `ExecutorBuilder` → документ: совпадает с эталоном (с порядком), топология как у ручного дерева, повторное выполнение плана, фильтр, ветка 1:N внутри строки (`HashJoinIterator`), ошибки сборки. |
-| `test/Executor/HashJoinIteratorTest.php` | `HashJoinIterator`: элемент на элемент `outer`, `null` проходит, связанные по ключу, пустая связь. |
-| `test/Plan/SelectWhereTest.php` | `WHERE` плана: фильтры владельца и 1-1 ресурса (`IS NULL OR`), именованные параметры, выполнение на SQLite примера; колонки фильтра и сортировки держат таблицы модели в FROM. |
-| `test/Executor/SerializeIteratorTest.php` | Сериализация по плану: ресурсы из запросов плана примера на SQLite совпадают с эталоном по атрибутам и связи `provider`; составной атрибут, приведение типов, связь по внешнему ключу, ключи, `null` у пустого `LEFT JOIN`. |
-| `test/Parser/DocumentParserTest.php` | Парсер документа вставки: дерево из `data` + `included`, порядок корней, ошибки клиента с указателем. |
-| `test/Plan/InsertPlannerTest.php` | Планировщик вставки: дерево по плану совпадает с собранным руками, только связи из документа, объединение по корням, модель из двух таблиц, `routeLink()`, выполнение плана с колонкой маршрута. |
-| `test/Executor/InsertWriterTest.php` | Дерево вставки на SQLite примера (транзакция с откатом): ключ владельца у связанных ресурсов, модель из двух таблиц и пропуск пустой LEFT-стороны, колонка связи из вложенного маршрута, `TableTreeBuilder`, ресурс без `Insertable`. |
+| `example/Controller/CertificatesController.php` | Точка входа `GET /certificates`: `get($query)` — парсер по `CertificateResource`, планировщик и `IteratorBuilder::document()`, возвращает `Document`; `plan($query)` — только план. |
+| `test/PlanTreeTest.php` | Запрос → план → `IteratorBuilder` → документ: совпадает с эталоном (с порядком), топология как у ручного дерева, повторное выполнение плана, фильтр, ветка 1:N внутри строки (`HashJoinIterator`), ошибки сборки. |
+| `test/Executor/Select/HashJoinIteratorTest.php` | `HashJoinIterator`: элемент на элемент `outer`, `null` проходит, связанные по ключу, пустая связь. |
+| `test/Plan/Select/SelectWhereTest.php` | `WHERE` плана: фильтры владельца и 1-1 ресурса (`IS NULL OR`), именованные параметры, выполнение на SQLite примера; колонки фильтра и сортировки держат таблицы модели в FROM. |
+| `test/Executor/Select/SerializeIteratorTest.php` | Сериализация по плану: ресурсы из запросов плана примера на SQLite совпадают с эталоном по атрибутам и связи `provider`; составной атрибут, приведение типов, связь по внешнему ключу, ключи, `null` у пустого `LEFT JOIN`. |
+| `test/Parser/Insert/DocumentParserTest.php` | Парсер документа вставки: дерево из `data` + `included`, порядок корней, ошибки клиента с указателем. |
+| `test/Plan/Insert/InsertPlannerTest.php` | Планировщик вставки: дерево по плану совпадает с собранным руками, только связи из документа, объединение по корням, модель из двух таблиц, `routeLink()`, выполнение плана с колонкой маршрута. |
+| `test/Executor/Insert/InsertWriterTest.php` | Дерево вставки на SQLite примера (транзакция с откатом): ключ владельца у связанных ресурсов, модель из двух таблиц и пропуск пустой LEFT-стороны, колонка связи из вложенного маршрута, `TableTreeBuilder`, ресурс без `Insertable`. |
+| `test/Executor/Insert/OptionalParentTest.php` | Необязательная сторона модели — родитель (`LeftJoin(vouchers, vendors, [vendor_id, id])`, своя схема в SQLite в памяти): план оборачивает `vendors` в `InsertOptionalTableNode` и ставит её родителем; с атрибутами продавца он вставляется первым и его ключ уходит в `vendor_id`, без них пропускается и `vendor_id` остаётся NULL. |
 | `test/DocumentTreeTest.php` | Дерево из `document.php` с константами ресурсов: документ совпадает с эталоном `test/Fixture/document.json`, каждый ресурс встречается один раз, связь по внешнему ключу без и с `include`, пустая доставка, топология `explain()`. |

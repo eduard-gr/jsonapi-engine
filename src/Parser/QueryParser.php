@@ -75,8 +75,8 @@ final class QueryParser
         foreach ($this->includePaths($query['include'] ?? null) as $path) {
             $node = &$tree;
             $current = '';
-            /** @var array<class-string, true> $onPath ресурсы от корня до узла: класс не может повториться */
-            $onPath = [$resource => true];
+            /** @var array<class-string, true> $on_path ресурсы от корня до узла: класс не может повториться */
+            $on_path = [$resource => true];
             foreach (explode('.', $path) as $name) {
                 $current = $current === '' ? $name : "{$current}.{$name}";
                 // связь описывает ресурс родителя; подключить можно любую его связь
@@ -84,10 +84,10 @@ final class QueryParser
                 if ($relationship === null) {
                     throw new InvalidQueryException("Relationship {$current} can not be included", 'include');
                 }
-                if ($cycle === null && isset($onPath[$relationship->resource])) {
+                if ($cycle === null && isset($on_path[$relationship->resource])) {
                     $cycle = "Include path {$current} contains a cycle: {$relationship->resource::type()} is already on the path";
                 }
-                $onPath[$relationship->resource] = true;
+                $on_path[$relationship->resource] = true;
                 if (!isset($node['includes'][$name])) {
                     $node['includes'][$name] = [
                         'type' => $this->getRelationshipType($relationship),
@@ -187,7 +187,7 @@ final class QueryParser
             if (!\is_string($list)) {
                 throw new InvalidQueryException("{$parameter} must be a comma-separated list", $parameter);
             }
-            $names = array_values(array_filter(array_map('trim', explode(',', $list)), fn (string $n) => $n !== ''));
+            $names = array_values(array_filter(array_map('trim', explode(',', $list)), fn (string $candidate_name) => $candidate_name !== ''));
 
             $found = false;
             $this->walk($tree, '', function (array &$node) use ($type, $names, $parameter, &$found): void {
@@ -315,9 +315,9 @@ final class QueryParser
      */
     private static function split(string $name): array
     {
-        $dot = strrpos($name, '.');
+        $last_dot_position = strrpos($name, '.');
 
-        return $dot === false ? ['', $name] : [substr($name, 0, $dot), substr($name, $dot + 1)];
+        return $last_dot_position === false ? ['', $name] : [substr($name, 0, $last_dot_position), substr($name, $last_dot_position + 1)];
     }
 
     /**
@@ -346,7 +346,7 @@ final class QueryParser
                 throw new InvalidQueryException("{$parameter} expects a non-empty list of values", $parameter);
             }
 
-            return array_map(fn (mixed $v): mixed => $this->value($v, $type, $parameter), $values);
+            return array_map(fn (mixed $single_value): mixed => $this->value($single_value, $type, $parameter), $values);
         }
 
         return $this->value($operand, $type, $parameter);
