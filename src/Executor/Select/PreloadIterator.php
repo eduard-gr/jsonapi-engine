@@ -16,7 +16,7 @@ use Ggs\JsonApiEngine\Executor\PullExecutor;
  *
  * Связь N:1 на ресурс справочника (например, provider сертификата) пишет сам сериализатор
  * главного ресурса из внешнего ключа своей строки — без соединения. Этот узел связи не трогает:
- * когда $source закончился, он вычитывает $preload до конца, а SerializeIterator справочника
+ * когда $source закончился, он вычитывает $preload до конца, а RegisterIterator справочника
  * регистрирует каждый ресурс в ResourceRegistry. Так Document при сборке included найдёт ресурсы,
  * на которые ссылаются связи.
  *
@@ -61,7 +61,7 @@ use Ggs\JsonApiEngine\Executor\PullExecutor;
  *    MergeNestJoinIterator по $outer и Document. LIMIT поэтому задаётся в SQL-запросе данных,
  *    а не узлом, обрывающим поток; узел, который читает поток не до конца, над PreloadIterator
  *    ставить нельзя;
- *  - $preload должен регистрировать ресурсы в том же реестре, то есть состоять из SerializeIterator
+ *  - $preload должен регистрировать ресурсы в том же реестре, то есть заканчиваться RegisterIterator
  *    с тем же ResourceRegistry. Поток, который ресурсы не регистрирует (например, голый
  *    SqlScanIterator), будет прочитан впустую, и included останется без справочника;
  *  - тип ресурсов справочника должен совпадать с типом в ссылке сериализатора (например,
@@ -79,7 +79,7 @@ class PreloadIterator implements PullExecutor
     /**
      * @param PullExecutor $source Поток главных ResourceRecord — пропускается без изменений
      * @param PullExecutor $preload Поток ресурсов справочника ?ResourceRecord — вычитывается целиком
-     *        после $source; должен регистрировать ресурсы в реестре документа (SerializeIterator)
+     *        после $source; должен регистрировать ресурсы в реестре документа (RegisterIterator)
      */
     public function __construct(
         private PullExecutor $source,
@@ -106,7 +106,7 @@ class PreloadIterator implements PullExecutor
 
         // Сюда доходим, только если потребитель дочитал $source до конца (см. ограничения),
         // и до обхода связей в Document: справочник к нему уже в реестре.
-        // Сами элементы не нужны: в реестр их кладёт SerializeIterator, здесь справочник только
+        // Сами элементы не нужны: в реестр их кладёт RegisterIterator, здесь справочник только
         // вычитывается до конца. Курсоры $source к этому моменту уже закрыты
         foreach ($this->preload as $ignored_record) {
         }

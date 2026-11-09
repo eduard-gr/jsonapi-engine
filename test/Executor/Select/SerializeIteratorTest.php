@@ -7,7 +7,6 @@ namespace Ggs\JsonApiEngine\Test\Executor\Select;
 use ArrayIterator;
 use Generator;
 use Ggs\JsonApiEngine\Document\ResourceRecord;
-use Ggs\JsonApiEngine\Document\ResourceRegistry;
 use Ggs\JsonApiEngine\Example\Resource\CertificateResource;
 use Ggs\JsonApiEngine\Example\Resource\ProviderResource;
 use Ggs\JsonApiEngine\Executor\PullExecutor;
@@ -53,7 +52,6 @@ final class SerializeIteratorTest extends TestCase
                 $iterator = new SerializeIterator(
                     source: new SqlScanIterator(pdo: getPDO(), sql: $sql),
                     resource: $columns['resource'],
-                    registry: new ResourceRegistry(),
                     columns: $columns,
                 );
                 foreach ($iterator as $record) {
@@ -137,7 +135,6 @@ final class SerializeIteratorTest extends TestCase
         new SerializeIterator(
             source: self::source(rows: []),
             resource: CertificateResource::class,
-            registry: new ResourceRegistry(),
             columns: self::columns(fields: [], keys: []),
         );
     }
@@ -148,7 +145,7 @@ final class SerializeIteratorTest extends TestCase
         unset($columns['columns']['amount']);
 
         $this->expectException(\LogicException::class);
-        new SerializeIterator(source: self::source(rows: []), resource: VoucherResource::class, registry: new ResourceRegistry(), columns: $columns);
+        new SerializeIterator(source: self::source(rows: []), resource: VoucherResource::class, columns: $columns);
     }
 
     public function testManyToOneIsForeignKeyRelationship(): void
@@ -169,7 +166,6 @@ final class SerializeIteratorTest extends TestCase
         $iterator = new SerializeIterator(
             source: self::source(rows: $rows),
             resource: VoucherResource::class,
-            registry: new ResourceRegistry(),
             columns: self::columns(fields: $fields, keys: $keys),
         );
 

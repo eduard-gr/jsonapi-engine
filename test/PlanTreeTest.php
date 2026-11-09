@@ -185,7 +185,8 @@ final class PlanTreeTest extends TestCase
     }
 
     /**
-     * Топология из explain(): классы узлов, имена связей, ключи и ресурсы — без SQL и карт колонок.
+     * Топология из explain(): классы узлов, имена связей, ключи (в том числе ключ и строгость AscendingKeyIterator)
+     * и ресурсы — без SQL и карт колонок.
      *
      * @param array<string, mixed> $explain
      * @return array<string, mixed>
@@ -193,7 +194,7 @@ final class PlanTreeTest extends TestCase
     private static function topology(array $explain): array
     {
         $result = [];
-        foreach (['node', 'name', 'outer_key', 'inner_key', 'resource'] as $key) {
+        foreach (['node', 'name', 'outer_key', 'inner_key', 'resource', 'key', 'strict'] as $key) {
             if (isset($explain[$key])) {
                 $result[$key] = $explain[$key];
             }

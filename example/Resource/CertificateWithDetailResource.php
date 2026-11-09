@@ -15,9 +15,10 @@ use Ggs\JsonApiEngine\Resource\Insertable;
  * (`buyer_email`, …) — атрибуты сертификата, а не отдельный ресурс `detail`. Связи — как у `CertificateResource`,
  * без `detail` (детали внутри модели).
  *
- * Пример ресурса из нескольких таблиц для вставки (`example/insert-document.php`): `TableTreeBuilder` разворачивает
- * модель в `InsertTableJoinWriter(certificates → certificate_details)`, строка деталей не вставляется, если ни одной
- * её колонки не прислали. Для SELECT (`serialize()` по `QUERY1`) не предназначен.
+ * Пример ресурса из нескольких таблиц для вставки (`example/insert-plan.php`, `example/insert-document.php`): модель
+ * разворачивается в `InsertTableJoinWriter(parent: certificates, child: InsertOptionalTableWriter(certificate_details))`
+ * (планировщиком или руками), строка деталей не вставляется, если ни одной её колонки не прислали. Для SELECT
+ * (`serialize()` по `QUERY1`) не предназначен.
  *
  * Можно создавать (`Insertable`).
  */

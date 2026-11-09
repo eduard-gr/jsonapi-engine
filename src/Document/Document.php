@@ -25,7 +25,7 @@ use Ds\Set;
  * например, связь provider, записанная сериализатором из внешнего ключа, когда провайдеры
  * не загружаются), ссылка остаётся в relationships, а в included ничего не добавляется.
  *
- * Реестр должен быть тем же, что получили SerializeIterator (ManualSerializeIterator) дерева. С другим реестром ошибки
+ * Реестр должен быть тем же, что получили RegisterIterator дерева. С другим реестром ошибки
  * не будет: find() ничего не найдёт, и included молча окажется пустым.
  *
  * data на повторы не проверяется: каждый ресурс потока уходит в data. Корень дерева — узел
@@ -51,7 +51,7 @@ final readonly class Document implements \JsonSerializable
     /**
      * @param iterable<ResourceRecord> $flow Поток главных ресурсов от корня дерева
      * @param ResourceRegistry $registry Реестр того же выполнения — тот же экземпляр,
-     *        что получили все SerializeIterator дерева
+     *        что получили все RegisterIterator дерева
      */
     public function __construct(
         private iterable $flow,

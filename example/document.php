@@ -17,10 +17,12 @@ use Ggs\JsonApiEngine\Example\Resource\DetailResource;
 use Ggs\JsonApiEngine\Example\Resource\DomainResource;
 use Ggs\JsonApiEngine\Example\Resource\LogResource;
 use Ggs\JsonApiEngine\Example\Resource\ProviderResource;
+use Ggs\JsonApiEngine\Executor\Select\AscendingKeyIterator;
 use Ggs\JsonApiEngine\Executor\Select\HashNestJoinIterator;
 use Ggs\JsonApiEngine\Executor\Select\ManualSerializeIterator;
 use Ggs\JsonApiEngine\Executor\Select\MergeNestJoinIterator;
 use Ggs\JsonApiEngine\Executor\Select\PreloadIterator;
+use Ggs\JsonApiEngine\Executor\Select\RegisterIterator;
 use Ggs\JsonApiEngine\Executor\Select\SharedDataIterator;
 use Ggs\JsonApiEngine\Executor\Select\SharedRowJoinIterator;
 use Ggs\JsonApiEngine\Executor\Select\SharedScanIterator;
@@ -46,30 +48,42 @@ $certificates = new SharedScanIterator(
     data: $data,
     source: new SharedRowJoinIterator(
         outer:new SharedRowJoinIterator(
-            outer: new ManualSerializeIterator( // Использование $data
-                source: $data,
-                resource: CertificateResource::class,
-                registry: $registry),
-            inner: new ManualSerializeIterator( // Тот же самый $data!
-                source: $data,
-                resource: DetailResource::class,
-                registry: $registry),
+            outer: new RegisterIterator(
+                source: new ManualSerializeIterator( // Использование $data
+                    source: $data,
+                    resource: CertificateResource::class,
+                ),
+                registry: $registry,
+            ),
+            inner: new RegisterIterator(
+                source: new ManualSerializeIterator( // Тот же самый $data!
+                    source: $data,
+                    resource: DetailResource::class,
+                ),
+                registry: $registry,
+            ),
             name: 'detail'),
-        inner: new ManualSerializeIterator( // Тот же самый $data! Без доставки (LEFT JOIN) — null
-            source: $data,
-            resource: DeliveryResource::class,
-            registry: $registry),
+        inner: new RegisterIterator(
+            source: new ManualSerializeIterator( // Тот же самый $data! Без доставки (LEFT JOIN) — null
+                source: $data,
+                resource: DeliveryResource::class,
+            ),
+            registry: $registry,
+        ),
         name: 'delivery'));
 
 
 // Справочник провайдеров: PreloadIterator вычитывает его целиком, и каждый провайдер
 // регистрируется в реестре
-$flow4 = new ManualSerializeIterator(
-    source: new SqlScanIterator(
-        pdo: $pdo,
-        sql: QUERY4),
-    resource: ProviderResource::class,
-    registry: $registry);
+$flow4 = new RegisterIterator(
+    source: new ManualSerializeIterator(
+        source: new SqlScanIterator(
+            pdo: $pdo,
+            sql: QUERY4),
+        resource: ProviderResource::class,
+    ),
+    registry: $registry,
+);
 
 // Сертификаты с провайдером: связь provider уже записана CertificateResource::serialize() из provider_id,
 // узел только загружает провайдеров в реестр — так они попадут в included (include=provider).
@@ -81,31 +95,46 @@ $flow1 = new PreloadIterator(
 
 
 // Домены: служебный ключ certificate_id — ключ соединения с сертификатом для HashNestJoinIterator
-$flow2 = new ManualSerializeIterator(
-    source: new SqlScanIterator(
-        pdo: $pdo,
-        sql: QUERY2),
-    resource: DomainResource::class,
-    registry: $registry);
+$flow2 = new RegisterIterator(
+    source: new ManualSerializeIterator(
+        source: new SqlScanIterator(
+            pdo: $pdo,
+            sql: QUERY2),
+        resource: DomainResource::class,
+    ),
+    registry: $registry,
+);
 
 
 // Логи: служебный ключ domain_id — ключ соединения с доменом для MergeNestJoinIterator
-$flow3 = new ManualSerializeIterator(
-    source: new SqlScanIterator(
-        pdo: $pdo,
-        sql: QUERY3),
-    resource: LogResource::class,
-    registry: $registry);
+$flow3 = new RegisterIterator(
+    source: new ManualSerializeIterator(
+        source: new SqlScanIterator(
+            pdo: $pdo,
+            sql: QUERY3),
+        resource: LogResource::class,
+    ),
+    registry: $registry,
+);
 
 
 // Домены с логами: доменам записывается связь logs, наружу идут домены. Логи попадут в included,
 // потому что Document дойдёт до них по связям сертификат → домен → лог.
 // MergeNestJoinIterator: QUERY2 и QUERY3 отсортированы по domain id. Порядок доменов по id
 // не подходит для соединения с сертификатами по certificate_id, поэтому внешнее
-// соединение остаётся HashNestJoinIterator — ему порядок не важен
+// соединение остаётся HashNestJoinIterator — ему порядок не важен.
+// Порядок ключей слиянию проверяет AscendingKeyIterator на каждом входе: домены — строго по id, логи — по domain_id
 $domains = new MergeNestJoinIterator(
-    outer: $flow2,
-    inner: $flow3,
+    outer: new AscendingKeyIterator(
+        source: $flow2,
+        key: 'id',
+        strict: true,
+    ),
+    inner: new AscendingKeyIterator(
+        source: $flow3,
+        key: 'domain_id',
+        strict: false,
+    ),
     outer_key: 'id',
     inner_key: 'domain_id',
     name: 'logs');

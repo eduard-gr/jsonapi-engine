@@ -6,16 +6,15 @@ namespace Ggs\JsonApiEngine\Executor\Select;
 
 use Generator;
 use Ggs\JsonApiEngine\Document\ResourceRecord;
-use Ggs\JsonApiEngine\Document\ResourceRegistry;
 use Ggs\JsonApiEngine\Executor\PullExecutor;
 use Ggs\JsonApiEngine\Plan\Select\SqlScanNode;
 use Ggs\JsonApiEngine\Resource;
 
 /**
- * Превращает строки источника в ресурсы JSON:API и регистрирует их в реестре.
+ * Превращает строки источника в ресурсы JSON:API по плану.
  *
- * Поток: вход — строки array (SqlScanIterator или SharedDataIterator) → выход — ?ResourceRecord;
- * для повторного type:id — тот же объект, что был отдан раньше.
+ * Поток: вход — строки array (SqlScanIterator или SharedDataIterator) → выход — ?ResourceRecord, новый объект
+ * на каждую строку. В реестр ресурсы кладёт RegisterIterator над этим узлом (его ставит IteratorBuilder).
  *
  * Одна строка — один ResourceRecord (или null, если в строке нет ресурса). Из одного источника можно строить
  * ресурсы разных типов: для этого на общий SharedDataIterator ставится несколько SerializeIterator с разными
@@ -37,15 +36,9 @@ use Ggs\JsonApiEngine\Resource;
  * Деревья, собранные руками без плана (example/document.php, DocumentTreeTest), используют ManualSerializeIterator:
  * тот вызывает написанный ресурсом `$resource::serialize($tuple)`.
  *
- * Каждый построенный ресурс проходит через ResourceRegistry::intern(): если ресурс с тем же
- * type:id уже встречался, наружу уходит зарегистрированный объект, а только что построенный
- * отбрасывается. Так один ресурс существует в одном экземпляре на всё выполнение.
- * Сериализация при этом выполняется на каждой строке: повторный ресурс сначала строится,
- * а потом отбрасывается — реестр экономит память документа, но не работу сериализации.
- * Реестр один на выполнение — тот же экземпляр получают все SerializeIterator дерева и Document.
+ * Реестра узел не знает: один объект на type:id обеспечивает RegisterIterator над ним.
  *
- * В explain() узел описывается классом ресурса, алиасом и fields. Реестр не описывается:
- * это состояние выполнения, а не топология.
+ * В explain() узел описывается классом ресурса, алиасом и fields.
  *
  * Узел ленивый: строка читается, только когда потребитель запрашивает следующий ресурс.
  * Это важно при чтении через SharedDataIterator — каждый шаг этого генератора
@@ -75,7 +68,6 @@ class SerializeIterator implements PullExecutor
     /**
      * @param PullExecutor $source Строки источника (ассоциативные массивы): SqlScanIterator или SharedDataIterator
      * @param class-string<Resource> $resource Класс ресурса
-     * @param ResourceRegistry $registry Реестр выполнения — один на всё дерево и Document
      * @param array $columns Запись SqlScanNode::columns этого ресурса (алиас, колонки, fields, ключи)
      * @psalm-param RowResource $columns
      * @throws \LogicException если запись относится к другому ресурсу или в ней нет нужной колонки
@@ -83,7 +75,6 @@ class SerializeIterator implements PullExecutor
     public function __construct(
         private PullExecutor $source,
         private string $resource,
-        private ResourceRegistry $registry,
         array $columns,
     ) {
         $this->prepare(columns: $columns);
@@ -113,10 +104,7 @@ class SerializeIterator implements PullExecutor
         // При чтении через SharedDataIterator шаг foreach не сдвигает общий источник (окно отдаёт
         // текущую строку), поэтому каждый шаг отдаёт ресурс из строки, на которой он сейчас стоит
         foreach ($this->source as $tuple) {
-            $record = $this->serialize(row: $tuple);
-
-            // Дальше идёт зарегистрированный объект: при повторном type:id это не $record
-            yield $record === null ? null : $this->registry->intern($record);
+            yield $this->serialize(row: $tuple);
         }
     }
 

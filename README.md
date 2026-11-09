@@ -180,7 +180,7 @@ GET /certificates?include=…&fields[…]=…&filter[…]=…&sort=…   + ко�
 - **Два вида элементов.** Снизу по потоку идут строки SQL (`array`), выше `SerializeIterator` — ресурсы (`ResourceRecord`). Какой поток у узла, написано в его описании («Поток: вход → выход»).
 - **Одна строка — несколько ресурсов.** Классический оператор читает свой вход один; здесь строку одного SQL читают несколько `SerializeIterator` через `SharedDataIterator`, а `SharedScanIterator` сдвигает её один раз за такт. Тройка работает в ногу (lockstep): каждая ветка за такт отдаёт ровно один элемент, отсутствие ресурса — `null` (см. [Одна строка — несколько ресурсов](#одна-строка--несколько-ресурсов)).
 - **Соединение не склеивает кортежи.** Выход соединения — элементы `outer`, которым дописана связь; связанные ресурсы в поток не копируются, а попадают в ответ через реестр и обход документа.
-- **Побочный эффект — реестр.** `SerializeIterator` регистрирует каждый ресурс в общем `ResourceRegistry` (один объект на `type:id`); `PreloadIterator` дочитывает свой вход только ради этого эффекта.
+- **Побочный эффект — реестр.** `RegisterIterator` над каждым сериализатором регистрирует каждый ресурс в общем `ResourceRegistry` (один объект на `type:id`); `PreloadIterator` дочитывает свой вход только ради этого эффекта.
 - **Одноразовость.** Итераторы хранят состояние и выполняются один раз; повторный перебор молча пуст. План переиспользуется, дерево итераторов на каждое выполнение строит `IteratorBuilder`.
 
 ### Модель оптимизатора
@@ -450,7 +450,7 @@ HashNestJoinNode domains
 
 Порядок строк — порядок ресурса-владельца (`t0`); сортировки 1-1 ресурсов на него не влияют:
 
-1. `order` — ключ, который занял `HashToMergeRule` (`MergeNestJoinIterator` проверяет порядок);
+1. `order` — ключ, который занял `HashToMergeRule` (порядок на входах `MergeNestJoinIterator` проверяет `AscendingKeyIterator`);
 2. клиентский `sort` владельца по `position`, `DESC` у `descending`;
 3. первичный ключ владельца, если его ещё нет: порядок однозначен от запуска к запуску.
 
@@ -545,14 +545,14 @@ order by t0.domain_id, t0.id
 
 | Узел плана | Итераторы |
 |---|---|
-| `SqlScanNode` с одним ресурсом | `SerializeIterator(SqlScanIterator(pdo, sql, parameters), resource, registry, columns[0])` |
+| `SqlScanNode` с одним ресурсом | `RegisterIterator(SerializeIterator(SqlScanIterator(pdo, sql, parameters), resource, columns[0]), registry)` |
 | `SqlScanNode` со строкой | `SqlScanIterator` → `SharedDataIterator`; поток строки по её узлам; сверху `SharedScanIterator(data, поток строки)` |
-| `ResourceNode` внутри строки | `SerializeIterator(SharedDataIterator, resource, registry, следующая запись columns)` — записи идут в порядке обхода строки (outer раньше inner), как их записал `withSelect()` |
+| `ResourceNode` внутри строки | `RegisterIterator(SerializeIterator(SharedDataIterator, resource, следующая запись columns), registry)` — записи идут в порядке обхода строки (outer раньше inner), как их записал `withSelect()` |
 | `SharedRowJoinNode` | `SharedRowJoinIterator(outer, inner, name)` |
 | `HashJoinNode` (внутри строки) | `HashJoinIterator(поток строки, запрос inner, relation[0], relation[1], name)` |
 | `PreloadNode` | `PreloadIterator(source: outer, preload: inner)` |
 | `HashNestJoinNode` | `HashNestJoinIterator(outer, inner, relation[0], relation[1], name)` |
-| `MergeNestJoinNode` | `MergeNestJoinIterator(outer, inner, relation[0], relation[1], name)` |
+| `MergeNestJoinNode` | `MergeNestJoinIterator(AscendingKeyIterator(outer, relation[0], strict), AscendingKeyIterator(inner, relation[1]), relation[0], relation[1], name)` |
 
 Ошибки плана — `LogicException` при сборке, до выполнения: план без шага `sql` (в нём остался `SharedScanNode`), `ResourceNode`/`SharedRowJoinNode`/`HashJoinNode` вне строки, `HashNestJoinNode`/`MergeNestJoinNode`/владелец запроса внутри строки, записи `columns` не того ресурса.
 
@@ -564,14 +564,16 @@ HashNestJoinIterator domains (id ← certificate_id)
 │   ├─ source: SharedScanIterator
 │   │   └─ SharedRowJoinIterator delivery
 │   │       ├─ SharedRowJoinIterator detail
-│   │       │   ├─ SerializeIterator certificate (t0) ─┐
-│   │       │   └─ SerializeIterator detail (t1) ──────┼─► SharedDataIterator ─► SqlScanIterator сертификатов
-│   │       └─ SerializeIterator delivery (t2) ────────┘
-│   └─ preload: SerializeIterator provider ─► SqlScanIterator провайдеров
+│   │       │   ├─ Register ─► SerializeIterator certificate (t0) ─┐
+│   │       │   └─ Register ─► SerializeIterator detail (t1) ──────┼─► SharedDataIterator ─► SqlScanIterator сертификатов
+│   │       └─ Register ─► SerializeIterator delivery (t2) ────────┘
+│   └─ preload: Register ─► SerializeIterator provider ─► SqlScanIterator провайдеров
 └─ inner: MergeNestJoinIterator logs (id ← domain_id)
-    ├─ SerializeIterator domain ─► SqlScanIterator доменов
-    └─ SerializeIterator log ────► SqlScanIterator логов
+    ├─ Ascending id (strict) ─► Register ─► SerializeIterator domain ─► SqlScanIterator доменов
+    └─ Ascending domain_id ───► Register ─► SerializeIterator log ────► SqlScanIterator логов
 ```
+
+`Register` — `RegisterIterator(source, registry)`: стоит над каждым сериализатором и кладёт его ресурсы в общий `ResourceRegistry`. `Ascending` — `AscendingKeyIterator(source, key, strict)`: проверяет порядок ключей на входах слияния.
 
 #### Пример: `example/query-plan.php`
 
@@ -614,55 +616,67 @@ echo json_encode($builder->document(plan: $plan));     // новое дерев�
                     "node": "SharedRowJoinIterator",
                     "name": "detail",
                     "outer": {
-                        "node": "SerializeIterator",
-                        "resource": "CertificateResource",
-                        "alias": "t0",
-                        "fields": ["code", "nominal", "currency", "status", "created_at", "provider"],
+                        "node": "RegisterIterator",
                         "source": {
-                            "node": "SharedDataIterator",
+                            "node": "SerializeIterator",
+                            "resource": "CertificateResource",
+                            "alias": "t0",
+                            "fields": ["code", "nominal", "currency", "status", "created_at", "provider"],
                             "source": {
-                                "node": "SqlScanIterator",
-                                "sql": "… (тот же SQL сертификатов)"
+                                "node": "SharedDataIterator",
+                                "source": {
+                                    "node": "SqlScanIterator",
+                                    "sql": "… (тот же SQL сертификатов)"
+                                }
                             }
                         }
                     },
                     "inner": {
-                        "node": "SerializeIterator",
-                        "resource": "DetailResource",
-                        "alias": "t1",
-                        "fields": ["buyer_email", "recipient_name", "recipient_email", "greeting_text", "design_template_id"],
+                        "node": "RegisterIterator",
                         "source": {
-                            "node": "SharedDataIterator",
+                            "node": "SerializeIterator",
+                            "resource": "DetailResource",
+                            "alias": "t1",
+                            "fields": ["buyer_email", "recipient_name", "recipient_email", "greeting_text", "design_template_id"],
                             "source": {
-                                "node": "SqlScanIterator",
-                                "sql": "… (тот же SQL сертификатов)"
+                                "node": "SharedDataIterator",
+                                "source": {
+                                    "node": "SqlScanIterator",
+                                    "sql": "… (тот же SQL сертификатов)"
+                                }
                             }
                         }
                     }
                 },
                 "inner": {
-                    "node": "SerializeIterator",
-                    "resource": "DeliveryResource",
-                    "alias": "t2",
-                    "fields": ["delivery_channel", "is_sent", "external_provider_id"],
+                    "node": "RegisterIterator",
                     "source": {
-                        "node": "SharedDataIterator",
+                        "node": "SerializeIterator",
+                        "resource": "DeliveryResource",
+                        "alias": "t2",
+                        "fields": ["delivery_channel", "is_sent", "external_provider_id"],
                         "source": {
-                            "node": "SqlScanIterator",
-                            "sql": "… (тот же SQL сертификатов)"
+                            "node": "SharedDataIterator",
+                            "source": {
+                                "node": "SqlScanIterator",
+                                "sql": "… (тот же SQL сертификатов)"
+                            }
                         }
                     }
                 }
             }
         },
         "preload": {
-            "node": "SerializeIterator",
-            "resource": "ProviderResource",
-            "alias": "t0",
-            "fields": ["name", "website", "created_at"],
+            "node": "RegisterIterator",
             "source": {
-                "node": "SqlScanIterator",
-                "sql": "select t0.id as t0_id, t0.\"name\" as t0_name, t0.website as t0_website, t0.created_at as t0_created_at from providers as t0 order by t0.id"
+                "node": "SerializeIterator",
+                "resource": "ProviderResource",
+                "alias": "t0",
+                "fields": ["name", "website", "created_at"],
+                "source": {
+                    "node": "SqlScanIterator",
+                    "sql": "select t0.id as t0_id, t0.\"name\" as t0_name, t0.website as t0_website, t0.created_at as t0_created_at from providers as t0 order by t0.id"
+                }
             }
         }
     },
@@ -672,23 +686,39 @@ echo json_encode($builder->document(plan: $plan));     // новое дерев�
         "outer_key": "id",
         "inner_key": "domain_id",
         "outer": {
-            "node": "SerializeIterator",
-            "resource": "DomainResource",
-            "alias": "t0",
-            "fields": ["domain_name", "is_primary", "created_at"],
+            "node": "AscendingKeyIterator",
+            "key": "id",
+            "strict": true,
             "source": {
-                "node": "SqlScanIterator",
-                "sql": "with p1 as ( select t0.id as id from certificates as t0 left join certificate_details as t1 on t0.id = t1.certificate_id left join certificate_delivery_meta as t2 on t0.id = t2.certificate_id ) select t0.id as t0_id, t0.domain_name as t0_domain_name, t0.is_primary as t0_is_primary, t0.created_at as t0_created_at, t0.certificate_id as t0_certificate_id from domains as t0 where t0.certificate_id in ( select id from p1 ) order by t0.id"
+                "node": "RegisterIterator",
+                "source": {
+                    "node": "SerializeIterator",
+                    "resource": "DomainResource",
+                    "alias": "t0",
+                    "fields": ["domain_name", "is_primary", "created_at"],
+                    "source": {
+                        "node": "SqlScanIterator",
+                        "sql": "with p1 as ( select t0.id as id from certificates as t0 left join certificate_details as t1 on t0.id = t1.certificate_id left join certificate_delivery_meta as t2 on t0.id = t2.certificate_id ) select t0.id as t0_id, t0.domain_name as t0_domain_name, t0.is_primary as t0_is_primary, t0.created_at as t0_created_at, t0.certificate_id as t0_certificate_id from domains as t0 where t0.certificate_id in ( select id from p1 ) order by t0.id"
+                    }
+                }
             }
         },
         "inner": {
-            "node": "SerializeIterator",
-            "resource": "LogResource",
-            "alias": "t0",
-            "fields": ["log_level", "message", "created_at"],
+            "node": "AscendingKeyIterator",
+            "key": "domain_id",
+            "strict": false,
             "source": {
-                "node": "SqlScanIterator",
-                "sql": "with p2 as ( select t0.id as id from certificates as t0 left join certificate_details as t1 on t0.id = t1.certificate_id left join certificate_delivery_meta as t2 on t0.id = t2.certificate_id ), p1 as ( select t0.id as id from domains as t0 where t0.certificate_id in ( select id from p2 ) ) select t0.id as t0_id, t0.log_level as t0_log_level, t0.message as t0_message, t0.created_at as t0_created_at, t0.domain_id as t0_domain_id from domain_logs as t0 where t0.domain_id in ( select id from p1 ) order by t0.domain_id, t0.id"
+                "node": "RegisterIterator",
+                "source": {
+                    "node": "SerializeIterator",
+                    "resource": "LogResource",
+                    "alias": "t0",
+                    "fields": ["log_level", "message", "created_at"],
+                    "source": {
+                        "node": "SqlScanIterator",
+                        "sql": "with p2 as ( select t0.id as id from certificates as t0 left join certificate_details as t1 on t0.id = t1.certificate_id left join certificate_delivery_meta as t2 on t0.id = t2.certificate_id ), p1 as ( select t0.id as id from domains as t0 where t0.certificate_id in ( select id from p2 ) ) select t0.id as t0_id, t0.log_level as t0_log_level, t0.message as t0_message, t0.created_at as t0_created_at, t0.domain_id as t0_domain_id from domain_logs as t0 where t0.domain_id in ( select id from p1 ) order by t0.domain_id, t0.id"
+                    }
+                }
             }
         }
     }
@@ -714,14 +744,16 @@ echo json_encode($builder->document(plan: $plan));     // новое дерев�
 | Узел | Поток | Что делает |
 |---|---|---|
 | `SqlScanIterator(PDO, sql, parameters)` | — → строки | Выполняет запрос при первом обращении к генератору, отдаёт строки по одной. Именованные параметры привязывает `bindValue()` с типом по типу PHP (не `execute($массив)`: он передал бы `false` как `''`). |
-| `SerializeIterator(source, resource, registry, columns)` | строки → `?ResourceRecord` | Строит ресурс из строки по описанию ресурса и записи `SqlScanNode::columns`; `null` — ресурса в строке нет (пустой `LEFT JOIN`). Регистрирует ресурс в `ResourceRegistry`: для повторного `type:id` дальше идёт уже зарегистрированный объект. |
-| `ManualSerializeIterator(source, resource, registry)` | строки → `?ResourceRecord` | То же для деревьев без плана (`example/document.php`, `DocumentTreeTest`): ресурс собирает написанный им `resource::serialize($tuple)` по алиасам своего запроса. Регистрирует ресурс в `ResourceRegistry`, как `SerializeIterator`. |
+| `SerializeIterator(source, resource, columns)` | строки → `?ResourceRecord` | Строит ресурс из строки по описанию ресурса и записи `SqlScanNode::columns`; `null` — ресурса в строке нет (пустой `LEFT JOIN`). Реестра не знает. |
+| `ManualSerializeIterator(source, resource)` | строки → `?ResourceRecord` | То же для деревьев без плана (`example/document.php`, `DocumentTreeTest`): ресурс собирает написанный им `resource::serialize($tuple)` по алиасам своего запроса. |
+| `RegisterIterator(source, registry)` | `?ResourceRecord` → `?ResourceRecord` | Стоит над каждым сериализатором: регистрирует ресурс в `ResourceRegistry`, для повторного `type:id` дальше идёт уже зарегистрированный объект; `null` проходит. Без него ресурс не попадёт в `included`. |
 | `SharedDataIterator(source)` | строки → строки | Раздаёт одну строку нескольким `SerializeIterator`: каждый получает своё «окно» на текущую строку и не может её сдвинуть. |
 | `SharedScanIterator(data, source)` | ресурсы → ресурсы | Корень поддерева одного SQL: отдаёт ресурс наверх и сдвигает общий источник на следующую строку. |
 | `SharedRowJoinIterator(outer, inner, name)` | ресурсы × ресурсы → ресурсы | Склеивает n-й элемент `outer` с n-м элементом `inner` (как `zip`) и пишет связь «к одному»: `outer.relationships[name] = inner` или `null`. |
 | `HashNestJoinIterator(outer, inner, outer_key, inner_key, name)` | ресурсы × ресурсы → ресурсы | Связь «ко многим»: читает `outer` целиком в хеш-таблицу, затем `inner` построчно дописывает в связь своего родителя. Блокирующий. |
 | `HashJoinIterator(outer, inner, outer_key, inner_key, name)` | ресурсы строки × ресурсы → ресурсы строки | Связь «ко многим» у 1-1 ресурса внутри общей строки: хеширует `inner` целиком, `outer` идёт потоком; на каждый элемент `outer` — ровно один элемент, `null` проходит как есть. |
-| `MergeNestJoinIterator(outer, inner, outer_key, inner_key, name)` | ресурсы × ресурсы → ресурсы | Связь «ко многим» слиянием двух потоков, отсортированных по ключу; порядок проверяет на лету. Не блокирует, хеш-таблицы не строит. |
+| `MergeNestJoinIterator(outer, inner, outer_key, inner_key, name)` | ресурсы × ресурсы → ресурсы | Связь «ко многим» слиянием двух потоков, отсортированных по ключу; порядок сам не проверяет. Не блокирует, хеш-таблицы не строит. |
+| `AscendingKeyIterator(source, key, strict)` | ресурсы → ресурсы | Проверяет на лету, что поток упорядочен по ключу (`strict` — строго по возрастанию, иначе по неубыванию), поток не меняет; `null` пропускает. Стоит на обоих входах `MergeNestJoinIterator`. |
 | `SortIterator(source, key)` | ресурсы → ресурсы | Пересортировывает выход соединения по целочисленному ключу (для `MergeNestJoinIterator`). Планировщик его пока не ставит. |
 | `PreloadIterator(source, preload)` | ресурсы → ресурсы | Пропускает `source`, затем дочитывает `preload`: его ресурсы попадают в реестр (справочник для связи по внешнему ключу). |
 
@@ -759,7 +791,7 @@ echo json_encode($flow->explain(), JSON_PRETTY_PRINT);
 
 Ресурс в потоке — `Document\ResourceRecord`: `id`, `type`, `attributes`, `relationships` (ссылки `{id, type}`) и служебные `keys`. Объект изменяемый: соединения дописывают ему связи после создания.
 
-`Document\ResourceRegistry` хранит один объект на `type:id` за выполнение. Его получают все `SerializeIterator` дерева и документ.
+`Document\ResourceRegistry` хранит один объект на `type:id` за выполнение. Его получают все `RegisterIterator` дерева и документ.
 
 `Document\Document(flow, registry)` собирается внутри `json_encode()`:
 
@@ -822,7 +854,7 @@ echo json_encode($flow->explain(), JSON_PRETTY_PRINT);
 
 ## Вставка (`insert`)
 
-Путь: тело `POST` (документ JSON:API) → `Parser\Insert\DocumentParser` → вложенное дерево новых ресурсов → `Plan\Insert\InsertPlanner` (план) → `Executor\Insert\WriterBuilder` → дерево вставки (push) → строки в таблицах. Примеры — `example/insert-plan.php` (через планировщик) и `example/insert-document.php` (то же дерево руками), тесты — `test/Parser/Insert/DocumentParserTest.php`, `test/Plan/Insert/InsertPlannerTest.php`, `test/Executor/Insert/InsertWriterTest.php`.
+Путь: тело `POST` (документ JSON:API) → `Parser\Insert\DocumentParser` → вложенное дерево новых ресурсов → `Plan\Insert\InsertPlanner` (план) → `Executor\Insert\WriterBuilder` → дерево вставки (push) → строки в таблицах. Примеры — `example/insert-plan.php` (через планировщик), `example/insert-document.php` (то же дерево руками) и `example/insert-route.php` (вложенный маршрут, `InsertRouteLinkWriter`), тесты — `test/Parser/Insert/DocumentParserTest.php`, `test/Plan/Insert/InsertPlannerTest.php`, `test/Executor/Insert/InsertWriterTest.php`.
 
 ```php
 $data = (new DocumentParser())->parse(document: $body, resource: CertificateResource::class);   // 400
@@ -1120,7 +1152,7 @@ public static function serializeNominal(array $values): string
 }
 ```
 
-**Ручная сериализация.** Дерево без плана собирает ресурсы `ManualSerializeIterator(source, resource, registry)`: он вызывает статический `serialize(array $tuple): ?ResourceRecord` ресурса (в базовом классе бросает `LogicException`). Так собраны ручные деревья `example/document.php` и `DocumentTreeTest`: их SQL написан руками (`QUERY1`–`QUERY4` в `example/db/connection.php`), ресурсы читают колонки по алиасам этих запросов. Строка — вся строка SQL-запроса, ресурс читает свои колонки, `null` — ресурса в строке нет.
+**Ручная сериализация.** Дерево без плана собирает ресурсы `ManualSerializeIterator(source, resource)` (под `RegisterIterator`): он вызывает статический `serialize(array $tuple): ?ResourceRecord` ресурса (в базовом классе бросает `LogicException`). Так собраны ручные деревья `example/document.php` и `DocumentTreeTest`: их SQL написан руками (`QUERY1`–`QUERY4` в `example/db/connection.php`), ресурсы читают колонки по алиасам этих запросов. Строка — вся строка SQL-запроса, ресурс читает свои колонки, `null` — ресурса в строке нет.
 
 ```php
 // DomainResource
@@ -1212,6 +1244,7 @@ php example/query-tree.php                         # дерево запроса
 php example/query-tree.php '/certificates?include=domains.logs&fields[certificate]=code'
 php example/insert-plan.php                        # вставка через планировщик: документ → план → дерево вставки, ключи; SQL в stderr; транзакция откатывается
 php example/insert-document.php                    # то же дерево вставки, собранное руками
+php example/insert-route.php                       # вложенный маршрут POST /certificates/1/domains: routeLink → InsertRouteLinkWriter над деревом
 php example/db/seed.php [количество сертификатов]  # пересоздать базу примера
 ```
 
@@ -1224,6 +1257,8 @@ php example/db/seed.php [количество сертификатов]  # пе�
 | `test/Executor/Select/HashJoinIteratorTest.php` | `HashJoinIterator`: элемент на элемент `outer`, `null` проходит, связанные по ключу, пустая связь. |
 | `test/Plan/Select/SelectWhereTest.php` | `WHERE` плана: фильтры владельца и 1-1 ресурса (`IS NULL OR`), именованные параметры, выполнение на SQLite примера; колонки фильтра и сортировки держат таблицы модели в FROM. |
 | `test/Executor/Select/SerializeIteratorTest.php` | Сериализация по плану: ресурсы из запросов плана примера на SQLite совпадают с эталоном по атрибутам и связи `provider`; составной атрибут, приведение типов, связь по внешнему ключу, ключи, `null` у пустого `LEFT JOIN`. |
+| `test/Executor/Select/RegisterIteratorTest.php` | `RegisterIterator`: повторный `type:id` даёт зарегистрированный объект, `null` проходит на своём месте, ресурсы попадают в реестр. |
+| `test/Executor/Select/AscendingKeyIteratorTest.php` | `AscendingKeyIterator`: упорядоченный поток проходит без изменений (с `null`), строгий порядок отвергает повтор ключа, нестрогий — убывание; неупорядоченный `outer` слияния — исключение. |
 | `test/Parser/Insert/DocumentParserTest.php` | Парсер документа вставки: дерево из `data` + `included`, порядок корней, ошибки клиента с указателем. |
 | `test/Plan/Insert/InsertPlannerTest.php` | Планировщик вставки: дерево по плану совпадает с собранным руками, только связи из документа, объединение по корням, модель из двух таблиц, `routeLink()`, выполнение плана с колонкой маршрута. |
 | `test/Executor/Insert/InsertWriterTest.php` | Дерево вставки на SQLite примера (транзакция с откатом): ключ владельца у связанных ресурсов, модель из двух таблиц и пропуск пустой LEFT-стороны, колонка связи из вложенного маршрута, `TableTreeBuilder`, ресурс без `Insertable`. |

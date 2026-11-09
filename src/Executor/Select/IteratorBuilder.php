@@ -28,19 +28,20 @@ use sad_spirit\pg_builder\SqlBuilderWalker;
  *
  * Узел плана и итератор соответствуют по основе имени. Вне строк:
  *  - SqlScanNode — запрос: SqlScanIterator(PDO, SQL select, parameters). С одним ресурсом (вход —
- *    ResourceNode) над ним сразу SerializeIterator. Со строкой из нескольких ресурсов — SharedDataIterator над
+ *    ResourceNode) над ним сразу SerializeIterator (под RegisterIterator). Со строкой из нескольких ресурсов — SharedDataIterator над
  *    запросом, поток строки (см. ниже) и SharedScanIterator, который один раз на строку сдвигает источник;
  *  - PreloadNode — PreloadIterator(source: outer, preload: inner);
  *  - HashNestJoinNode, MergeNestJoinNode — HashNestJoinIterator, MergeNestJoinIterator с ключами
- *    relation[0] (outer) и relation[1] (inner) и именем связи.
+ *    relation[0] (outer) и relation[1] (inner) и именем связи; у MergeNestJoinIterator оба входа обёрнуты
+ *    в AscendingKeyIterator (outer — строго по relation[0], inner — по неубыванию relation[1]).
  * Внутри строки (вход SqlScanNode), где все потоки читают один SharedDataIterator:
- *  - ResourceNode — SerializeIterator с записью SqlScanNode::columns этого ресурса. Записи идут в порядке
+ *  - ResourceNode — RegisterIterator над SerializeIterator с записью SqlScanNode::columns этого ресурса. Записи идут в порядке
  *    обхода строки слева направо (outer раньше inner, у ветки — только outer), и сборщик идёт в том же порядке;
  *  - SharedRowJoinNode — SharedRowJoinIterator;
  *  - HashJoinNode — HashJoinIterator (outer — поток строки, inner — отдельный запрос);
  *  - PreloadNode — PreloadIterator (source — поток строки, preload — отдельный запрос).
  *
- * Чего нет в плане, даёт сборщик: PDO — каждому SqlScanIterator; ResourceRegistry — каждому SerializeIterator
+ * Чего нет в плане, даёт сборщик: PDO — каждому SqlScanIterator; ResourceRegistry — каждому RegisterIterator
  * и Document (один на выполнение).
  *
  * Дерево итераторов одноразовое (см. PullExecutor), план — нет: на каждое выполнение нужен новый вызов
@@ -103,9 +104,18 @@ final readonly class IteratorBuilder
                 inner_key: $node->relation[1],
                 name: $node->name,
             ),
+            // Слиянию нужен порядок ключей: его проверяет AscendingKeyIterator на каждом входе
             $node instanceof MergeNestJoinNode => new MergeNestJoinIterator(
-                outer: $this->node(node: $node->outer, registry: $registry),
-                inner: $this->node(node: $node->inner, registry: $registry),
+                outer: new AscendingKeyIterator(
+                    source: $this->node(node: $node->outer, registry: $registry),
+                    key: $node->relation[0],
+                    strict: true,
+                ),
+                inner: new AscendingKeyIterator(
+                    source: $this->node(node: $node->inner, registry: $registry),
+                    key: $node->relation[1],
+                    strict: false,
+                ),
                 outer_key: $node->relation[0],
                 inner_key: $node->relation[1],
                 name: $node->name,
@@ -190,7 +200,7 @@ final readonly class IteratorBuilder
     }
 
     /**
-     * SerializeIterator ресурса строки со следующей записью columns.
+     * Поток ресурса строки: SerializeIterator со следующей записью columns под RegisterIterator.
      *
      * @param list<array<string, mixed>> $columns
      * @param int                        $index   по ссылке: номер записи; сдвигается на одну
@@ -201,7 +211,7 @@ final readonly class IteratorBuilder
         array $columns,
         int &$index,
         ResourceRegistry $registry,
-    ): SerializeIterator {
+    ): RegisterIterator {
         $entry = $columns[$index++] ?? throw new LogicException('Query owner has no columns for ' . $node->resource);
 
         // Запись проверяет и SerializeIterator, но здесь ошибка понятнее: сбился порядок обхода
@@ -209,6 +219,13 @@ final readonly class IteratorBuilder
             throw new LogicException("Columns entry of {$entry['resource']} given to {$node->resource}");
         }
 
-        return new SerializeIterator(source: $source, resource: $node->resource, registry: $registry, columns: $entry);
+        return new RegisterIterator(
+            source: new SerializeIterator(
+                source: $source,
+                resource: $node->resource,
+                columns: $entry,
+            ),
+            registry: $registry,
+        );
     }
 }

@@ -12,10 +12,12 @@ use Ggs\JsonApiEngine\Example\Resource\DetailResource;
 use Ggs\JsonApiEngine\Example\Resource\DomainResource;
 use Ggs\JsonApiEngine\Example\Resource\LogResource;
 use Ggs\JsonApiEngine\Example\Resource\ProviderResource;
+use Ggs\JsonApiEngine\Executor\Select\AscendingKeyIterator;
 use Ggs\JsonApiEngine\Executor\Select\HashNestJoinIterator;
 use Ggs\JsonApiEngine\Executor\Select\ManualSerializeIterator;
 use Ggs\JsonApiEngine\Executor\Select\MergeNestJoinIterator;
 use Ggs\JsonApiEngine\Executor\Select\PreloadIterator;
+use Ggs\JsonApiEngine\Executor\Select\RegisterIterator;
 use Ggs\JsonApiEngine\Executor\Select\SharedDataIterator;
 use Ggs\JsonApiEngine\Executor\Select\SharedRowJoinIterator;
 use Ggs\JsonApiEngine\Executor\Select\SharedScanIterator;
@@ -197,22 +199,36 @@ final class DocumentTreeTest extends TestCase
         return new HashNestJoinIterator(
             outer: new PreloadIterator(
                 source: self::certificates($pdo, $registry),
-                preload: new ManualSerializeIterator(
-                    source: new SqlScanIterator(pdo: $pdo, sql: QUERY4),
-                    resource: ProviderResource::class,
+                preload: new RegisterIterator(
+                    source: new ManualSerializeIterator(
+                        source: new SqlScanIterator(pdo: $pdo, sql: QUERY4),
+                        resource: ProviderResource::class,
+                    ),
                     registry: $registry,
                 ),
             ),
             inner: new MergeNestJoinIterator(
-                outer: new ManualSerializeIterator(
-                    source: new SqlScanIterator(pdo: $pdo, sql: QUERY2),
-                    resource: DomainResource::class,
-                    registry: $registry,
+                outer: new AscendingKeyIterator(
+                    source: new RegisterIterator(
+                        source: new ManualSerializeIterator(
+                            source: new SqlScanIterator(pdo: $pdo, sql: QUERY2),
+                            resource: DomainResource::class,
+                        ),
+                        registry: $registry,
+                    ),
+                    key: 'id',
+                    strict: true,
                 ),
-                inner: new ManualSerializeIterator(
-                    source: new SqlScanIterator(pdo: $pdo, sql: QUERY3),
-                    resource: LogResource::class,
-                    registry: $registry,
+                inner: new AscendingKeyIterator(
+                    source: new RegisterIterator(
+                        source: new ManualSerializeIterator(
+                            source: new SqlScanIterator(pdo: $pdo, sql: QUERY3),
+                            resource: LogResource::class,
+                        ),
+                        registry: $registry,
+                    ),
+                    key: 'domain_id',
+                    strict: false,
                 ),
                 outer_key: 'id',
                 inner_key: 'domain_id',
@@ -235,11 +251,29 @@ final class DocumentTreeTest extends TestCase
             data: $data,
             source: new SharedRowJoinIterator(
                 outer: new SharedRowJoinIterator(
-                    outer: new ManualSerializeIterator(source: $data, resource: CertificateResource::class, registry: $registry),
-                    inner: new ManualSerializeIterator(source: $data, resource: DetailResource::class, registry: $registry),
+                    outer: new RegisterIterator(
+                        source: new ManualSerializeIterator(
+                            source: $data,
+                            resource: CertificateResource::class,
+                        ),
+                        registry: $registry,
+                    ),
+                    inner: new RegisterIterator(
+                        source: new ManualSerializeIterator(
+                            source: $data,
+                            resource: DetailResource::class,
+                        ),
+                        registry: $registry,
+                    ),
                     name: CertificateResource::DETAIL,
                 ),
-                inner: new ManualSerializeIterator(source: $data, resource: DeliveryResource::class, registry: $registry),
+                inner: new RegisterIterator(
+                    source: new ManualSerializeIterator(
+                        source: $data,
+                        resource: DeliveryResource::class,
+                    ),
+                    registry: $registry,
+                ),
                 name: CertificateResource::DELIVERY,
             ),
         );

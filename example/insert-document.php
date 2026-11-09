@@ -8,22 +8,31 @@
  *     php example/insert-document.php            # дерево (explain) и ключи корня; SQL каждого INSERT — в stderr
  *     php example/insert-document.php 2>sql.log  # SQL отдельно
  *
- * `POST /certificates`: сертификат, `detail`, `delivery` и три домена — отдельные ресурсы из одной таблицы каждый.
- * Дерево уровня ресурсов — левый глубокий список `InsertJoinWriter` (родитель, сторона с первичным ключом, — `parent`);
- * поддерево таблиц под каждым ресурсом строит `TableTreeBuilder` из `model()`. `detail` стоит глубже `delivery`:
- * `certificate_delivery_meta.certificate_id` ссылается на `certificate_details` (SQLite с `foreign_keys = ON` иначе
- * отказывает). Вставка идёт в транзакции, которая в конце откатывается: база не меняется.
+ * `POST /certificates` для `CertificateWithDetailResource`: сертификат с деталями-атрибутами, `delivery` и три домена.
+ * Руками собраны оба уровня дерева:
+ *  - уровень ресурсов — левый глубокий список `InsertJoinWriter` (родитель — владелец связи, `parent`; новые дети —
+ *    `child`): сначала `delivery`, потом `domains`;
+ *  - уровень таблиц сертификата — `InsertTableJoinWriter`: родитель `certificates`, ребёнок `certificate_details`,
+ *    обёрнутый в `InsertOptionalTableWriter` (правая сторона `LeftJoin`: без колонок деталей она пропускается).
+ *    Для ресурсов из одной таблицы поддерево таблиц строит `TableTreeBuilder` из `model()`.
+ * `delivery` вставляется после деталей: `certificate_delivery_meta.certificate_id` ссылается на `certificate_details`
+ * (SQLite с `foreign_keys = ON` иначе отказывает). Вставка идёт в транзакции, которая в конце откатывается: база
+ * не меняется.
  */
 
 declare(strict_types=1);
 
-use Ggs\JsonApiEngine\Example\Resource\CertificateResource;
+use Ggs\JsonApiEngine\Example\Entity\CertificateDetailsEntity;
+use Ggs\JsonApiEngine\Example\Entity\CertificatesEntity;
+use Ggs\JsonApiEngine\Example\Resource\CertificateWithDetailResource;
 use Ggs\JsonApiEngine\Example\Resource\DeliveryResource;
-use Ggs\JsonApiEngine\Example\Resource\DetailResource;
 use Ggs\JsonApiEngine\Example\Resource\DomainResource;
 use Ggs\JsonApiEngine\Executor\Insert\InsertJoinWriter;
+use Ggs\JsonApiEngine\Executor\Insert\InsertOptionalTableWriter;
 use Ggs\JsonApiEngine\Executor\Insert\InsertResourceWriter;
 use Ggs\JsonApiEngine\Executor\Insert\InsertRootWriter;
+use Ggs\JsonApiEngine\Executor\Insert\InsertTableJoinWriter;
+use Ggs\JsonApiEngine\Executor\Insert\InsertTableWriter;
 use Ggs\JsonApiEngine\Executor\Insert\TableTreeBuilder;
 use Ggs\JsonApiEngine\Parser\Insert\DocumentParser;
 
@@ -34,10 +43,18 @@ const DOCUMENT = [
     'data' => [
         'type' => 'certificate',
         'lid' => 'c1',
-        'attributes' => ['code' => 'CERT-0001', 'nominal' => '100.00', 'currency' => 'EUR', 'status' => 'ACTIVE'],
+        'attributes' => [
+            'code' => 'CERT-0001',
+            'nominal' => '100.00',
+            'currency' => 'EUR',
+            'status' => 'ACTIVE',
+            'buyer_email' => 'buyer@example.com',
+            'recipient_name' => 'Anna',
+            'recipient_email' => 'anna@example.com',
+            'greeting_text' => 'Happy birthday!',
+        ],
         'relationships' => [
             'provider' => ['data' => ['type' => 'provider', 'id' => '1']],
-            'detail' => ['data' => ['type' => 'detail', 'lid' => 'det1']],
             'delivery' => ['data' => ['type' => 'delivery', 'lid' => 'del1']],
             'domains' => ['data' => [
                 ['type' => 'domain', 'lid' => 'd1'],
@@ -47,12 +64,6 @@ const DOCUMENT = [
         ],
     ],
     'included' => [
-        ['type' => 'detail', 'lid' => 'det1', 'attributes' => [
-            'buyer_email' => 'buyer@example.com',
-            'recipient_name' => 'Anna',
-            'recipient_email' => 'anna@example.com',
-            'greeting_text' => 'Happy birthday!',
-        ]],
         ['type' => 'delivery', 'lid' => 'del1', 'attributes' => ['delivery_channel' => 'EMAIL', 'is_sent' => false]],
         ['type' => 'domain', 'lid' => 'd1', 'attributes' => ['domain_name' => 'example.com', 'is_primary' => true]],
         ['type' => 'domain', 'lid' => 'd2', 'attributes' => ['domain_name' => 'www.example.com', 'is_primary' => false]],
@@ -61,30 +72,64 @@ const DOCUMENT = [
 ];
 
 $pdo = getPDO();
-$tables = new TableTreeBuilder(pdo: $pdo);
-$resource = static fn(string $class): InsertResourceWriter => new InsertResourceWriter(
-    resource: $class,
-    input: $tables->build($class),
+
+// Уровень таблиц сертификата: certificates — родитель, certificate_details — необязательный ребёнок (LeftJoin).
+// Колонки — колонки модели ресурса в каждой таблице; certificate_id деталей приходит колонкой связи от родителя
+$certificate_tables = new InsertTableJoinWriter(
+    relation: [CertificatesEntity::ID, CertificateDetailsEntity::CERTIFICATE_ID],
+    parent: new InsertTableWriter(
+        pdo: $pdo,
+        entity: CertificatesEntity::class,
+        columns: [
+            CertificatesEntity::ID,
+            CertificatesEntity::PROVIDER_ID,
+            CertificatesEntity::CODE,
+            CertificatesEntity::NOMINAL,
+            CertificatesEntity::CURRENCY,
+            CertificatesEntity::STATUS,
+            CertificatesEntity::CREATED_AT,
+        ],
+    ),
+    child: new InsertOptionalTableWriter(
+        input: new InsertTableWriter(
+            pdo: $pdo,
+            entity: CertificateDetailsEntity::class,
+            columns: [
+                CertificateDetailsEntity::BUYER_EMAIL,
+                CertificateDetailsEntity::RECIPIENT_NAME,
+                CertificateDetailsEntity::RECIPIENT_EMAIL,
+                CertificateDetailsEntity::GREETING_TEXT,
+                CertificateDetailsEntity::DESIGN_TEMPLATE_ID,
+            ],
+        ),
+    ),
 );
+
+// Ресурсы из одной таблицы: поддерево таблиц — по model() ресурса
+$tables = new TableTreeBuilder(pdo: $pdo);
 
 $insert = new InsertRootWriter(
     root: new InsertJoinWriter(
-        name: CertificateResource::DOMAINS,
-        relation: CertificateResource::relationship(CertificateResource::DOMAINS)->relation,
+        name: CertificateWithDetailResource::DOMAINS,
+        relation: CertificateWithDetailResource::relationship(CertificateWithDetailResource::DOMAINS)->relation,
         parent: new InsertJoinWriter(
-            name: CertificateResource::DELIVERY,
-            relation: CertificateResource::relationship(CertificateResource::DELIVERY)->relation,
-            parent: new InsertJoinWriter(
-                name: CertificateResource::DETAIL,
-                relation: CertificateResource::relationship(CertificateResource::DETAIL)->relation,
-                parent: $resource(CertificateResource::class),
-                child: $resource(DetailResource::class),
+            name: CertificateWithDetailResource::DELIVERY,
+            relation: CertificateWithDetailResource::relationship(CertificateWithDetailResource::DELIVERY)->relation,
+            parent: new InsertResourceWriter(
+                resource: CertificateWithDetailResource::class,
+                input: $certificate_tables,
             ),
-            child: $resource(DeliveryResource::class),
+            child: new InsertResourceWriter(
+                resource: DeliveryResource::class,
+                input: $tables->build(DeliveryResource::class),
+            ),
         ),
-        child: $resource(DomainResource::class),
+        child: new InsertResourceWriter(
+            resource: DomainResource::class,
+            input: $tables->build(DomainResource::class),
+        ),
     ),
-    data: new DocumentParser()->parse(document: DOCUMENT, resource: CertificateResource::class),
+    data: new DocumentParser()->parse(document: DOCUMENT, resource: CertificateWithDetailResource::class),
 );
 
 echo json_encode($insert->explain(), JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES), "\n\n";

@@ -7,7 +7,6 @@ namespace Ggs\JsonApiEngine\Executor\Select;
 use Generator;
 use Ggs\JsonApiEngine\Document\ResourceRecord;
 use Ggs\JsonApiEngine\Executor\PullExecutor;
-use UnexpectedValueException;
 
 /**
  * Соединяет главные ресурсы со связанными по ключу за один совместный проход двух
@@ -38,8 +37,9 @@ use UnexpectedValueException;
  * Требование: оба потока отсортированы по ключу соединения по возрастанию (ORDER BY в запросах):
  *  - $outer — строго по возрастанию, ключ главного ресурса уникален;
  *  - $inner — по неубыванию, у одного главного может быть сколько угодно связанных.
- * Узел проверяет порядок на лету и выбрасывает исключение при нарушении — иначе неотсортированный
- * поток молча дал бы неполные связи.
+ * Сам узел порядок не проверяет: это делает AscendingKeyIterator на каждом входе (strict для $outer, нестрогий
+ * для $inner), его ставит IteratorBuilder. В ручном дереве проверку ставит тот, кто собирает дерево; без неё
+ * неотсортированный поток молча даст неполные связи.
  *
  * Вложенные соединения: если $inner — другой узел соединения, его выход идёт в порядке его $outer.
  * Поэтому один поток обычно не подходит для двух MergeNestJoinIterator с разными ключами. Например,
@@ -109,8 +109,6 @@ class MergeNestJoinIterator implements JoinIterator
 
     /**
      * @return Generator<int, ResourceRecord>
-     * @throws UnexpectedValueException если $outer не строго возрастает по ключу
-     *         или $inner убывает по ключу
      * @throws \LogicException если у связанного ресурса нет главного
      */
     #[\Override]
@@ -119,60 +117,30 @@ class MergeNestJoinIterator implements JoinIterator
         // $inner читается вручную: на каждом шаге $outer из него берётся ровно столько,
         // сколько относится к текущему главному ресурсу
         $inner = $this->inner->getIterator();
-        $previous_outer_key = null;
-        $previous_inner_key = null;
 
         foreach ($this->outer as $record) {
             $key = $record->getKey($this->outer_key);
-
-            if ($previous_outer_key !== null && $key <= $previous_outer_key) {
-                throw new UnexpectedValueException(
-                    "Outer stream of MergeNestJoinIterator '{$this->name}' must be sorted by key strictly ascending: "
-                    . "{$key} after {$previous_outer_key}"
-                );
-            }
-            $previous_outer_key = $key;
-
             // LEFT JOIN: связь есть всегда, пустая — если связанных не найдётся
             $record->setRelationships(name: $this->name, related: []);
 
             while ($inner->valid()) {
                 $related = $inner->current();
-
-                if ($related === null) {
-                    $inner->next();
-                    continue;
-                }
-
-                $related_key = $related->getKey($this->inner_key);
-
-                if ($previous_inner_key !== null && $related_key < $previous_inner_key) {
-                    throw new UnexpectedValueException(
-                        "Inner stream of MergeNestJoinIterator '{$this->name}' must be sorted by key ascending: "
-                        . "{$related_key} after {$previous_inner_key}"
-                    );
-                }
-                $previous_inner_key = $related_key;
-
-                // Связанный относится к одному из следующих главных — оставляем его в $inner
-                // (не сдвигаем) и отдаём текущий главный ресурс
-                if ($related_key > $key) {
-                    break;
-                }
-
-                if ($related_key === $key) {
-                    $record->addRelationship(
-                        name: $this->name,
-                        related: $related
-                    );
-                } else {
+                if ($related !== null) {
+                    $related_key = $related->getKey($this->inner_key);
+                    // Связанный относится к одному из следующих главных — оставляем его в $inner
+                    // (не сдвигаем) и отдаём текущий главный ресурс
+                    if ($related_key > $key) {
+                        break;
+                    }
                     // Ключ меньше текущего главного: главные идут по возрастанию, и главного
                     // с таким ключом нет — ошибка плана
-                    throw new \LogicException(
-                        "Related resource {$related->key()} has no parent with key {$related_key} in MergeNestJoinIterator '{$this->name}'"
-                    );
+                    if ($related_key < $key) {
+                        throw new \LogicException(
+                            "Related resource {$related->key()} has no parent with key {$related_key} in MergeNestJoinIterator '{$this->name}'",
+                        );
+                    }
+                    $record->addRelationship(name: $this->name, related: $related);
                 }
-
                 $inner->next();
             }
 
@@ -185,7 +153,7 @@ class MergeNestJoinIterator implements JoinIterator
             $related = $inner->current();
             if ($related !== null) {
                 throw new \LogicException(
-                    "Related resource {$related->key()} has no parent: outer stream of MergeNestJoinIterator '{$this->name}' is over"
+                    "Related resource {$related->key()} has no parent: outer stream of MergeNestJoinIterator '{$this->name}' is over",
                 );
             }
             $inner->next();
