@@ -13,9 +13,10 @@ use Ggs\JsonApiEngine\Resource\Insertable;
 /**
  * `delivery`: таблица `certificate_delivery_meta`, идентификатор — её первичный ключ `certificate_id`.
  *
- * Можно создавать (`Insertable`): вставку см. `Executor\Insert\InsertResourceWriter`.
+ * Можно создавать (`Insertable`): вставку см. `Executor\Insert\InsertResourceWriter`; изменять и удалять
+ * (`Updatable`, `Deletable` — прототип записи example/patch-document.php).
  */
-final class DeliveryResource extends Resource implements Insertable
+final class DeliveryResource extends Resource implements Insertable, Updatable, Deletable
 {
     public const string TYPE = 'delivery';
 

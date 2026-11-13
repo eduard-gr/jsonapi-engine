@@ -14,9 +14,10 @@ use Ggs\JsonApiEngine\Resource\Insertable;
 /**
  * `domain`: таблица `domains` (QUERY2). Связь `logs` (1:N).
  *
- * Можно создавать (`Insertable`): вставку см. `Executor\Insert\InsertResourceWriter`.
+ * Можно создавать (`Insertable`): вставку см. `Executor\Insert\InsertResourceWriter`; изменять и удалять
+ * (`Updatable`, `Deletable` — прототип записи example/patch-document.php).
  */
-final class DomainResource extends Resource implements Insertable
+final class DomainResource extends Resource implements Insertable, Updatable, Deletable
 {
     public const string TYPE = 'domain';
 

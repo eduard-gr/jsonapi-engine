@@ -20,9 +20,10 @@ use Ggs\JsonApiEngine\Resource\Insertable;
  * (планировщиком или руками), строка деталей не вставляется, если ни одной её колонки не прислали. Для SELECT
  * (`serialize()` по `QUERY1`) не предназначен.
  *
- * Можно создавать (`Insertable`).
+ * Можно создавать (`Insertable`), изменять и удалять (`Updatable`, `Deletable` — прототип записи
+ * example/patch-document.php).
  */
-final class CertificateWithDetailResource extends Resource implements Insertable
+final class CertificateWithDetailResource extends Resource implements Insertable, Updatable, Deletable
 {
     public const string TYPE = CertificateResource::TYPE;
 
