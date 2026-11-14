@@ -84,7 +84,7 @@
  * `DELETE /certificates/1` (строки до и после: каскад удалил детали, доставку, домены, логи и конфиги) и тот же план
  * для `DELETE /certificates/999` (404); `PATCH /certificates/1` с полной заменой списка `domains` (`PatchReplaceNode`
  * под `PatchJoinNode`) и с заменой пустым — `delivery: null`, `domains: []` (только `PatchReplaceNode`, узлов связи
- * нет). План и дерево исполнителей печатаются текстом (`$plan_tree`, `$execution_tree`), порядок выполнения виден по
+ * нет). План и дерево исполнителей печатаются текстом (`planTree()`, `executionTree()`), порядок выполнения виден по
  * SQL в stderr.
  *
  * Ограничения прототипа: необязательная правая сторона модели — одна таблица; вставка отсутствующей строки деталей
@@ -1115,9 +1115,8 @@ final class PatchPlanner
         foreach ($tree->columns() as $column) {
             $columns[(int) $tree->columnTable($column)][] = $column;
         }
-        /** @var callable(): (Join|class-string<Entity>) $model */
-        $model = [$resource, 'model'];
-        $model = $model();
+        /** @var Join|class-string<Entity> $model */
+        $model = $resource::model();
         $returning = [];
         self::returning(model: $model, tree: $tree, returning: $returning);
         $leaf = 0;
@@ -1623,17 +1622,6 @@ final readonly class UpdateTableWriter implements TableWriter
         $conditions = array_diff_key(array_intersect_key($link, array_flip($this->columns)), [$this->key => true]);
         $returned = array_values(array_unique([$this->key, ...$this->returning]));
         $targets = array_map(static fn(string $column): TargetElement => new TargetElement(new ColumnReference($entity::column($column))), $returned);
-        $key = $this->key;
-        $where = static function (Update|Select $statement) use ($entity, $key, $conditions): array {
-            $statement->where->and(new OperatorExpression('=', new ColumnReference($entity::column($key)), new NamedParameter('key')));
-            $parameters = [];
-            foreach ($conditions as $column => $value) {
-                $statement->where->and(new OperatorExpression('=', new ColumnReference($entity::column((string) $column)), new NamedParameter("link_{$column}")));
-                $parameters["link_{$column}"] = $value;
-            }
-
-            return $parameters;
-        };
 
         $found = [];
         if ($values !== []) {
@@ -1644,7 +1632,7 @@ final readonly class UpdateTableWriter implements TableWriter
                     array_keys($values),
                 )),
             );
-            $parameters = [...$values, 'key' => $key_value, ...$where($update)];
+            $parameters = [...$values, 'key' => $key_value, ...$this->where(statement: $update, conditions: $conditions)];
             // Только если хоть одно присланное значение отличается от записанного; NULL сравнивается как значение
             $update->where->and(new LogicalExpression(
                 array_map(
@@ -1660,10 +1648,29 @@ final readonly class UpdateTableWriter implements TableWriter
         if ($found === []) {
             $select = new Select(new TargetList(array_map(static fn(TargetElement $target): TargetElement => clone $target, $targets)));
             $select->from[] = new RelationReference(new QualifiedName($entity::TABLE));
-            $found = Tables::run(pdo: $this->pdo, statement: $select, parameters: ['key' => $key_value, ...$where($select)]);
+            $found = Tables::run(pdo: $this->pdo, statement: $select, parameters: ['key' => $key_value, ...$this->where(statement: $select, conditions: $conditions)]);
         }
 
         return $found === [] ? [] : [...$values, ...$found[0]];
+    }
+
+    /**
+     * Условие поиска строки: `key = :key` и колонки связи с родителем; значение `:key` подставляет вызывающий.
+     *
+     * @param array<string, mixed> $conditions колонка связи → значение
+     * @return array<string, mixed> параметры колонок связи (`link_<колонка>`)
+     */
+    private function where(Update|Select $statement, array $conditions): array
+    {
+        $entity = $this->entity;
+        $statement->where->and(new OperatorExpression('=', new ColumnReference($entity::column($this->key)), new NamedParameter('key')));
+        $parameters = [];
+        foreach ($conditions as $column => $value) {
+            $statement->where->and(new OperatorExpression('=', new ColumnReference($entity::column($column)), new NamedParameter("link_{$column}")));
+            $parameters["link_{$column}"] = $value;
+        }
+
+        return $parameters;
     }
 
     #[\Override]
@@ -1893,12 +1900,17 @@ final class Tables
         $sql = (string) preg_replace(pattern: '/\s+/', replacement: ' ', subject: $statement->dispatch(new SqlBuilderWalker()));
         $prepared = $pdo->prepare($sql);
         foreach ($parameters as $name => $value) {
-            $prepared->bindValue(':' . $name, $value, match (true) {
-                is_int($value) => PDO::PARAM_INT,
-                is_bool($value) => PDO::PARAM_BOOL,
-                $value === null => PDO::PARAM_NULL,
-                default => PDO::PARAM_STR,
-            });
+            $type = PDO::PARAM_STR;
+            if (is_int($value)) {
+                $type = PDO::PARAM_INT;
+            }
+            if (is_bool($value)) {
+                $type = PDO::PARAM_BOOL;
+            }
+            if ($value === null) {
+                $type = PDO::PARAM_NULL;
+            }
+            $prepared->bindValue(':' . $name, $value, $type);
         }
         $prepared->execute();
         /** @var list<array<string, mixed>> $rows */
@@ -1958,53 +1970,59 @@ final readonly class PatchWriterBuilder
 
     public function build(PatchJoinNode|PatchReplaceNode|PatchOperationNode $plan): PushExecutor
     {
-        return match (true) {
-            $plan instanceof PatchJoinNode => new PatchJoinWriter(
+        if ($plan instanceof PatchJoinNode) {
+            return new PatchJoinWriter(
                 name: $plan->name,
                 relation: $plan->relation,
                 parent: $this->build(plan: $plan->parent),
                 child: $this->build(plan: $plan->child),
-            ),
-            $plan instanceof PatchReplaceNode => new PatchReplaceWriter(
+            );
+        }
+        if ($plan instanceof PatchReplaceNode) {
+            return new PatchReplaceWriter(
                 pdo: $this->pdo,
                 name: $plan->name,
                 relation: $plan->relation,
                 child_resource: $plan->child_resource,
                 input: $this->build(plan: $plan->input),
+            );
+        }
+
+        return new PatchOperationWriter(
+            resource: $plan->resource,
+            add: $plan->add === null ? null : new WriterBuilder(pdo: $this->pdo)->build(plan: $plan->add),
+            update: $plan->update === null ? null : new UpdateResourceWriter(
+                resource: $plan->update->resource,
+                input: $this->table(plan: $plan->update->input),
             ),
-            default => new PatchOperationWriter(
-                resource: $plan->resource,
-                add: $plan->add === null ? null : new WriterBuilder(pdo: $this->pdo)->build(plan: $plan->add),
-                update: $plan->update === null ? null : new UpdateResourceWriter(
-                    resource: $plan->update->resource,
-                    input: $this->table(plan: $plan->update->input),
-                ),
-                remove: $plan->remove === null ? null : new DeleteResourceWriter(
-                    pdo: $this->pdo,
-                    resource: $plan->remove->resource,
-                ),
+            remove: $plan->remove === null ? null : new DeleteResourceWriter(
+                pdo: $this->pdo,
+                resource: $plan->remove->resource,
             ),
-        };
+        );
     }
 
     public function table(UpdateTableJoinNode|UpdateTableNode|UpdateOptionalTableNode $plan): TableWriter
     {
-        return match (true) {
-            $plan instanceof UpdateTableJoinNode => new UpdateTableJoinWriter(
+        if ($plan instanceof UpdateTableJoinNode) {
+            return new UpdateTableJoinWriter(
                 relation: $plan->relation,
                 main: $this->table(plan: $plan->main),
                 joined: $this->table(plan: $plan->joined),
-            ),
-            $plan instanceof UpdateOptionalTableNode => new UpdateOptionalTableWriter(
+            );
+        }
+        if ($plan instanceof UpdateOptionalTableNode) {
+            return new UpdateOptionalTableWriter(
                 update: $this->updateTable(plan: $plan->update),
                 insert: new InsertTableWriter(
                     pdo: $this->pdo,
                     entity: $plan->insert->entity,
                     columns: $plan->insert->columns,
                 ),
-            ),
-            default => $this->updateTable(plan: $plan),
-        };
+            );
+        }
+
+        return $this->updateTable(plan: $plan);
     }
 
     private function updateTable(UpdateTableNode $plan): UpdateTableWriter
@@ -2022,47 +2040,63 @@ final readonly class PatchWriterBuilder
 // ---------------------------------------------------------------------------------------------------------------
 // Печать: дерево изменений, план и дерево исполнителей текстом
 
-$json = static fn(mixed $value): string => (string) json_encode($value, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+function json(mixed $value): string
+{
+    return (string) json_encode($value, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+}
+
+/**
+ * Имя класса без пространства имён.
+ */
+function shortClassName(string $class): string
+{
+    return substr((string) strrchr('\\' . $class, '\\'), 1);
+}
 
 /**
  * Дерево изменений текстом: операция, тип, id/lid, атрибуты; связи с режимом и элементами с отступом.
  */
-$changes = static function (array $node, string $indent = '') use (&$changes): string {
-    $identity = match (true) {
-        isset($node['id']) => "id {$node['id']}",
-        isset($node['lid']) => "lid {$node['lid']}",
-        default => 'new',
-    };
+function changes(array $node, string $indent = ''): string
+{
+    $identity = 'new';
+    if (isset($node['lid'])) {
+        $identity = "lid {$node['lid']}";
+    }
+    if (isset($node['id'])) {
+        $identity = "id {$node['id']}";
+    }
     $attributes = ($node['attributes'] ?? []) === [] ? '' : ' ' . json_encode($node['attributes'], JSON_UNESCAPED_UNICODE);
     $output = "{$indent}{$node['patch:op']} {$node['type']} {$identity}{$attributes}\n";
     foreach ($node['relationships'] ?? [] as $name => $relationship) {
         if (isset($relationship['patch:replace'])) {
-            $kind = match (true) {
-                isset($relationship['patch:to-one']) => 'owned to-one',
-                default => 'owned',
-            };
-            $mode = match (true) {
-                $node['patch:op'] === 'add' => 'new parent: everything listed is added',
-                isset($relationship['patch:to-one']) => $relationship['patch:replace'] ? 'replace (the current one is deleted first)' : 'keep or update the current one',
-                $relationship['patch:replace'] => 'replace (unlisted leave the relationship)',
-                default => 'partial (unlisted are kept)',
-            };
+            $to_one = isset($relationship['patch:to-one']);
+            $kind = $to_one ? 'owned to-one' : 'owned';
+            if ($node['patch:op'] === 'add') {
+                $mode = 'new parent: everything listed is added';
+            } elseif ($to_one) {
+                $mode = $relationship['patch:replace'] ? 'replace (the current one is deleted first)' : 'keep or update the current one';
+            } elseif ($relationship['patch:replace']) {
+                $mode = 'replace (unlisted leave the relationship)';
+            } else {
+                $mode = 'partial (unlisted are kept)';
+            }
             $output .= "{$indent}    {$name} ({$kind}): {$mode}\n";
             foreach ($relationship['data'] as $child) {
-                $output .= $changes($child, "{$indent}        ");
+                $output .= changes($child, "{$indent}        ");
             }
         }
     }
 
     return $output;
-};
+}
 
 /**
  * Дерево исполнителей текстом из explain(): короткое имя узла, его скалярные и списочные свойства, входы с отступом
  * под своим именем (`parent`, `child`, `add`, `input`…).
  */
-$execution_tree = static function (array $explain, string $indent = '', string $role = '') use (&$execution_tree): string {
-    $name = substr(strrchr('\\' . $explain['node'], '\\'), 1);
+function executionTree(array $explain, string $indent = '', string $role = ''): string
+{
+    $name = shortClassName($explain['node']);
     $properties = [];
     $inputs = [];
     foreach ($explain as $key => $value) {
@@ -2072,23 +2106,23 @@ $execution_tree = static function (array $explain, string $indent = '', string $
         if (is_array($value) && isset($value['node'])) {
             $inputs[$key] = $value;
         } else {
-            $properties[] = "{$key}: " . (is_string($value) && str_contains($value, '\\') ? substr(strrchr($value, '\\'), 1) : json_encode($value, JSON_UNESCAPED_SLASHES));
+            $properties[] = "{$key}: " . (is_string($value) && str_contains($value, '\\') ? shortClassName($value) : json_encode($value, JSON_UNESCAPED_SLASHES));
         }
     }
     $output = $indent . ($role === '' ? '' : "{$role}: ") . $name . ($properties === [] ? '' : ' (' . implode(', ', $properties) . ')') . "\n";
     foreach ($inputs as $key => $input) {
-        $output .= $execution_tree($input, "{$indent}    ", (string) $key);
+        $output .= executionTree($input, "{$indent}    ", (string) $key);
     }
 
     return $output;
-};
+}
 
 /**
  * План текстом из публичных свойств узлов: короткое имя узла, его свойства, входы (свойства-узлы) с отступом под
  * своим именем; пустые ветви (`null`) не печатаются.
  */
-$plan_tree = static function (object $node, string $indent = '', string $role = '') use (&$plan_tree): string {
-    $short = static fn(string $class): string => substr(strrchr('\\' . $class, '\\'), 1);
+function planTree(object $node, string $indent = '', string $role = ''): string
+{
     $properties = [];
     $inputs = [];
     foreach (get_object_vars($node) as $key => $value) {
@@ -2098,18 +2132,71 @@ $plan_tree = static function (object $node, string $indent = '', string $role = 
         if (is_object($value) && str_ends_with($value::class, 'Node')) {
             $inputs[$key] = $value;
         } elseif (is_object($value)) {
-            $properties[] = "{$key}: " . $short($value::class);
+            $properties[] = "{$key}: " . shortClassName($value::class);
         } else {
-            $properties[] = "{$key}: " . (is_string($value) && str_contains($value, '\\') ? $short($value) : json_encode($value, JSON_UNESCAPED_SLASHES));
+            $properties[] = "{$key}: " . (is_string($value) && str_contains($value, '\\') ? shortClassName($value) : json_encode($value, JSON_UNESCAPED_SLASHES));
         }
     }
-    $output = $indent . ($role === '' ? '' : "{$role}: ") . $short($node::class) . ($properties === [] ? '' : ' (' . implode(', ', $properties) . ')') . "\n";
+    $output = $indent . ($role === '' ? '' : "{$role}: ") . shortClassName($node::class) . ($properties === [] ? '' : ' (' . implode(', ', $properties) . ')') . "\n";
     foreach ($inputs as $key => $input) {
-        $output .= $plan_tree($input, "{$indent}    ", (string) $key);
+        $output .= planTree($input, "{$indent}    ", (string) $key);
     }
 
     return $output;
-};
+}
+
+/**
+ * Строки сертификата 1 и его детей: состояние до и после сценария.
+ *
+ * @return array<string, mixed>
+ */
+function certificateState(PDO $pdo): array
+{
+    return [
+        'certificate' => $pdo->query('select c.nominal, d.buyer_email, d.recipient_name from certificates c left join certificate_details d on d.certificate_id = c.id where c.id = 1')->fetch(PDO::FETCH_ASSOC),
+        'delivery' => $pdo->query('select certificate_id, delivery_channel, is_sent, external_provider_id from certificate_delivery_meta where certificate_id = 1')->fetch(PDO::FETCH_ASSOC),
+        'domains' => $pdo->query('select id, domain_name, is_primary from domains where certificate_id = 1 order by id')->fetchAll(PDO::FETCH_ASSOC),
+    ];
+}
+
+/**
+ * Два документа PATCH для сертификата без строки деталей: только NULL, затем значения.
+ *
+ * @return list<array>
+ */
+function detailDocuments(string $id): array
+{
+    return [
+        ['data' => ['type' => 'certificate', 'id' => $id, 'attributes' => ['recipient_name' => null]]],
+        ['data' => ['type' => 'certificate', 'id' => $id, 'attributes' => ['buyer_email' => 'first-buyer@example.com', 'greeting_text' => 'Hello']]],
+    ];
+}
+
+/**
+ * @return array<string, mixed>|false строка деталей сертификата, false — строки нет
+ */
+function detailState(PDO $pdo, string $id): array|false
+{
+    return $pdo->query("select * from certificate_details where certificate_id = {$id}")->fetch(PDO::FETCH_ASSOC);
+}
+
+/**
+ * Число строк сертификата 1 и его потомков по таблицам: что удалил каскад.
+ *
+ * @param string $domain_ids id доменов сертификата через запятую (после удаления их уже не найти)
+ * @return array<string, int>
+ */
+function cascadeState(PDO $pdo, string $domain_ids): array
+{
+    return [
+        'certificates' => (int) $pdo->query('select count(*) from certificates where id = 1')->fetchColumn(),
+        'certificate_details' => (int) $pdo->query('select count(*) from certificate_details where certificate_id = 1')->fetchColumn(),
+        'certificate_delivery_meta' => (int) $pdo->query('select count(*) from certificate_delivery_meta where certificate_id = 1')->fetchColumn(),
+        'domains' => (int) $pdo->query('select count(*) from domains where certificate_id = 1')->fetchColumn(),
+        'domain_logs' => (int) $pdo->query("select count(*) from domain_logs where domain_id in ({$domain_ids})")->fetchColumn(),
+        'domain_configs' => (int) $pdo->query("select count(*) from domain_configs where domain_id in ({$domain_ids})")->fetchColumn(),
+    ];
+}
 
 $pdo = getPDO();
 // FOR KEY SHARE в проверках существования: в PostgreSQL true; SQLite примера такой конструкции не знает
@@ -2141,27 +2228,22 @@ $certificate_document = [
         ['type' => 'delivery', 'lid' => 'del1', 'attributes' => ['delivery_channel' => 'SMS', 'is_sent' => false]],
     ],
 ];
-echo "######## 1. PATCH /certificates/1\n", $json($certificate_document), "\n\n";
+echo "######## 1. PATCH /certificates/1\n", json($certificate_document), "\n\n";
 
-$certificate_state = static fn(PDO $pdo): array => [
-    'certificate' => $pdo->query('select c.nominal, d.buyer_email, d.recipient_name from certificates c left join certificate_details d on d.certificate_id = c.id where c.id = 1')->fetch(PDO::FETCH_ASSOC),
-    'delivery' => $pdo->query('select certificate_id, delivery_channel, is_sent, external_provider_id from certificate_delivery_meta where certificate_id = 1')->fetch(PDO::FETCH_ASSOC),
-    'domains' => $pdo->query('select id, domain_name, is_primary from domains where certificate_id = 1 order by id')->fetchAll(PDO::FETCH_ASSOC),
-];
 
 $pdo->beginTransaction();
 try {
     $certificate_root = new WriteDocumentParser()->update(document: $certificate_document, resource: CertificateWithDetailResource::class, id: '1');
-    echo "######## change tree\n", $changes($certificate_root), "\n";
+    echo "######## change tree\n", changes($certificate_root), "\n";
     $certificate_plan = new PatchPlanner()->plan(resource: CertificateWithDetailResource::class, roots: [$certificate_root]);
-    echo "######## plan\n", $plan_tree($certificate_plan), "\n";
+    echo "######## plan\n", planTree($certificate_plan), "\n";
     $certificate_writer = new PatchWriterBuilder(pdo: $pdo, lock: $lock)->root(plan: $certificate_plan, data: [$certificate_root]);
-    echo "######## execution tree\n", $execution_tree($certificate_writer->explain()), "\n";
-    echo "######## before\n", $json($certificate_state($pdo)), "\n\n";
-    echo "######## keys of the root\n", $json($certificate_writer->execute()[0]), "\n\n";
-    echo "######## after (before rollback)\n", $json($certificate_state($pdo)), "\n\n";
+    echo "######## execution tree\n", executionTree($certificate_writer->explain()), "\n";
+    echo "######## before\n", json(certificateState(pdo: $pdo)), "\n\n";
+    echo "######## keys of the root\n", json($certificate_writer->execute()[0]), "\n\n";
+    echo "######## after (before rollback)\n", json(certificateState(pdo: $pdo)), "\n\n";
 } catch (WriteDocumentException $exception) {
-    echo "######## response\n", $json($exception->toDocument()), "\n\n";
+    echo "######## response\n", json($exception->toDocument()), "\n\n";
 } finally {
     $pdo->rollBack();
 }
@@ -2171,28 +2253,23 @@ try {
 //    recipient_name: null — строки нет, все присланные значения NULL: вставлять нечего, только SELECT;
 //    buyer_email + greeting_text — строки нет: UPDATE ничего не нашёл, строка вставляется
 
-$detail_documents = static fn(string $id): array => [
-    ['data' => ['type' => 'certificate', 'id' => $id, 'attributes' => ['recipient_name' => null]]],
-    ['data' => ['type' => 'certificate', 'id' => $id, 'attributes' => ['buyer_email' => 'first-buyer@example.com', 'greeting_text' => 'Hello']]],
-];
-$detail_state = static fn(PDO $pdo, string $id): array|false => $pdo->query("select * from certificate_details where certificate_id = {$id}")->fetch(PDO::FETCH_ASSOC);
 
 $pdo->beginTransaction();
 try {
     $pdo->exec("insert into certificates (provider_id, code, nominal) values (1, 'NO-DETAIL', '1.00')");
     $detail_id = (string) $pdo->lastInsertId();
     echo "######## 2. PATCH /certificates/{$detail_id} (no certificate_details row)\n\n";
-    foreach ($detail_documents($detail_id) as $detail_document) {
-        echo "######## document\n", $json($detail_document), "\n";
+    foreach (detailDocuments(id: $detail_id) as $detail_document) {
+        echo "######## document\n", json($detail_document), "\n";
         $detail_root = new WriteDocumentParser()->update(document: $detail_document, resource: CertificateWithDetailResource::class, id: $detail_id);
         $detail_plan = new PatchPlanner()->plan(resource: CertificateWithDetailResource::class, roots: [$detail_root]);
-        echo "######## plan\n", $plan_tree($detail_plan);
+        echo "######## plan\n", planTree($detail_plan);
         $detail_writer = new PatchWriterBuilder(pdo: $pdo, lock: $lock)->root(plan: $detail_plan, data: [$detail_root]);
-        echo "######## keys of the root\n", $json($detail_writer->execute()[0]), "\n";
-        echo "######## certificate_details after\n", $json($detail_state($pdo, $detail_id)), "\n\n";
+        echo "######## keys of the root\n", json($detail_writer->execute()[0]), "\n";
+        echo "######## certificate_details after\n", json(detailState(pdo: $pdo, id: $detail_id)), "\n\n";
     }
 } catch (WriteDocumentException $exception) {
-    echo "######## response\n", $json($exception->toDocument()), "\n\n";
+    echo "######## response\n", json($exception->toDocument()), "\n\n";
 } finally {
     $pdo->rollBack();
 }
@@ -2223,20 +2300,20 @@ $post_document = [
         ['type' => 'domain', 'lid' => 'd2', 'attributes' => ['domain_name' => 'plan2.example.com']],
     ],
 ];
-echo "\n######## 3. POST /certificates\n", $json($post_document), "\n\n";
+echo "\n######## 3. POST /certificates\n", json($post_document), "\n\n";
 
 $pdo->beginTransaction();
 try {
     $post_roots = new WriteDocumentParser()->insert(document: $post_document, resource: CertificateWithDetailResource::class);
-    echo "######## change tree\n", implode('', array_map($changes, $post_roots)), "\n";
+    echo "######## change tree\n", implode('', array_map(static fn(array $root): string => changes(node: $root), $post_roots)), "\n";
     $post_plan = new PatchPlanner()->plan(resource: CertificateWithDetailResource::class, roots: $post_roots);
-    echo "######## plan\n", $plan_tree($post_plan), "\n";
+    echo "######## plan\n", planTree($post_plan), "\n";
     $post_writer = new PatchWriterBuilder(pdo: $pdo, lock: $lock)->root(plan: $post_plan, data: $post_roots);
     $post_keys = $post_writer->execute();
     $post_id = (string) $post_keys[0][CertificateWithDetailResource::primaryColumn()];
-    echo "######## response\n201 Created\nLocation: /certificates/{$post_id}\n", $json(['data' => ['type' => CertificateWithDetailResource::type(), 'id' => $post_id]]), "\n";
+    echo "######## response\n201 Created\nLocation: /certificates/{$post_id}\n", json(['data' => ['type' => CertificateWithDetailResource::type(), 'id' => $post_id]]), "\n";
 } catch (WriteDocumentException $exception) {
-    echo "######## response\n", $json($exception->toDocument()), "\n";
+    echo "######## response\n", json($exception->toDocument()), "\n";
 } finally {
     $pdo->rollBack();
 }
@@ -2253,28 +2330,28 @@ $route_document = [
         ['type' => 'domain', 'lid' => 'd2', 'attributes' => ['domain_name' => 'cdn.example.org', 'is_primary' => false]],
     ],
 ];
-echo "\n######## 4. POST /certificates/1/domains\n", $json($route_document), "\n\n";
+echo "\n######## 4. POST /certificates/1/domains\n", json($route_document), "\n\n";
 
 $pdo->beginTransaction();
 try {
     $route_roots = new WriteDocumentParser()->insert(document: $route_document, resource: DomainResource::class);
-    echo "######## change tree\n", implode('', array_map($changes, $route_roots)), "\n";
+    echo "######## change tree\n", implode('', array_map(static fn(array $root): string => changes(node: $root), $route_roots)), "\n";
     $route_plan = new PatchPlanner()->plan(
         resource: DomainResource::class,
         roots: $route_roots,
         parent: CertificateResource::class,
         relationship: CertificateResource::DOMAINS,
     );
-    echo "######## plan\n", $plan_tree($route_plan), "\n";
+    echo "######## plan\n", planTree($route_plan), "\n";
     $route_writer = new PatchWriterBuilder(pdo: $pdo, lock: $lock)->root(plan: $route_plan, data: $route_roots, route_id: 1);
-    echo "######## execution tree\n", $execution_tree($route_writer->explain()), "\n";
+    echo "######## execution tree\n", executionTree($route_writer->explain()), "\n";
     $route_keys = $route_writer->execute();
-    echo "######## response\n201 Created\n", $json(['data' => array_map(
+    echo "######## response\n201 Created\n", json(['data' => array_map(
         static fn(array $keys): array => ['type' => DomainResource::type(), 'id' => (string) $keys[DomainResource::primaryColumn()]],
         $route_keys,
     )]), "\n";
 } catch (WriteDocumentException $exception) {
-    echo "######## response\n", $json($exception->toDocument()), "\n";
+    echo "######## response\n", json($exception->toDocument()), "\n";
 } finally {
     $pdo->rollBack();
 }
@@ -2288,7 +2365,7 @@ $pdo->beginTransaction();
 try {
     new PatchWriterBuilder(pdo: $pdo, lock: $lock)->root(plan: $route_plan, data: $route_roots, route_id: 999)->execute();
 } catch (WriteDocumentException $exception) {
-    echo "######## response\n", $json($exception->toDocument()), "\n";
+    echo "######## response\n", json($exception->toDocument()), "\n";
 } finally {
     $pdo->rollBack();
 }
@@ -2301,29 +2378,21 @@ try {
 echo "\n######## 6. DELETE /certificates/1\n\n";
 
 $domain_ids = implode(', ', $pdo->query('select id from domains where certificate_id = 1')->fetchAll(PDO::FETCH_COLUMN));
-$cascade_state = static fn(PDO $pdo): array => [
-    'certificates' => (int) $pdo->query('select count(*) from certificates where id = 1')->fetchColumn(),
-    'certificate_details' => (int) $pdo->query('select count(*) from certificate_details where certificate_id = 1')->fetchColumn(),
-    'certificate_delivery_meta' => (int) $pdo->query('select count(*) from certificate_delivery_meta where certificate_id = 1')->fetchColumn(),
-    'domains' => (int) $pdo->query('select count(*) from domains where certificate_id = 1')->fetchColumn(),
-    'domain_logs' => (int) $pdo->query("select count(*) from domain_logs where domain_id in ({$domain_ids})")->fetchColumn(),
-    'domain_configs' => (int) $pdo->query("select count(*) from domain_configs where domain_id in ({$domain_ids})")->fetchColumn(),
-];
 
 $pdo->beginTransaction();
 try {
     $delete_root = new WriteDocumentParser()->delete(resource: CertificateWithDetailResource::class, id: '1');
-    echo "######## change tree\n", $changes($delete_root), "\n";
+    echo "######## change tree\n", changes($delete_root), "\n";
     $delete_plan = new PatchPlanner()->plan(resource: CertificateWithDetailResource::class, roots: [$delete_root]);
-    echo "######## plan\n", $plan_tree($delete_plan), "\n";
+    echo "######## plan\n", planTree($delete_plan), "\n";
     $delete_writer = new PatchWriterBuilder(pdo: $pdo, lock: $lock)->root(plan: $delete_plan, data: [$delete_root]);
-    echo "######## execution tree\n", $execution_tree($delete_writer->explain()), "\n";
-    echo "######## rows of certificate 1 before\n", $json($cascade_state($pdo)), "\n\n";
+    echo "######## execution tree\n", executionTree($delete_writer->explain()), "\n";
+    echo "######## rows of certificate 1 before\n", json(cascadeState(pdo: $pdo, domain_ids: $domain_ids)), "\n\n";
     $delete_writer->execute();
     echo "######## response\n204 No Content\n\n";
-    echo "######## rows of certificate 1 after (before rollback)\n", $json($cascade_state($pdo)), "\n";
+    echo "######## rows of certificate 1 after (before rollback)\n", json(cascadeState(pdo: $pdo, domain_ids: $domain_ids)), "\n";
 } catch (WriteDocumentException $exception) {
-    echo "######## response\n", $json($exception->toDocument()), "\n";
+    echo "######## response\n", json($exception->toDocument()), "\n";
 } finally {
     $pdo->rollBack();
 }
@@ -2337,7 +2406,7 @@ try {
     $missing_root = new WriteDocumentParser()->delete(resource: CertificateWithDetailResource::class, id: '999');
     new PatchWriterBuilder(pdo: $pdo, lock: $lock)->root(plan: $delete_plan, data: [$missing_root])->execute();
 } catch (WriteDocumentException $exception) {
-    echo "######## response\n", $json($exception->toDocument()), "\n";
+    echo "######## response\n", json($exception->toDocument()), "\n";
 } finally {
     $pdo->rollBack();
 }
@@ -2359,18 +2428,18 @@ $replace_document = [
         ],
     ],
 ];
-echo "\n######## 8. PATCH /certificates/1 (full replacement of domains)\n", $json($replace_document), "\n\n";
+echo "\n######## 8. PATCH /certificates/1 (full replacement of domains)\n", json($replace_document), "\n\n";
 $pdo->beginTransaction();
 try {
     $replace_root = new WriteDocumentParser()->update(document: $replace_document, resource: CertificateWithDetailResource::class, id: '1');
-    echo "######## change tree\n", $changes($replace_root), "\n";
+    echo "######## change tree\n", changes($replace_root), "\n";
     $replace_plan = new PatchPlanner()->plan(resource: CertificateWithDetailResource::class, roots: [$replace_root]);
-    echo "######## plan\n", $plan_tree($replace_plan), "\n";
-    echo "######## before\n", $json($certificate_state($pdo)), "\n\n";
+    echo "######## plan\n", planTree($replace_plan), "\n";
+    echo "######## before\n", json(certificateState(pdo: $pdo)), "\n\n";
     new PatchWriterBuilder(pdo: $pdo, lock: $lock)->root(plan: $replace_plan, data: [$replace_root])->execute();
-    echo "######## after (before rollback)\n", $json($certificate_state($pdo)), "\n";
+    echo "######## after (before rollback)\n", json(certificateState(pdo: $pdo)), "\n";
 } catch (WriteDocumentException $exception) {
-    echo "######## response\n", $json($exception->toDocument()), "\n";
+    echo "######## response\n", json($exception->toDocument()), "\n";
 } finally {
     $pdo->rollBack();
 }
@@ -2389,18 +2458,18 @@ $empty_document = [
         ],
     ],
 ];
-echo "\n######## 9. PATCH /certificates/1 (replacement by empty: delivery null, domains [])\n", $json($empty_document), "\n\n";
+echo "\n######## 9. PATCH /certificates/1 (replacement by empty: delivery null, domains [])\n", json($empty_document), "\n\n";
 $pdo->beginTransaction();
 try {
     $empty_root = new WriteDocumentParser()->update(document: $empty_document, resource: CertificateWithDetailResource::class, id: '1');
-    echo "######## change tree\n", $changes($empty_root), "\n";
+    echo "######## change tree\n", changes($empty_root), "\n";
     $empty_plan = new PatchPlanner()->plan(resource: CertificateWithDetailResource::class, roots: [$empty_root]);
-    echo "######## plan\n", $plan_tree($empty_plan), "\n";
-    echo "######## before\n", $json($certificate_state($pdo)), "\n\n";
+    echo "######## plan\n", planTree($empty_plan), "\n";
+    echo "######## before\n", json(certificateState(pdo: $pdo)), "\n\n";
     new PatchWriterBuilder(pdo: $pdo, lock: $lock)->root(plan: $empty_plan, data: [$empty_root])->execute();
-    echo "######## after (before rollback)\n", $json($certificate_state($pdo)), "\n";
+    echo "######## after (before rollback)\n", json(certificateState(pdo: $pdo)), "\n";
 } catch (WriteDocumentException $exception) {
-    echo "######## response\n", $json($exception->toDocument()), "\n";
+    echo "######## response\n", json($exception->toDocument()), "\n";
 } finally {
     $pdo->rollBack();
 }
