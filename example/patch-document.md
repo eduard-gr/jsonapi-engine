@@ -14,8 +14,8 @@ php example/patch-document.php 2>sql.log     # деревья — в stdout, SQL
 
 1. [Конвейер целиком](#1-конвейер-целиком)
 2. [Пример: запрос и база до него](#2-пример-запрос-и-база-до-него)
-3. [Шаг 1. Парсер: документ → дерево изменений](#3-шаг-1-парсер-документ--дерево-изменений)
-4. [Шаг 2. Планировщик: дерево изменений → план](#4-шаг-2-планировщик-дерево-изменений--план)
+3. [Шаг 1. Парсер: документ → дерево операций](#3-шаг-1-парсер-документ--дерево-операций)
+4. [Шаг 2. Планировщик: дерево операций → план](#4-шаг-2-планировщик-дерево-операций--план)
 5. [Шаг 3. Сборщик: план → дерево исполнителей](#5-шаг-3-сборщик-план--дерево-исполнителей)
 6. [Шаг 4. Выполнение: как данные идут по дереву](#6-шаг-4-выполнение-как-данные-идут-по-дереву)
 7. [Другие ветви поведения](#7-другие-ветви-поведения)
@@ -30,7 +30,7 @@ php example/patch-document.php 2>sql.log     # деревья — в stdout, SQL
 
 ```mermaid
 flowchart LR
-    A["Документ JSON:API<br/>data + included"] -->|"WriteDocumentParser::update()"| B["Дерево изменений<br/>вложенные массивы"]
+    A["Документ JSON:API<br/>data + included"] -->|"WriteDocumentParser::update()"| B["Дерево операций<br/>объекты …Operation"]
     B -->|"PatchPlanner::plan()"| C["План<br/>неизменяемые узлы …Node"]
     C -->|"PatchWriterBuilder::root()"| D["Дерево исполнителей<br/>…Writer"]
     D -->|"WriteRootWriter::execute()"| E["SQL в базе<br/>ключи корня"]
@@ -38,14 +38,15 @@ flowchart LR
 
 | стадия | вход | выход | что решает | трогает базу |
 |---|---|---|---|---|
-| парсер | документ, класс ресурса, id из маршрута | дерево изменений | что клиент просит сделать с каждым ресурсом; все ошибки клиента 400/403/409 | нет |
-| планировщик | дерево изменений | план | какие узлы нужны и в каком порядке; какие таблицы у каждого ресурса | нет |
+| парсер | документ, класс ресурса, id из маршрута | дерево операций | что клиент просит сделать с каждым ресурсом; все ошибки клиента 400/403/409 | нет |
+| планировщик | дерево операций | план | какие узлы нужны и в каком порядке; какие таблицы у каждого ресурса | нет |
 | сборщик | план, корни, значения из маршрута | дерево исполнителей | ничего: переводит узел плана в исполнитель один к одному | нет |
-| выполнение | корень дерева изменений | ключи корня | значения: какие строки менять, вставлять, удалять | да |
+| выполнение | корень дерева операций | ключи корня | значения: какие строки менять, вставлять, удалять | да |
 
 Три вида деревьев отличаются тем, что в них лежит:
 
-- **дерево изменений** — данные запроса: конкретные id, значения атрибутов, операция каждого ресурса;
+- **дерево операций** — данные запроса: конкретные id, значения атрибутов, операция каждого ресурса (класс
+  объекта);
 - **план** — только форма: какие ресурсы, связи и таблицы участвуют. Значений и id в нём нет, поэтому один план
   годится для любого запроса той же формы;
 - **дерево исполнителей** — план плюс соединение с базой; строится на одно выполнение.
@@ -102,12 +103,21 @@ flowchart LR
 
 ---
 
-## 3. Шаг 1. Парсер: документ → дерево изменений
+## 3. Шаг 1. Парсер: документ → дерево операций
 
 `WriteDocumentParser::update(document, CertificateWithDetailResource::class, id: '1')`.
 
-Документ плоский: все связанные ресурсы лежат в `included`, а в связях — только ссылки. Парсер подставляет ресурсы на
-место ссылок и каждому приписывает операцию. Весь документ проверяется до первого запроса в базу.
+Документ плоский: все связанные ресурсы лежат в `included`, а в связях — только ссылки. Парсер находит для каждой
+ссылки её ресурс и сразу создаёт операцию — объект одного из четырёх классов:
+
+| класс | что значит | данные |
+|---|---|---|
+| `InsertOperation` | вставить новый ресурс | `lid` (или ничего), атрибуты, связи |
+| `UpdateOperation` | изменить существующий | `id`, атрибуты, связи |
+| `KeepOperation` | оставить ребёнка, только проверить | `id` |
+| `DeleteOperation` | удалить | `id` |
+
+Объекты документа и пометка `meta.op` дальше парсера не идут. Весь документ проверяется до первого запроса в базу.
 
 ### 3.1. Корень
 
@@ -131,8 +141,8 @@ flowchart LR
 
 ### 3.3. Обход корня
 
-Корень существует, поэтому его операция — `update`. Проверяется, что ресурс можно изменять (маркер `Updatable`, иначе
-403), затем атрибуты и связи.
+Корень существует, поэтому его операция — `UpdateOperation`. Проверяется, что ресурс можно изменять (маркер
+`Updatable`, иначе 403), затем атрибуты и связи.
 
 **Атрибуты.** Каждый должен быть известен, не быть первичным ключом и не быть только для чтения; `null` допустим только
 у атрибута с `nullable`. `recipient_name: null` проходит (`nullable`), `buyer_email: null` дал бы 400.
@@ -147,26 +157,26 @@ flowchart LR
 | `null` | удалить текущую | |
 
 Ссылка `delivery:lid:del1` найдена в индексе и помечена использованной. Замена удаляет текущую доставку, поэтому
-проверяется `Deletable` у `DeliveryResource`; новый ресурс разбирается рекурсивно с операцией `add` (проверяется
-`Insertable`). Связь получает `patch:replace: true`.
+проверяется `Deletable` у `DeliveryResource`; новый ресурс разбирается рекурсивно в `InsertOperation` (проверяется
+`Insertable`). Связь получает `replace: true`.
 
 **Связь `domains`** — один ко многим, владение. Сначала парсер смотрит, есть ли в списке хоть одна пометка `meta.op`.
-Есть (у домена 2), значит изменение частичное: `patch:replace: false`. Без пометок это была бы полная замена списка.
+Есть (у домена 2), значит изменение частичное: `replace: false`. Без пометок это была бы полная замена списка.
 Затем по элементам:
 
 | элемент | в `included` | операция | проверка возможности |
 |---|---|---|---|
-| `{domain, id 3}` | да, `/included/0` | `update` | `Updatable` |
-| `{domain, id 2, meta.op remove}` | нет | `remove` | `Deletable` |
-| `{domain, lid d1}` | да, `/included/1` | `add` | `Insertable` |
+| `{domain, id 3}` | да, `/included/0` | `UpdateOperation` | `Updatable` |
+| `{domain, id 2, meta.op remove}` | нет | `DeleteOperation` | `Deletable` |
+| `{domain, lid d1}` | да, `/included/1` | `InsertOperation` | `Insertable` |
 
-(Элемент `{id}` без ресурса в `included` и без пометки получил бы операцию `keep`: ничего не менять, только
+(Элемент `{id}` без ресурса в `included` и без пометки получил бы `KeepOperation`: ничего не менять, только
 проверить, что ребёнок принадлежит родителю.)
 
 ### 3.4. Порядок детей
 
-Дети связи сортируются по порядку выполнения: `remove` → `keep`/`update` → `add`. В документе было «3, 2, d1», в
-дереве стало «2, 3, d1». Так значение уникальной колонки, освобождённое удалением, можно занять новым ребёнком в том же
+Дети связи сортируются по порядку выполнения: удаления → оставленные и изменённые → вставки. В документе было
+«3, 2, d1», в дереве стало «2, 3, d1». Так значение уникальной колонки, освобождённое удалением, можно занять новым ребёнком в том же
 запросе.
 
 ### 3.5. Все ресурсы использованы
@@ -174,83 +184,72 @@ flowchart LR
 Каждый ресурс `included` должен быть использован ровно один раз. Неиспользованный — 400. Поэтому результат — дерево:
 у ресурса один родитель, циклов нет.
 
-### 3.6. Результат: дерево изменений
+### 3.6. Результат: дерево операций
 
-Кратко (так его печатает прототип):
+Так его печатает прототип:
 
 ```
-update certificate id 1 {"nominal":"2500.00","buyer_email":"new-buyer@example.com","recipient_name":null}
-    delivery (owned to-one): replace (the current one is deleted first)
-        add delivery lid del1 {"delivery_channel":"SMS","is_sent":false}
-    domains (owned): partial (unlisted are kept)
-        remove domain id 2
-        update domain id 3 {"is_primary":true}
-        add domain lid d1 {"domain_name":"new.green1.net","is_primary":false}
+UpdateOperation CertificateWithDetailResource id:1 {"nominal":"2500.00","buyer_email":"new-buyer@example.com","recipient_name":null}
+    RelationshipOperation delivery, replace: true
+        InsertOperation DeliveryResource lid:del1 {"delivery_channel":"SMS","is_sent":false}
+    RelationshipOperation domains, replace: false
+        DeleteOperation DomainResource id:2
+        UpdateOperation DomainResource id:3 {"is_primary":true}
+        InsertOperation DomainResource lid:d1 {"domain_name":"new.green1.net","is_primary":false}
 ```
 
-Полностью — это вложенный массив. Служебные ключи начинаются с `patch:`:
+Это дерево объектов. Корень в виде кода:
 
-```json
-{
-  "type": "certificate", "id": "1",
-  "attributes": {"nominal": "2500.00", "buyer_email": "new-buyer@example.com", "recipient_name": null},
-  "relationships": {
-    "delivery": {
-      "data": [
-        {"type": "delivery", "lid": "del1",
-         "attributes": {"delivery_channel": "SMS", "is_sent": false}, "relationships": [],
-         "patch:op": "add", "patch:pointer": "/included/2"}
-      ],
-      "patch:replace": true, "patch:to-one": true
-    },
-    "domains": {
-      "data": [
-        {"type": "domain", "id": "2",
-         "patch:op": "remove", "patch:pointer": "/data/relationships/domains/data/1"},
-        {"type": "domain", "id": "3", "attributes": {"is_primary": true}, "relationships": [],
-         "patch:op": "update", "patch:pointer": "/included/0"},
-        {"type": "domain", "lid": "d1",
-         "attributes": {"domain_name": "new.green1.net", "is_primary": false}, "relationships": [],
-         "patch:op": "add", "patch:pointer": "/included/1"}
-      ],
-      "patch:replace": false
-    }
-  },
-  "patch:op": "update", "patch:pointer": "/data"
-}
+```php
+new UpdateOperation(
+    resource: CertificateWithDetailResource::class,
+    identity: new PersistentIdentity(id: 1),
+    attributes: ['nominal' => '2500.00', 'buyer_email' => 'new-buyer@example.com', 'recipient_name' => null],
+    references: [],                      // связи по внешнему ключу: имя → PersistentIdentity | null
+    relationships: [                     // связи по владению: имя → RelationshipOperation
+        'delivery' => new RelationshipOperation(replace: true, children: [/* InsertOperation del1 */]),
+        'domains' => new RelationshipOperation(replace: false, children: [/* Delete 2, Update 3, Insert d1 */]),
+    ],
+)
 ```
 
-| служебный ключ | у кого | значение |
+| что | где лежит | значение |
 |---|---|---|
-| `patch:op` | у ресурса | `add`, `update`, `keep` или `remove` |
-| `patch:pointer` | у ресурса | место в исходном документе — для ошибки 404 при выполнении |
-| `patch:replace` | у связи | `true` — неназванные дети удаляются |
-| `patch:to-one` | у связи | связь один к одному, пришла списком из одного ребёнка или пустым |
+| операция | класс объекта | `InsertOperation`, `UpdateOperation`, `KeepOperation` или `DeleteOperation` |
+| имя ресурса | `identity` | `PersistentIdentity` (`id`) у существующего, `LocalIdentity` (`lid`) или `null` у нового |
+| признак полной замены | `RelationshipOperation::$replace` | `true` — неназванные дети удаляются |
+| дети связи | `RelationshipOperation::$children` | операции в порядке выполнения |
 
-Связь один к одному парсер тоже отдаёт списком. Благодаря этому дальше обе связи обрабатывает один и тот же код.
+Типы не дают собрать невозможное: у изменения, проверки и удаления имя — всегда `id`, у вставки — только `lid`.
+Места в документе (JSON Pointer) в дереве нет: ошибку формы документа парсер отдаёт сам, а ошибка выполнения
+называет ресурс типом и `id`.
+
+Связь один к одному парсер отдаёт тем же списком `children` — из одной операции или пустым. Благодаря этому дальше
+обе связи обрабатывает один и тот же код.
 
 ---
 
-## 4. Шаг 2. Планировщик: дерево изменений → план
+## 4. Шаг 2. Планировщик: дерево операций → план
 
 `PatchPlanner::plan(CertificateWithDetailResource::class, roots: [корень])`.
 
-Планировщик смотрит только на форму дерева изменений: какие связи присутствуют и какие операции встречаются. Значения
+Планировщик смотрит только на форму дерева операций: какие связи присутствуют и какие операции встречаются. Значения
 атрибутов и id он не читает.
 
-**Место** — ресурс вместе со всеми его элементами в одной позиции дерева: корень; все дети связи `delivery`; все дети
+**Место** — ресурс вместе со всеми его операциями в одной позиции дерева: корень; все дети связи `delivery`; все дети
 связи `domains`. Для каждого места строится один узел, как бы много элементов в нём ни было.
 
 ### 4.1. Построение по шагам
 
-**Шаг 1. Место корня.** Элемент один, операция `update`. Создаётся узел-развилка с одной ветвью:
+**Шаг 1. Место корня.** Операция одна, `UpdateOperation`. Создаётся узел-развилка с одной ветвью `update`:
 
 ```
 PatchOperationNode (CertificateWithDetailResource)
     update: UpdateResourceNode
 ```
 
-Ветвей `add` и `remove` нет: таких операций у корня в документе нет.
+Ветвей `add` (для `InsertOperation`) и `remove` (для `DeleteOperation`) нет: таких операций у корня нет. Ветвь
+`update` исполняет и `UpdateOperation`, и `KeepOperation`.
 
 **Шаг 2. Таблицы модели корня.** Ветвь `update` получает дерево таблиц по `model()` ресурса
 (`LeftJoin(certificates, certificate_details, [id, certificate_id])`):
@@ -275,7 +274,7 @@ PatchOperationNode (CertificateWithDetailResource)
 `domains`. `provider` — связь по внешнему ключу: её пишет сама строка сертификата, узла у неё нет. `delivery` в документе
 есть, и для неё планировщик решает два вопроса по очереди.
 
-*Заменяется ли связь целиком?* Да: у `delivery` стоит `patch:replace: true`. Построенное дерево оборачивается в узел
+*Заменяется ли связь целиком?* Да: у `delivery` стоит `replace: true`. Построенное дерево оборачивается в узел
 замены — он удалит текущую доставку:
 
 ```
@@ -293,10 +292,10 @@ PatchJoinNode (delivery, relation: [id, certificate_id])
             input: InsertTableNode (certificate_delivery_meta)
 ```
 
-`child` — место детей связи. Элемент один, операция `add`, поэтому ветвь одна. Узел замены стоит внутри `parent`,
+`child` — место детей связи. Операция одна, `InsertOperation`, поэтому ветвь одна. Узел замены стоит внутри `parent`,
 поэтому удаление выполнится после записи сертификата, но до вставки новой доставки.
 
-**Шаг 4. Связь `domains`.** У неё `patch:replace: false` (в списке есть пометки `meta.op`), поэтому узла замены нет.
+**Шаг 4. Связь `domains`.** У неё `replace: false` (в списке есть пометки `meta.op`), поэтому узла замены нет.
 Дети есть, и узел связи оборачивает уже построенное дерево целиком:
 
 ```
@@ -308,7 +307,7 @@ PatchJoinNode (domains, relation: [id, certificate_id])
         remove: DeleteResourceNode
 ```
 
-В месте `domains` три элемента с тремя разными операциями, поэтому у развилки три ветви. Узел при этом один: будь в
+В месте `domains` три операции трёх разных классов, поэтому у развилки три ветви. Узел при этом один: будь в
 списке сто доменов, план был бы тем же.
 
 **Шаг 5. Корень плана.** Сверху ставится `WriteRootNode`. У вложенного маршрута в нём был бы ещё узел проверки
@@ -316,11 +315,11 @@ PatchJoinNode (domains, relation: [id, certificate_id])
 
 ### 4.2. Как меняется форма дерева
 
-В дереве изменений связи лежат **внутри** ресурса. В плане узел связи стоит **над** ресурсом, а связи одного владельца
+В дереве операций связи лежат **внутри** операции. В плане узел связи стоит **над** ресурсом, а связи одного владельца
 вытянуты в цепочку слева направо («левый глубокий список»):
 
 ```
-дерево изменений (данные)                 план (форма)
+дерево операций (данные)                  план (форма)
 
 certificate                               WriteRootNode
 ├── delivery (замена)                     └── PatchJoinNode domains
@@ -361,8 +360,8 @@ flowchart TD
 
 | остаётся данными | что из этого есть в плане | почему не всё |
 |---|---|---|
-| операция элемента (`patch:op`) | ветви `add` / `update` / `remove` места | один узел места обслуживает все элементы; ветвь выбирается по элементу |
-| признак полной замены (`patch:replace`) | узел `PatchReplaceNode` связи | место одно на всех владельцев: один может заменять связь, другой — менять частично |
+| операция элемента (класс операции) | ветви `add` / `update` / `remove` места | один узел места обслуживает все элементы; ветвь выбирается по элементу |
+| признак полной замены (`RelationshipOperation::$replace`) | узел `PatchReplaceNode` связи | место одно на всех владельцев: один может заменять связь, другой — менять частично |
 | id и значения атрибутов | ничего | план не зависит от значений |
 
 Три формы одной связи в плане:
@@ -384,12 +383,13 @@ flowchart TD
 `PatchWriterBuilder(pdo, lock)->root(plan, data: [корень])`.
 
 Сборщик ничего не решает: каждый узел плана превращается в исполнитель с тем же именем (`…Node` → `…Writer`) и той же
-формой. Добавляется только то, чего в плане нет:
+формой. Исключение одно: над вставкой из `src/` стоит переходник `InsertOperationWriter` (см. таблицу ниже).
+Добавляется только то, чего в плане нет:
 
 | добавляется | куда |
 |---|---|
 | соединение с базой (`PDO`) | исполнителям, которые выполняют SQL |
-| корни дерева изменений | `WriteRootWriter` |
+| корни дерева операций | `WriteRootWriter` |
 | id родителя из вложенного маршрута | `RouteParentWriter` (здесь нет) |
 | флаг `lock` (`FOR KEY SHARE`; в SQLite выключен) | проверкам существования |
 
@@ -398,12 +398,13 @@ flowchart TD
 | `WriteRootNode` | `WriteRootWriter` | запускает дерево для каждого корня |
 | `PatchJoinNode` | `PatchJoinWriter` | владелец, затем его дети с ключом владельца |
 | `PatchReplaceNode` | `PatchReplaceWriter` | владелец, затем `DELETE` его детей, не названных в документе |
-| `PatchOperationNode` | `PatchOperationWriter` | развилка по `patch:op` |
-| `UpdateResourceNode` | `UpdateResourceWriter` | ресурс → строка «колонка → значение» |
+| `PatchOperationNode` | `PatchOperationWriter` | развилка по классу операции |
+| `UpdateResourceNode` | `UpdateResourceWriter` | операция → строка «колонка → значение» |
 | `UpdateTableJoinNode` | `UpdateTableJoinWriter` | главная таблица, затем присоединённая |
 | `UpdateOptionalTableNode` | `UpdateOptionalTableWriter` | изменить, а если строки нет — вставить |
 | `UpdateTableNode` | `UpdateTableWriter` | `UPDATE` или `SELECT` одной таблицы |
-| `InsertResourceNode`, `InsertTableNode` | `InsertResourceWriter`, `InsertTableWriter` (из `src/`) | вставка |
+| `InsertResourceNode` | `InsertOperationWriter` над `InsertResourceWriter` (из `src/`) | переходник: `InsertOperation` → ресурс массивом, который принимает вставка из `src/` |
+| `InsertTableNode` | `InsertTableWriter` (из `src/`) | `INSERT` одной таблицы |
 | `DeleteResourceNode` | `DeleteResourceWriter` | `DELETE` строки главной таблицы |
 
 Дерево исполнителей примера (форма та же, что у плана):
@@ -421,9 +422,9 @@ WriteRootWriter (data: 1)
                                 update: UpdateTableWriter (certificate_details, key: certificate_id)
                                 insert: InsertTableWriter (certificate_details)
             child: PatchOperationWriter (DeliveryResource)
-                add: InsertResourceWriter → InsertTableWriter (certificate_delivery_meta)
+                add: InsertOperationWriter → InsertResourceWriter → InsertTableWriter (certificate_delivery_meta)
         child: PatchOperationWriter (DomainResource)
-            add:    InsertResourceWriter → InsertTableWriter (domains)
+            add:    InsertOperationWriter → InsertResourceWriter → InsertTableWriter (domains)
             update: UpdateResourceWriter → UpdateTableWriter (domains, key: id)
             remove: DeleteResourceWriter (domains)
 ```
@@ -434,13 +435,16 @@ WriteRootWriter (data: 1)
 
 ### 6.1. Правило движения
 
-У каждого исполнителя один метод:
+У каждого исполнителя уровня ресурсов один метод (контракт `OperationPushExecutor`):
 
 ```php
-push(array $resource, array $link = []): array   // возвращает ключи
+push(WriteOperation $operation, array $link = []): array   // возвращает ключи
 ```
 
-- **вниз** идут ресурс из дерева изменений и `$link` — колонки связи от родителя (`[certificate_id => 1]`);
+Исполнители уровня таблиц (`…Table…Writer`) принимают уже строку «колонка → значение» (контракт `TableWriter` из
+`src/`).
+
+- **вниз** идут операция из дерева операций и `$link` — колонки связи от родителя (`[certificate_id => 1]`);
 - **вверх** возвращаются ключи записанной строки (`[id => 1, …]`);
 - пустые ключи значат «строки нет». На уровне развилки это превращается в 404.
 
@@ -463,31 +467,31 @@ sequenceDiagram
     JD->>JV: push(сертификат)
     JV->>RV: push(сертификат)
     RV->>OC: push(сертификат)
-    Note over OC: patch:op = update
+    Note over OC: UpdateOperation
     OC->>DB: UPDATE certificates
     DB-->>OC: id 1
     OC->>DB: UPDATE certificate_details
     DB-->>OC: certificate_id 1
     OC-->>RV: ключи сертификата, id = 1
 
-    Note over RV: delivery, patch:replace = true
+    Note over RV: delivery, replace = true
     RV->>DB: DELETE certificate_delivery_meta, certificate_id = 1
     RV-->>JV: ключи сертификата
     JV->>OV: push(del1, link certificate_id = 1)
-    Note over OV: patch:op = add
+    Note over OV: InsertOperation
     OV->>DB: INSERT certificate_delivery_meta
     DB-->>OV: 1
     JV-->>JD: ключи сертификата
 
     Note over JD: domains, узла замены в плане нет
     JD->>OD: push(домен 2, link certificate_id = 1)
-    Note over OD: patch:op = remove
+    Note over OD: DeleteOperation
     OD->>DB: DELETE domains, id = 2 и certificate_id = 1
     JD->>OD: push(домен 3, link certificate_id = 1)
-    Note over OD: patch:op = update
+    Note over OD: UpdateOperation
     OD->>DB: UPDATE domains, id = 3 и certificate_id = 1
     JD->>OD: push(d1, link certificate_id = 1)
-    Note over OD: patch:op = add
+    Note over OD: InsertOperation
     OD->>DB: INSERT domains
     DB-->>OD: 53
     JD-->>R: ключи сертификата
@@ -498,11 +502,11 @@ sequenceDiagram
 Вызов спускается по цепочке `parent` до самого низа, и запись начинается оттуда.
 
 **1. Сертификат: спуск до развилки.** `WriteRootWriter` → `PatchJoinWriter(domains)` → `PatchJoinWriter(delivery)` →
-`PatchReplaceWriter(delivery)` → `PatchOperationWriter(certificate)`. Узлы связи и замены сначала передают ресурс вниз,
-ничего не делая. Развилка видит `patch:op: update` и отдаёт ресурс ветви `update`.
+`PatchReplaceWriter(delivery)` → `PatchOperationWriter(certificate)`. Узлы связи и замены сначала передают операцию
+вниз, ничего не делая. Развилка видит `UpdateOperation` и отдаёт её ветви `update`.
 
-**2. Ресурс → строка.** `UpdateResourceWriter` превращает ресурс в строку «колонка модели → значение» и добавляет в
-`$link` первичный ключ:
+**2. Операция → строка.** `UpdateResourceWriter` превращает операцию в строку «колонка модели → значение» и добавляет
+в `$link` первичный ключ (`identity->id`):
 
 ```
 строка: {nominal: "2500.00", buyer_email: "new-buyer@example.com", recipient_name: null}
@@ -542,7 +546,7 @@ returning certificate_id
 ```
 
 **5. Связь `delivery`.** Ключи вернулись в `PatchReplaceWriter(delivery)`. Он берёт из них ключ владельца (`id = 1`,
-колонка `relation[0]`). У связи `patch:replace: true`, поэтому удаляются дети, которых нет в списке. В списке только
+колонка `relation[0]`). У связи `replace: true`, поэтому удаляются дети, которых нет в списке. В списке только
 новый ребёнок без id, значит удаляются все:
 
 ```sql
@@ -551,7 +555,7 @@ delete from certificate_delivery_meta where certificate_id = :parent_key
 ```
 
 Узел замены возвращает ключи сертификата без изменений в `PatchJoinWriter(delivery)`. Тот отправляет ребёнка в
-`child` с `link = {certificate_id: 1}` (колонка `relation[1]`). Развилка видит `add`:
+`child` с `link = {certificate_id: 1}` (колонка `relation[1]`). Развилка видит `InsertOperation`:
 
 ```sql
 insert into certificate_delivery_meta (delivery_channel, is_sent, certificate_id)
@@ -565,17 +569,17 @@ values (:delivery_channel, :is_sent, :certificate_id) returning certificate_id
 Дети идут в `child` по порядку, который задал парсер, каждый с `link = {certificate_id: 1}`:
 
 ```sql
--- домен 2, patch:op = remove
+-- домен 2, DeleteOperation
 delete from domains where id = :key_id and certificate_id = :link_certificate_id returning id
 -- {"key_id":2,"link_certificate_id":1} → [{"id":2}]
 
--- домен 3, patch:op = update
+-- домен 3, UpdateOperation
 update domains set is_primary = :is_primary
 where id = :key and certificate_id = :link_certificate_id and (is_primary is distinct from :is_primary)
 returning id
 -- {"is_primary":true,"key":3,"link_certificate_id":1} → [{"id":3}]
 
--- d1, patch:op = add
+-- d1, InsertOperation
 insert into domains (domain_name, is_primary, certificate_id)
 values (:domain_name, :is_primary, :certificate_id) returning id
 -- {"domain_name":"new.green1.net","is_primary":false,"certificate_id":1} → 53
@@ -611,20 +615,20 @@ values (:domain_name, :is_primary, :certificate_id) returning id
 ```
 
 ```
-domains (owned): replace (unlisted leave the relationship)
-    keep domain id 1
-    keep domain id 3
+RelationshipOperation domains, replace: true
+    KeepOperation DomainResource id:1
+    KeepOperation DomainResource id:3
 ```
 
 ```sql
 delete from domains where certificate_id = :parent_key and id not in (:listed_0, :listed_1)
 -- {"parent_key":1,"listed_0":1,"listed_1":3} → 1 rows            (удалён домен 2)
-select id from domains where id = :key and certificate_id = :link_certificate_id      -- keep 1: только проверка
-select id from domains where id = :key and certificate_id = :link_certificate_id      -- keep 3: только проверка
+select id from domains where id = :key and certificate_id = :link_certificate_id      -- KeepOperation 1: только проверка
+select id from domains where id = :key and certificate_id = :link_certificate_id      -- KeepOperation 3: только проверка
 ```
 
 План отличается в двух местах. Под узлом связи `domains` появляется `PatchReplaceNode (domains)` — он и выполняет
-первый запрос. У места `domains` остаётся одна ветвь `update` (её же выполняет `keep`). Парсер заранее требует
+первый запрос. У места `domains` остаётся одна ветвь `update` (она исполняет `KeepOperation`). Парсер заранее требует
 `Deletable` у `DomainResource`, даже если удалять в итоге нечего.
 
 ### 7.2. Значения не изменились
@@ -672,12 +676,13 @@ delete from domains where id = :key_id and certificate_id = :link_certificate_id
 -- {"key_id":4,"link_certificate_id":1} → []
 ```
 
-Ключи пустые, развилка отвечает ошибкой с указателем из `patch:pointer`:
+Ключи пустые, развилка отвечает ошибкой. Указателя на место в документе у операции нет, поэтому ресурс назван типом
+и `id` в `meta`:
 
 ```json
 {"errors": [{"status": "404",
-             "source": {"pointer": "/data/relationships/domains/data/0"},
-             "detail": "domain 4 not found under {\"certificate_id\":1}"}]}
+             "detail": "domain 4 not found under {\"certificate_id\":1}",
+             "meta": {"type": "domain", "id": "4"}}]}
 ```
 
 К этому моменту сертификат уже изменён двумя запросами. Откатить их должна транзакция вызывающего.
@@ -700,6 +705,9 @@ delete from domains where id = :key_id and certificate_id = :link_certificate_id
 | выполнение | 404 | ресурса нет; ребёнок принадлежит другому родителю |
 | выполнение | 500 | ошибка базы как есть: несуществующая цель внешнего ключа, нарушение `NOT NULL` или уникальности |
 
+Ошибки разбора указывают место в документе (`source.pointer`). Ошибка 404 называет ресурс в `meta` (`{type, id}`);
+у родителя из вложенного маршрута нет ни того, ни другого — его нет в документе.
+
 ---
 
 ## 9. Карта классов
@@ -709,14 +717,18 @@ delete from domains where id = :key_id and certificate_id = :link_certificate_id
 | стадия | класс | роль |
 |---|---|---|
 | разбор | `WriteDocumentParser` | `update()` (PATCH), а также `insert()` (POST) и `delete()` (DELETE) с общим ядром |
-| план | `PatchPlanner` | дерево изменений → узлы плана; `tables()` — дерево таблиц по `model()` |
+| дерево операций | `WriteOperation`: `InsertOperation`, `UpdateOperation`, `KeepOperation`, `DeleteOperation` | операция над одним ресурсом; вид операции — класс |
+| дерево операций | `RelationshipOperation` | связь по владению: признак замены и операции над детьми |
+| дерево операций | `ResourceIdentity`: `PersistentIdentity`, `LocalIdentity` | имя ресурса: `id` или `lid` |
+| план | `PatchPlanner` | дерево операций → узлы плана; `tables()` — дерево таблиц по `model()` |
 | план | `WriteRootNode`, `PatchJoinNode`, `PatchReplaceNode`, `PatchOperationNode` | корень, связь, полная замена связи, развилка по операции |
 | план | `UpdateResourceNode`, `UpdateTableJoinNode`, `UpdateOptionalTableNode`, `UpdateTableNode` | изменение ресурса и его таблиц |
 | план | `DeleteResourceNode`, `RouteParentNode` | удаление; родитель вложенного маршрута |
 | сборка | `PatchWriterBuilder` | план → исполнители |
 | выполнение | одноимённые `…Writer` | см. таблицу в разделе 5 |
+| выполнение | `OperationPushExecutor`, `InsertOperationWriter` | контракт исполнителей уровня ресурсов и переходник к вставке из `src/`, помечены `@temporary` |
 | общее | `Tables`, `WriteDocumentException` | помощник и ошибка прототипа, помечены `@temporary` |
 
-Вставка (`add`) переиспользует `src/`: `InsertPlanner::tables()`, `WriterBuilder`, `InsertResourceWriter`,
-`InsertTableWriter`. POST и DELETE идут по тому же конвейеру: POST — корень с операцией `add`, DELETE — корень с
-операцией `remove`.
+Вставка переиспользует `src/`: `InsertPlanner::tables()`, `WriterBuilder`, `InsertResourceWriter`,
+`InsertTableWriter`. POST и DELETE идут по тому же конвейеру: POST — корни `InsertOperation`, DELETE — корень
+`DeleteOperation`.

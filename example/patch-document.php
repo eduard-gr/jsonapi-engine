@@ -7,10 +7,16 @@
  * `src/` не меняется; из `src/` взяты `InsertPlanner::tables()` + `WriterBuilder` (вставка новых детей),
  * `InsertTableWriter` (вставка отсутствующей необязательной части модели) и контракты `PushExecutor`, `TableWriter`.
  *
- * Конвейер, как у SELECT и вставки: документ → `WriteDocumentParser` → дерево изменений → `PatchPlanner` → план
+ * Конвейер, как у SELECT и вставки: документ → `WriteDocumentParser` → дерево операций → `PatchPlanner` → план
  * (неизменяемые узлы `…Node`) → `PatchWriterBuilder` → дерево исполнителей (`…Writer`) → `push()`.
  *
- *     php example/patch-document.php            # документ → дерево изменений → план → дерево исполнителей → ключи;
+ * Дерево операций — типизированный результат разбора (`WriteOperation`): `InsertOperation`, `UpdateOperation`,
+ * `KeepOperation`, `DeleteOperation`, связи по владению — `RelationshipOperation`; ресурс назван `PersistentIdentity`
+ * (`id`) или `LocalIdentity` (`lid`). Объекты документа и пометка `meta.op` дальше разбора не идут. Исполнители
+ * уровня ресурсов принимают операцию (`OperationPushExecutor`); вставке из `src/`, которая принимает массив, её
+ * передаёт переходник `InsertOperationWriter`.
+ *
+ *     php example/patch-document.php            # документ → дерево операций → план → дерево исполнителей → ключи;
  *                                               # состояние до и после; SQL каждого запроса — в stderr
  *     php example/patch-document.php 2>sql.log  # SQL отдельно
  *
@@ -69,7 +75,7 @@
  * Правило области запроса: создаются только корень и его потомки по владению; связи по внешнему ключу — только на
  * существующие ресурсы (`{type, id}`). Каждый ресурс `included` используется ровно
  * один раз. Весь документ проверяется до первого запроса (`WriteDocumentParser`), ошибки — WriteDocumentException с JSON
- * Pointer.
+ * Pointer. Ошибка выполнения (404) называет ресурс типом и `id` в `meta` ошибки: указателя у операций нет.
  *
  * Порядок выполнения: родитель, затем связи (связи одного родителя — левый глубокий список в порядке объявления,
  * `PatchPlanner`), в связи по владению — удаление неназванных (полная замена), `remove`, `keep`/`update`, `add`:
@@ -149,9 +155,10 @@ require __DIR__ . '/../vendor/autoload.php';
 require __DIR__ . '/db/connection.php';
 
 /**
- * Ошибка документа POST/PATCH для ответа: статус, JSON Pointer, описание. 400/403/409 — при разборе, до первого
- * запроса; 404 — при выполнении (ребёнка или цели нет, ребёнок принадлежит другому родителю, нет родителя из
- * маршрута — без указателя: его нет в документе).
+ * Ошибка записи для ответа: статус, описание и место ошибки. 400/403/409 — при разборе, до первого запроса: место —
+ * JSON Pointer (`source.pointer`), разбор его знает. 404 — при выполнении (ребёнка или цели нет, ребёнок принадлежит
+ * другому родителю): место — ресурс, названный типом и `id` в `meta` ошибки; у операций указателя нет. Родителя из
+ * маршрута нет в документе — у его 404 нет ни указателя, ни `meta`.
  *
  * @temporary Только для прототипа. В `src/` ошибки разойдутся по исключениям слоёв: 400 разбора —
  *            `Parser\InvalidDocumentException` (у него нет статуса, только 400), 404 — `ResourceNotFoundException`;
@@ -160,16 +167,20 @@ require __DIR__ . '/db/connection.php';
  */
 final class WriteDocumentException extends RuntimeException
 {
+    /**
+     * @param array<string, string>|null $meta ресурс ошибки выполнения: `{type, id}`
+     */
     public function __construct(
         public readonly string $status,
         public readonly ?string $pointer,
         string $detail,
+        public readonly ?array $meta = null,
     ) {
         parent::__construct($detail);
     }
 
     /**
-     * @return array{errors: list<array{status: string, source: array{pointer: string}, detail: string}>}
+     * @return array{errors: list<array<string, mixed>>}
      */
     public function toDocument(): array
     {
@@ -177,48 +188,290 @@ final class WriteDocumentException extends RuntimeException
             'status' => $this->status,
             ...($this->pointer === null ? [] : ['source' => ['pointer' => $this->pointer]]),
             'detail' => $this->getMessage(),
+            ...($this->meta === null ? [] : ['meta' => $this->meta]),
         ]]];
     }
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Дерево операций: результат разбора документа, вход планировщика и исполнителей
+
 /**
- * Один парсер для POST и PATCH: документ → дерево изменений. Заменяет оба: `Parser\Insert\DocumentParser` (POST) и
- * прежний парсер PATCH этого файла; POST — частный случай: корень новый, у его потомков только `lid` (существующих
- * детей у нового ресурса нет), пометок `meta.op` нет, полной замены нет.
+ * Чем ресурс назван в документе: `id` (`PersistentIdentity`) или `lid` (`LocalIdentity`). Один тип вместо двух
+ * свойств, допускающих null: «ровно одно из двух» нельзя нарушить, а вид имени — главное, по чему разбор выбирает
+ * операцию (`lid` — ресурс новый, `id` — существующий).
  *
- * Поток: документ + класс ресурса точки входа (+ id из маршрута у PATCH) → корни дерева изменений. Узел —
- * ресурс (`type`, `id` и/или `lid`, `attributes`, связи по внешнему ключу `{data: {type, id} | null}`) со служебными
- * `patch:op` (`add` | `update` | `keep` | `remove`) и `patch:pointer` (куда указывать ошибку); связь по владению —
- * `{data: list<узел>, patch:replace: bool}` (to-one — тот же список из одного или пустой, плюс `patch:to-one: true`),
- * дети уже в порядке выполнения (remove, keep/update, add). `InsertResourceWriter` служебные ключи и эти связи не
- * читает.
+ * Слово «идентификатор» оставлено за объектом `{type, id}` из связи (resource identifier object в JSON:API); это —
+ * его значение.
+ */
+interface ResourceIdentity
+{
+    /**
+     * Имя текстом: `id:3` или `lid:d1`.
+     */
+    public function key(): string;
+
+    /**
+     * Как ресурс называется в `meta` ошибки: `{id: "3"}` или `{lid: "d1"}`.
+     *
+     * @return array{id: string}|array{lid: string}
+     */
+    public function toMeta(): array;
+}
+
+/**
+ * `id`: ресурс существует в базе. Значение — целое, проверенное при чтении документа (в документе это строка цифр).
+ */
+final readonly class PersistentIdentity implements ResourceIdentity
+{
+    public function __construct(
+        public int $id,
+    ) {}
+
+    #[\Override]
+    public function key(): string
+    {
+        return "id:{$this->id}";
+    }
+
+    #[\Override]
+    public function toMeta(): array
+    {
+        return ['id' => (string) $this->id];
+    }
+}
+
+/**
+ * `lid`: новый ресурс. Имя действует только внутри документа — по нему разбор находит ресурс `included` для
+ * идентификатора из связи; в базу оно не попадает. В дереве операций остаётся только для ошибок.
+ */
+final readonly class LocalIdentity implements ResourceIdentity
+{
+    public function __construct(
+        public string $lid,
+    ) {}
+
+    #[\Override]
+    public function key(): string
+    {
+        return "lid:{$this->lid}";
+    }
+
+    #[\Override]
+    public function toMeta(): array
+    {
+        return ['lid' => $this->lid];
+    }
+}
+
+/**
+ * Операция над одним ресурсом: узел дерева, которое выдаёт разбор (`WriteDocumentParser`). Вид операции — класс:
+ * `InsertOperation`, `UpdateOperation`, `KeepOperation`, `DeleteOperation`; у каждого только те свойства, которые у
+ * операции бывают.
+ *
+ * Общее у всех — описание ресурса: по нему строится место плана. Указателя на место в документе у операций нет:
+ * ошибка выполнения называет ресурс типом и `id` (в `meta` ошибки), а они у операции есть.
+ */
+abstract readonly class WriteOperation
+{
+    /**
+     * @param class-string<Resource> $resource
+     */
+    public function __construct(
+        public string $resource,
+    ) {}
+
+    /**
+     * Связь по владению `name` этой операции; null — связи нет в документе (детей не трогают) или у операции связей
+     * не бывает (`KeepOperation`, `DeleteOperation`). Узлы связей плана проходят все операции места, поэтому
+     * спрашивают так, а не по классу операции.
+     */
+    public function relationship(string $name): ?RelationshipOperation
+    {
+        return null;
+    }
+}
+
+/**
+ * Вставить ресурс: корень POST или идентификатор `{type, lid}` с ресурсом в `included`.
+ *
+ * Своего id нет: его даст база. Имя — только `lid` (у корня POST его может не быть): вставить ресурс с `id` нельзя
+ * по построению. Атрибуты — только присланные: остальным колонкам значение даёт `DEFAULT` базы. У нового ресурса
+ * все дети тоже новые, а полной замены в связях не бывает: удалять нечего.
+ */
+final readonly class InsertOperation extends WriteOperation
+{
+    /**
+     * @param class-string<Resource>                 $resource      описание ресурса (по `type` документа)
+     * @param LocalIdentity|null                     $identity      `lid`; null — корень POST без `lid`
+     * @param array<string, mixed>                   $attributes    присланные атрибуты: имя → значение
+     * @param array<string, PersistentIdentity|null> $references    связи по внешнему ключу: имя → цель (только
+     *                                                              существующий ресурс), null — без связи
+     * @param array<string, RelationshipOperation>   $relationships связи по владению: имя → операции над детьми
+     */
+    public function __construct(
+        string $resource,
+        public ?LocalIdentity $identity,
+        public array $attributes,
+        public array $references,
+        public array $relationships,
+    ) {
+        parent::__construct(
+            resource: $resource,
+        );
+    }
+
+    #[\Override]
+    public function relationship(string $name): ?RelationshipOperation
+    {
+        return $this->relationships[$name] ?? null;
+    }
+}
+
+/**
+ * Изменить ресурс: корень PATCH или идентификатор `{type, id}` с ресурсом в `included`. id — `identity->id`: имя
+ * всегда `id`, изменить ресурс с `lid` нельзя по построению.
+ *
+ * Атрибуты — только присланные: присутствие ключа, а не значение, решает, что колонку трогать (`null` — это NULL в
+ * колонку). Их может не быть вовсе (изменяются только связи) — тогда строка ресурса только ищется.
+ */
+final readonly class UpdateOperation extends WriteOperation
+{
+    /**
+     * @param class-string<Resource>                 $resource      описание ресурса (по `type` документа)
+     * @param array<string, mixed>                   $attributes    присланные атрибуты: имя → значение
+     * @param array<string, PersistentIdentity|null> $references    связи по внешнему ключу: имя → цель (только
+     *                                                              существующий ресурс), null — снять связь
+     * @param array<string, RelationshipOperation>   $relationships связи по владению: имя → операции над детьми
+     */
+    public function __construct(
+        string $resource,
+        public PersistentIdentity $identity,
+        public array $attributes,
+        public array $references,
+        public array $relationships,
+    ) {
+        parent::__construct(
+            resource: $resource,
+        );
+    }
+
+    #[\Override]
+    public function relationship(string $name): ?RelationshipOperation
+    {
+        return $this->relationships[$name] ?? null;
+    }
+}
+
+/**
+ * Оставить ребёнка как есть: идентификатор `{type, id}` без ресурса в `included`. Данных нет — только проверка, что
+ * ребёнок существует и принадлежит этому родителю. Своего узла плана нет: исполняет ветвь изменения.
+ */
+final readonly class KeepOperation extends WriteOperation
+{
+    /**
+     * @param class-string<Resource> $resource
+     */
+    public function __construct(
+        string $resource,
+        public PersistentIdentity $identity,
+    ) {
+        parent::__construct(
+            resource: $resource,
+        );
+    }
+}
+
+/**
+ * Удалить ресурс: корень DELETE или идентификатор `{type, id}` с пометкой `remove`. Данных нет. Имя — только `id`:
+ * удалить ресурс с `lid` нельзя по построению (как и оставить — `KeepOperation`).
+ */
+final readonly class DeleteOperation extends WriteOperation
+{
+    /**
+     * @param class-string<Resource> $resource
+     */
+    public function __construct(
+        string $resource,
+        public PersistentIdentity $identity,
+    ) {
+        parent::__construct(
+            resource: $resource,
+        );
+    }
+}
+
+/**
+ * Связь по владению: что сделать с детьми одного владельца. Связи нет в документе — нет и ключа в `relationships`
+ * владельца, детей не трогают; связь прислана пустой — ключ есть, `children` пуст, это не одно и то же.
+ *
+ * `replace` — полная замена: дети владельца, которых нет среди `children`, удаляются до остальных операций
+ * (`PatchReplaceNode` плана). `children` — уже в порядке выполнения: удаления, затем оставленные и изменённые, затем
+ * вставки — освобождённое значение уникальной колонки может занять новый ребёнок. To-one (`delivery`) — тот же
+ * список: одна операция или пусто.
+ *
+ * Как разбор получает операцию из идентификатора связи to-many (правила PATCH):
+ *
+ *     пометка   идентификатор   ресурс в included   операция
+ *     нет       {lid}           есть                InsertOperation
+ *     нет       {id}            есть                UpdateOperation
+ *     нет       {id}            нет                 KeepOperation
+ *     add       {lid}           есть                InsertOperation
+ *     update    {id}            есть                UpdateOperation
+ *     remove    {id}            нет                 DeleteOperation
+ *
+ * Остальные сочетания — ошибка документа. Пометка `meta.op` в дерево не попадает: она нужна только для этого выбора
+ * и для `replace`. `replace` у to-many — в списке нет ни одной пометки; у to-one (пометок у него нет) — прислан
+ * `{lid}` или `null`. У нового владельца (POST, вставленный ребёнок) замены не бывает: удалять нечего.
+ */
+final readonly class RelationshipOperation
+{
+    /**
+     * @param list<WriteOperation> $children
+     */
+    public function __construct(
+        public bool $replace,
+        public array $children,
+    ) {}
+}
+
+/**
+ * Один парсер для POST, PATCH и DELETE: документ → дерево операций (`WriteOperation`). Заменяет оба:
+ * `Parser\Insert\DocumentParser` (POST) и прежний парсер PATCH этого файла; POST — частный случай: корень новый, у
+ * его потомков только `lid` (существующих детей у нового ресурса нет), пометок `meta.op` нет, полной замены нет.
+ *
+ * Поток: документ + класс ресурса точки входа (+ id из маршрута у PATCH) → корни дерева операций. Ресурс с данными —
+ * `InsertOperation` или `UpdateOperation` (атрибуты, связи по внешнему ключу `references`, связи по владению
+ * `relationships`); идентификатор без ресурса — `KeepOperation` или `DeleteOperation`; связь по владению —
+ * `RelationshipOperation` (to-one — тот же список из одной операции или пустой), дети уже в порядке выполнения
+ * (удаления, оставленные и изменённые, вставки). Объекты документа, `included`, `lid` как ключ поиска и пометка
+ * `meta.op` дальше разбора не идут; место в документе (JSON Pointer) разбор знает сам и в дерево не кладёт.
  *
  * Три входа, общее ядро (`included`, `lid`, атрибуты, связи):
- *  - `insert()` — POST: `data` — ресурс или список ресурсов, каждый — новый корень (`add`, `Insertable`, иначе 403):
- *    `type` — ресурс точки входа (иначе 409), `id` нет (клиентский id не поддерживается — 403), `lid` не обязателен;
- *    возвращает список корней. Ответ: один ресурс — `201` + `Location` + `{data: {type, id}}`; список — `201` без
- *    `Location`, `data` — идентификаторы в порядке запроса. Вложенный маршрут (`POST /certificates/1/domains`) — не
- *    дело парсера: родитель — `RouteParentNode` плана, id — у исполнителя (`RouteParentWriter`);
- *  - `update()` — PATCH: `data` — один ресурс, `type` и `id` совпадают с маршрутом (иначе 409); операция `update`;
- *  - `delete()` — DELETE: документа нет, корень с операцией `remove`, ресурс `Deletable` (иначе 403); ответ `204`,
+ *  - `insert()` — POST: `data` — ресурс или список ресурсов, каждый — новый корень (`InsertOperation`, `Insertable`,
+ *    иначе 403): `type` — ресурс точки входа (иначе 409), `id` нет (клиентский id не поддерживается — 403), `lid` не
+ *    обязателен; возвращает список корней. Ответ: один ресурс — `201` + `Location` + `{data: {type, id}}`; список —
+ *    `201` без `Location`, `data` — идентификаторы в порядке запроса. Вложенный маршрут
+ *    (`POST /certificates/1/domains`) — не дело парсера: родитель — `RouteParentNode` плана, id — у исполнителя
+ *    (`RouteParentWriter`);
+ *  - `update()` — PATCH: `data` — один ресурс, `type` и `id` совпадают с маршрутом (иначе 409); `UpdateOperation`;
+ *  - `delete()` — DELETE: документа нет, корень — `DeleteOperation`, ресурс `Deletable` (иначе 403); ответ `204`,
  *    ресурса нет — 404 при выполнении.
  *
  * Проверяет весь документ до первого запроса: форма `attributes`/`relationships` (объекты), атрибут известен,
  * не первичный ключ, не `mode` READ, `null` только у `nullable`; связь известна и у неё есть `data`; по внешнему
  * ключу — `{type, id}` нужного типа или null; по владению — to-many (список) и to-one (ресурс или null); тип и
- * `meta.op` элементов; возможности ресурсов (403): `add` — `Insertable`, `update` (корень PATCH, ребёнок `{id}` +
- * included; изменение связи по внешнему ключу — изменение владельца) — `Updatable`, `remove`, полная замена to-many и
- * замена to-one (`lid`, `null`) — `Deletable` цели (по форме документа); у нового ресурса — только новые дети; повторы;
- * каждый ресурс `included` использован ровно один раз (дерево, циклов нет). Ошибки — WriteDocumentException
- * 400/403/409 с JSON Pointer.
+ * `meta.op` элементов; возможности ресурсов (403): вставка — `Insertable`, изменение (корень PATCH, ребёнок `{id}` +
+ * included; изменение связи по внешнему ключу — изменение владельца) — `Updatable`, удаление, полная замена to-many
+ * и замена to-one (`lid`, `null`) — `Deletable` цели (по форме документа); у нового ресурса — только новые дети;
+ * повторы; каждый ресурс `included` использован ровно один раз (дерево, циклов нет). Ошибки —
+ * WriteDocumentException 400/403/409 с JSON Pointer.
  *
  * Не проверяет (как `DocumentParser`): типы значений атрибутов и обязательные атрибуты при вставке (NOT NULL без
  * значения по умолчанию — ошибка базы), существование цели связи по внешнему ключу (ошибка внешнего ключа базы).
  */
 final class WriteDocumentParser
 {
-    private const array ORDER = ['remove' => 0, 'keep' => 1, 'update' => 1, 'add' => 2];
-
     /** @var array<string, array{resource: array, pointer: string}> "type:id" или "type:lid" → ресурс из included */
     private array $included = [];
 
@@ -231,7 +484,7 @@ final class WriteDocumentParser
      * (`POST /certificates/1/domains`) парсер не знает: это `RouteParentNode` плана и id из маршрута у исполнителя.
      *
      * @param class-string<Resource> $resource ресурс точки входа (`POST /certificates` → CertificateResource)
-     * @return list<array> корни дерева изменений в порядке `data`
+     * @return list<InsertOperation> корни дерева операций в порядке `data`
      * @throws WriteDocumentException
      */
     public function insert(array $document, string $resource): array
@@ -245,7 +498,10 @@ final class WriteDocumentParser
             );
         }
         $items = array_is_list($data) ? $data : [$data];
-        $pointers = array_is_list($data) ? array_map(static fn(int $index): string => "/data/{$index}", array_keys($data)) : ['/data'];
+        $pointers = ['/data'];
+        if (array_is_list($data)) {
+            $pointers = array_map(static fn(int $index): string => "/data/{$index}", array_keys($data));
+        }
 
         $root_keys = [];
         foreach ($items as $index => $item) {
@@ -281,7 +537,11 @@ final class WriteDocumentParser
         $this->index(document: $document, root_keys: $root_keys);
 
         $roots = array_map(
-            fn(int $index): array => $this->resource(item: $items[$index], class: $resource, pointer: $pointers[$index], operation: 'add'),
+            fn(int $index): InsertOperation => $this->insertOperation(
+                item: $items[$index],
+                class: $resource,
+                pointer: $pointers[$index],
+            ),
             array_keys($items),
         );
         $this->checkUsed();
@@ -291,16 +551,15 @@ final class WriteDocumentParser
 
     /**
      * DELETE `/certificates/{id}`: тела нет (документ JSON:API у DELETE не передаётся) — только проверка возможности и
-     * корень с операцией `remove`. Ресурс не `Deletable` — 403; id не из цифр — 404 (такого ресурса быть не может).
+     * корень `DeleteOperation`. Ресурс не `Deletable` — 403; id не из цифр — 404 (такого ресурса быть не может).
      * Указателя у этих ошибок нет: документа нет. Что удаляется вместе с ресурсом, решает база (каскад, см.
      * `DeleteResourceWriter`); `Deletable` потомков не проверяется.
      *
      * @param class-string<Resource> $resource ресурс точки входа
      * @param string                 $id       id из маршрута
-     * @return array корень дерева изменений
      * @throws WriteDocumentException
      */
-    public function delete(string $resource, string $id): array
+    public function delete(string $resource, string $id): DeleteOperation
     {
         if (!ctype_digit($id)) {
             throw new WriteDocumentException(
@@ -317,14 +576,12 @@ final class WriteDocumentParser
             );
         }
 
-        return [
-            'type' => $resource::type(),
-            'id' => $id,
-            'attributes' => [],
-            'relationships' => [],
-            'patch:op' => 'remove',
-            'patch:pointer' => null,
-        ];
+        return new DeleteOperation(
+            resource: $resource,
+            identity: new PersistentIdentity(
+                id: (int) $id,
+            ),
+        );
     }
 
     /**
@@ -332,10 +589,9 @@ final class WriteDocumentParser
      *
      * @param class-string<Resource> $resource ресурс точки входа (`PATCH /certificates/{id}` → CertificateResource)
      * @param string                 $id       id из маршрута
-     * @return array корень дерева изменений
      * @throws WriteDocumentException
      */
-    public function update(array $document, string $resource, string $id): array
+    public function update(array $document, string $resource, string $id): UpdateOperation
     {
         $data = $document['data'] ?? null;
         if (!is_array($data) || $data === [] || array_is_list($data)) {
@@ -355,7 +611,7 @@ final class WriteDocumentParser
         }
         $this->index(document: $document, root_keys: ["{$resource::type()}:id:{$id}" => true]);
 
-        $root = $this->resource(item: $data, class: $resource, pointer: '/data', operation: 'update');
+        $root = $this->updateOperation(item: $data, class: $resource, pointer: '/data');
         $this->checkUsed();
 
         return $root;
@@ -423,11 +679,69 @@ final class WriteDocumentParser
     }
 
     /**
-     * Ресурс места `$class` → узел дерева с разобранными связями.
+     * Новый ресурс места `$class` (корень POST или ресурс `included` с `lid`) → `InsertOperation`. Ресурс не
+     * `Insertable` — 403.
      *
      * @param class-string<Resource> $class
      */
-    private function resource(array $item, string $class, string $pointer, string $operation): array
+    private function insertOperation(array $item, string $class, string $pointer): InsertOperation
+    {
+        self::type(item: $item, class: $class, pointer: $pointer);
+        if (!is_a($class, Insertable::class, true)) {
+            throw new WriteDocumentException(
+                status: '403',
+                pointer: $pointer,
+                detail: "resource {$class::type()} can not be created",
+            );
+        }
+        $content = $this->content(item: $item, class: $class, pointer: $pointer, owner_is_new: true);
+
+        return new InsertOperation(
+            resource: $class,
+            identity: isset($item['lid'])
+                ? new LocalIdentity(
+                    lid: (string) $item['lid'],
+                )
+                : null,
+            attributes: $content['attributes'],
+            references: $content['references'],
+            relationships: $content['relationships'],
+        );
+    }
+
+    /**
+     * Существующий ресурс места `$class` (корень PATCH или ресурс `included` с `id`) → `UpdateOperation`. Ресурс не
+     * `Updatable` — 403, даже если меняются только связи.
+     *
+     * @param class-string<Resource> $class
+     */
+    private function updateOperation(array $item, string $class, string $pointer): UpdateOperation
+    {
+        self::type(item: $item, class: $class, pointer: $pointer);
+        if (!is_a($class, Updatable::class, true)) {
+            throw new WriteDocumentException(
+                status: '403',
+                pointer: $pointer,
+                detail: "resource {$class::type()} can not be changed",
+            );
+        }
+        $content = $this->content(item: $item, class: $class, pointer: $pointer, owner_is_new: false);
+
+        return new UpdateOperation(
+            resource: $class,
+            identity: new PersistentIdentity(
+                id: (int) $item['id'],
+            ),
+            attributes: $content['attributes'],
+            references: $content['references'],
+            relationships: $content['relationships'],
+        );
+    }
+
+    /**
+     * @param class-string<Resource> $class
+     */
+    private static function type(array $item, string $class, string $pointer): void
     {
         if (($item['type'] ?? null) !== $class::type()) {
             throw new WriteDocumentException(
@@ -436,22 +750,21 @@ final class WriteDocumentParser
                 detail: "type must be {$class::type()}",
             );
         }
+    }
 
-        if ($operation === 'add' && !is_a($class, Insertable::class, true)) {
-            throw new WriteDocumentException(
-                status: '403',
-                pointer: $pointer,
-                detail: "resource {$class::type()} can not be created",
-            );
-        }
-        if ($operation === 'update' && !is_a($class, Updatable::class, true)) {
-            throw new WriteDocumentException(
-                status: '403',
-                pointer: $pointer,
-                detail: "resource {$class::type()} can not be changed",
-            );
-        }
-
+    /**
+     * Данные ресурса места `$class`: присланные атрибуты, связи по внешнему ключу и разобранные связи по владению.
+     *
+     * @param class-string<Resource> $class
+     * @param bool                   $owner_is_new ресурс вставляется: у его связей только новые дети и нет замены
+     * @return array{
+     *     attributes: array<string, mixed>,
+     *     references: array<string, PersistentIdentity|null>,
+     *     relationships: array<string, RelationshipOperation>,
+     * }
+     */
+    private function content(array $item, string $class, string $pointer, bool $owner_is_new): array
+    {
         foreach (['attributes', 'relationships'] as $member) {
             $value = $item[$member] ?? [];
             if (!is_array($value) || ($value !== [] && array_is_list($value))) {
@@ -473,7 +786,8 @@ final class WriteDocumentParser
                     detail: "unknown attribute {$name} of {$class::type()}",
                 );
             }
-            if ($name === $class::primaryAttribute() || ($class::ATTRIBUTES[$name]['mode'] ?? null) === Resource::READ) {
+            $read_only = ($class::ATTRIBUTES[$name]['mode'] ?? null) === Resource::READ;
+            if ($name === $class::primaryAttribute() || $read_only) {
                 throw new WriteDocumentException(
                     status: '400',
                     pointer: "{$pointer}/attributes/{$name}",
@@ -489,6 +803,7 @@ final class WriteDocumentParser
             }
         }
 
+        $references = [];
         $relationships = [];
         /** @var array<string, mixed> $sent */
         $sent = $item['relationships'] ?? [];
@@ -510,36 +825,27 @@ final class WriteDocumentParser
                     detail: 'data is required',
                 );
             }
+            $owner_side = $relationship->relation[0] === $class::primaryColumn();
             if ($class::foreignRelationship($name) !== null) {
-                $target = $value['data'];
-                if ($target !== null && (!is_array($target) || ($target['type'] ?? null) !== $relationship->resource::type())) {
-                    throw new WriteDocumentException(
-                        status: '400',
-                        pointer: "{$relationship_pointer}/data/type",
-                        detail: "type must be {$relationship->resource::type()}",
-                    );
-                }
-                if ($target !== null && (!isset($target['id']) || isset($target['lid']) || !(is_string($target['id']) && ctype_digit($target['id'])))) {
-                    throw new WriteDocumentException(
-                        status: '400',
-                        pointer: "{$relationship_pointer}/data",
-                        detail: "{$name} refers to an existing resource: {type, id} or null",
-                    );
-                }
-                $relationships[$name] = ['data' => $target === null ? null : ['type' => $target['type'], 'id' => $target['id']]];
-            } elseif ($relationship instanceof OneToMany && $relationship->relation[0] === $class::primaryColumn()) {
+                $references[$name] = self::reference(
+                    name: $name,
+                    target: $relationship->resource,
+                    value: $value['data'],
+                    pointer: $relationship_pointer,
+                );
+            } elseif ($relationship instanceof OneToMany && $owner_side) {
                 $relationships[$name] = $this->children(
                     target: $relationship->resource,
                     value: $value,
                     pointer: $relationship_pointer,
-                    parent_is_new: $operation === 'add',
+                    parent_is_new: $owner_is_new,
                 );
-            } elseif ($relationship instanceof OneToOne && $relationship->relation[0] === $class::primaryColumn()) {
+            } elseif ($relationship instanceof OneToOne && $owner_side) {
                 $relationships[$name] = $this->child(
                     target: $relationship->resource,
                     value: $value,
                     pointer: $relationship_pointer,
-                    parent_is_new: $operation === 'add',
+                    parent_is_new: $owner_is_new,
                 );
             } else {
                 throw new WriteDocumentException(
@@ -550,24 +856,48 @@ final class WriteDocumentParser
             }
         }
 
-        return [
-            'type' => $item['type'],
-            ...(isset($item['id']) ? ['id' => (string) $item['id']] : []),
-            ...(isset($item['lid']) ? ['lid' => (string) $item['lid']] : []),
-            'attributes' => $attributes,
-            'relationships' => $relationships,
-            'patch:op' => $operation,
-            'patch:pointer' => $pointer,
-        ];
+        return ['attributes' => $attributes, 'references' => $references, 'relationships' => $relationships];
     }
 
     /**
-     * Список связи по владению → дети в порядке выполнения и признак полной замены.
+     * Связь по внешнему ключу: `{type, id}` нужного типа → цель, `null` → null (без связи). `lid` недопустим: цель —
+     * только существующий ресурс.
      *
      * @param class-string<Resource> $target
-     * @return array{data: list<array>, 'patch:replace': bool}
      */
-    private function children(string $target, mixed $value, string $pointer, bool $parent_is_new): array
+    private static function reference(string $name, string $target, mixed $value, string $pointer): ?PersistentIdentity
+    {
+        if ($value === null) {
+            return null;
+        }
+        if (!is_array($value) || ($value['type'] ?? null) !== $target::type()) {
+            throw new WriteDocumentException(
+                status: '400',
+                pointer: "{$pointer}/data/type",
+                detail: "type must be {$target::type()}",
+            );
+        }
+        $id = $value['id'] ?? null;
+        if (isset($value['lid']) || !is_string($id) || !ctype_digit($id)) {
+            throw new WriteDocumentException(
+                status: '400',
+                pointer: "{$pointer}/data",
+                detail: "{$name} refers to an existing resource: {type, id} or null",
+            );
+        }
+
+        return new PersistentIdentity(
+            id: (int) $id,
+        );
+    }
+
+    /**
+     * Список связи по владению → операции над детьми в порядке выполнения и признак полной замены. Правила — в
+     * докблоке `RelationshipOperation`.
+     *
+     * @param class-string<Resource> $target
+     */
+    private function children(string $target, mixed $value, string $pointer, bool $parent_is_new): RelationshipOperation
     {
         $identifiers = is_array($value) ? ($value['data'] ?? null) : null;
         if (!is_array($identifiers) || !array_is_list($identifiers)) {
@@ -579,7 +909,12 @@ final class WriteDocumentParser
         }
         $marked = array_filter($identifiers, static fn(mixed $identifier): bool => isset($identifier['meta']['op']));
         if ($marked === [] && !$parent_is_new) {
-            self::deletable(target: $target, pointer: "{$pointer}/data", detail: "a list without meta.op replaces the relationship and deletes unlisted {$target::type()}, which can not be deleted: mark elements with meta.op for a partial change");
+            self::deletable(
+                target: $target,
+                pointer: "{$pointer}/data",
+                detail: "a list without meta.op replaces the relationship and deletes unlisted {$target::type()}, "
+                    . 'which can not be deleted: mark elements with meta.op for a partial change',
+            );
         }
 
         $children = [];
@@ -602,8 +937,8 @@ final class WriteDocumentParser
                 );
             }
             $seen[$key] = true;
-            $operation = $identifier['meta']['op'] ?? null;
-            if ($operation !== null && !in_array($operation, ['add', 'update', 'remove'], true)) {
+            $marker = $identifier['meta']['op'] ?? null;
+            if ($marker !== null && !in_array($marker, ['add', 'update', 'remove'], true)) {
                 throw new WriteDocumentException(
                     status: '400',
                     pointer: "{$identifier_pointer}/meta/op",
@@ -614,7 +949,7 @@ final class WriteDocumentParser
 
             // Новый ребёнок: только с ресурсом в included
             if (isset($identifier['lid'])) {
-                if ($operation !== null && $operation !== 'add') {
+                if ($marker !== null && $marker !== 'add') {
                     throw new WriteDocumentException(
                         status: '400',
                         pointer: "{$identifier_pointer}/meta/op",
@@ -629,7 +964,11 @@ final class WriteDocumentParser
                     );
                 }
                 $this->used[$key] = true;
-                $children[] = $this->resource(item: $included['resource'], class: $target, pointer: $included['pointer'], operation: 'add');
+                $children[] = $this->insertOperation(
+                    item: $included['resource'],
+                    class: $target,
+                    pointer: $included['pointer'],
+                );
                 continue;
             }
 
@@ -641,15 +980,22 @@ final class WriteDocumentParser
                     detail: 'a new resource has no existing children: use lid',
                 );
             }
-            if ($operation === 'add') {
+            if ($marker === 'add') {
                 throw new WriteDocumentException(
                     status: '400',
                     pointer: "{$identifier_pointer}/meta/op",
                     detail: 'moving an existing resource to another parent is not supported',
                 );
             }
-            if ($operation === 'remove') {
-                self::deletable(target: $target, pointer: $identifier_pointer, detail: "{$target::type()} can not be deleted");
+            $identity = new PersistentIdentity(
+                id: (int) $identifier['id'],
+            );
+            if ($marker === 'remove') {
+                self::deletable(
+                    target: $target,
+                    pointer: $identifier_pointer,
+                    detail: "{$target::type()} can not be deleted",
+                );
                 if ($included !== null) {
                     throw new WriteDocumentException(
                         status: '400',
@@ -657,48 +1003,80 @@ final class WriteDocumentParser
                         detail: "{$key} is removed, it can not be in included",
                     );
                 }
-                $children[] = ['type' => $target::type(), 'id' => (string) $identifier['id'], 'patch:op' => 'remove', 'patch:pointer' => $identifier_pointer];
+                $children[] = new DeleteOperation(
+                    resource: $target,
+                    identity: $identity,
+                );
                 continue;
             }
             if ($included !== null) {
                 $this->used[$key] = true;
-                $children[] = $this->resource(item: $included['resource'], class: $target, pointer: $included['pointer'], operation: 'update');
+                $children[] = $this->updateOperation(
+                    item: $included['resource'],
+                    class: $target,
+                    pointer: $included['pointer'],
+                );
                 continue;
             }
-            if ($operation === 'update') {
+            if ($marker === 'update') {
                 throw new WriteDocumentException(
                     status: '400',
                     pointer: $identifier_pointer,
                     detail: "update needs {$key} in included",
                 );
             }
-            $children[] = ['type' => $target::type(), 'id' => (string) $identifier['id'], 'patch:op' => 'keep', 'patch:pointer' => $identifier_pointer];
+            $children[] = new KeepOperation(
+                resource: $target,
+                identity: $identity,
+            );
         }
 
-        usort($children, static fn(array $left, array $right): int => self::ORDER[$left['patch:op']] <=> self::ORDER[$right['patch:op']]);
+        usort(
+            $children,
+            static fn(WriteOperation $left, WriteOperation $right): int => self::order(operation: $left)
+                <=> self::order(operation: $right),
+        );
 
-        return ['data' => $children, 'patch:replace' => $marked === [] && !$parent_is_new];
+        return new RelationshipOperation(
+            replace: $marked === [] && !$parent_is_new,
+            children: $children,
+        );
     }
 
     /**
-     * Связь to-one по владению (`delivery`) → ребёнок (список из одного или пустой) и признак замены. `meta.op` не
-     * нужен, операцию даёт форма:
+     * Место операции в порядке выполнения внутри связи: удаления, затем оставленные и изменённые, затем вставки.
+     */
+    private static function order(WriteOperation $operation): int
+    {
+        if ($operation instanceof DeleteOperation) {
+            return 0;
+        }
+        if ($operation instanceof InsertOperation) {
+            return 2;
+        }
+
+        return 1;
+    }
+
+    /**
+     * Связь to-one по владению (`delivery`) → операция над ребёнком (список из одной или пустой) и признак замены.
+     * `meta.op` не нужен, операцию даёт форма:
      *
-     *     {type, lid} + ресурс в included   replace: текущий ребёнок удаляется, новый вставляется
-     *     {type, id}  + ресурс в included   update текущего ребёнка (чужой — 404)
-     *     {type, id}                        keep: только проверка, что это текущий ребёнок
-     *     null                              replace без нового: текущий ребёнок удаляется (его нет — не ошибка)
+     *     {type, lid} + ресурс в included   замена: текущий ребёнок удаляется, новый вставляется (InsertOperation)
+     *     {type, id}  + ресурс в included   UpdateOperation текущего ребёнка (чужой — 404)
+     *     {type, id}                        KeepOperation: только проверка, что это текущий ребёнок
+     *     null                              замена без нового: текущий ребёнок удаляется (его нет — не ошибка)
      *
-     * У нового родителя: `{lid}` — add, `null` — ничего, `{id}` — 400. Замена исполняется тем же
+     * У нового родителя: `{lid}` — вставка, `null` — ничего, `{id}` — 400. Замена исполняется тем же
      * `PatchReplaceWriter`, что и полная замена to-many: `DELETE … WHERE <колонка связи> = родитель` без названных id,
      * потом вставка (`PatchJoinWriter`).
      *
      * @param class-string<Resource> $target
-     * @return array{data: list<array>, 'patch:replace': bool, 'patch:to-one': true}
      */
-    private function child(string $target, mixed $value, string $pointer, bool $parent_is_new): array
+    private function child(string $target, mixed $value, string $pointer, bool $parent_is_new): RelationshipOperation
     {
-        if (!is_array($value) || !array_key_exists('data', $value) || (is_array($value['data']) && array_is_list($value['data']) && $value['data'] !== [])) {
+        $is_list = is_array($value) && is_array($value['data'] ?? null) && array_is_list($value['data']);
+        if (!is_array($value) || !array_key_exists('data', $value) || ($is_list && $value['data'] !== [])) {
             throw new WriteDocumentException(
                 status: '400',
                 pointer: "{$pointer}/data",
@@ -709,10 +1087,17 @@ final class WriteDocumentParser
         $identifier_pointer = "{$pointer}/data";
         if ($identifier === null || $identifier === []) {
             if (!$parent_is_new) {
-                self::deletable(target: $target, pointer: $identifier_pointer, detail: "null deletes the current {$target::type()}, which can not be deleted");
+                self::deletable(
+                    target: $target,
+                    pointer: $identifier_pointer,
+                    detail: "null deletes the current {$target::type()}, which can not be deleted",
+                );
             }
 
-            return ['data' => [], 'patch:replace' => !$parent_is_new, 'patch:to-one' => true];
+            return new RelationshipOperation(
+                replace: !$parent_is_new,
+                children: [],
+            );
         }
         $key = self::identity(item: $identifier, pointer: $identifier_pointer);
         if (($identifier['type'] ?? null) !== $target::type()) {
@@ -741,14 +1126,23 @@ final class WriteDocumentParser
             }
             $this->used[$key] = true;
             if (!$parent_is_new) {
-                self::deletable(target: $target, pointer: $identifier_pointer, detail: "lid replaces the current {$target::type()}, which can not be deleted");
+                self::deletable(
+                    target: $target,
+                    pointer: $identifier_pointer,
+                    detail: "lid replaces the current {$target::type()}, which can not be deleted",
+                );
             }
 
-            return [
-                'data' => [$this->resource(item: $included['resource'], class: $target, pointer: $included['pointer'], operation: 'add')],
-                'patch:replace' => !$parent_is_new,
-                'patch:to-one' => true,
-            ];
+            return new RelationshipOperation(
+                replace: !$parent_is_new,
+                children: [
+                    $this->insertOperation(
+                        item: $included['resource'],
+                        class: $target,
+                        pointer: $included['pointer'],
+                    ),
+                ],
+            );
         }
 
         if ($parent_is_new) {
@@ -760,12 +1154,30 @@ final class WriteDocumentParser
         }
         if ($included !== null) {
             $this->used[$key] = true;
-            $child = $this->resource(item: $included['resource'], class: $target, pointer: $included['pointer'], operation: 'update');
-        } else {
-            $child = ['type' => $target::type(), 'id' => (string) $identifier['id'], 'patch:op' => 'keep', 'patch:pointer' => $identifier_pointer];
+
+            return new RelationshipOperation(
+                replace: false,
+                children: [
+                    $this->updateOperation(
+                        item: $included['resource'],
+                        class: $target,
+                        pointer: $included['pointer'],
+                    ),
+                ],
+            );
         }
 
-        return ['data' => [$child], 'patch:replace' => false, 'patch:to-one' => true];
+        return new RelationshipOperation(
+            replace: false,
+            children: [
+                new KeepOperation(
+                    resource: $target,
+                    identity: new PersistentIdentity(
+                        id: (int) $identifier['id'],
+                    ),
+                ),
+            ],
+        );
     }
 
     /**
@@ -812,9 +1224,10 @@ final class WriteDocumentParser
 // План PATCH: неизменяемые узлы и планировщик (пара к Plan\Insert); исполнителей по плану строит PatchWriterBuilder
 
 /**
- * Узел плана PATCH: место дерева изменений — ресурс и ветви по операциям, которые встретились у ресурсов этого места.
+ * Узел плана PATCH: место дерева операций — ресурс и ветви по операциям, которые встретились у ресурсов этого места.
  * Исполнитель — `PatchOperationWriter`. Ветви нет (`null`) — операции нет в документе: `add` — поддерево вставки
- * (`Plan\Insert`), `update` — изменения (его же исполняет `keep`), `remove` — удаления.
+ * (`Plan\Insert`) для `InsertOperation`, `update` — изменения для `UpdateOperation` (его же исполняет
+ * `KeepOperation`), `remove` — удаления для `DeleteOperation`.
  */
 final readonly class PatchOperationNode
 {
@@ -852,8 +1265,9 @@ final readonly class PatchJoinNode
  * Исполнитель — `PatchReplaceWriter`. Один вход — владелец (`input`); стоит под `PatchJoinNode` той же связи как его
  * `parent`, а при замене пустым списком (`[]`, `null` у to-one) — без узла связи над собой.
  *
- * Узел есть, если связь заменяет хотя бы один владелец этого места; какой именно — говорит `patch:replace` связи в
- * дереве изменений (как `patch:op` для ветвей `PatchOperationNode`). У POST его не бывает.
+ * Узел есть, если связь заменяет хотя бы один владелец этого места; какой именно — говорит
+ * `RelationshipOperation::$replace` в дереве операций (как класс операции для ветвей `PatchOperationNode`). У POST
+ * его не бывает.
  */
 final readonly class PatchReplaceNode
 {
@@ -975,19 +1389,19 @@ final readonly class RouteParentNode
 }
 
 /**
- * Планировщик PATCH: ресурс точки входа + дерево изменений (`WriteDocumentParser::parse()`) → план (неизменяемые
- * узлы выше). Пара к `InsertPlanner`; исполнителей по плану строит `PatchWriterBuilder`.
+ * Планировщик PATCH: ресурс точки входа + дерево операций (`WriteDocumentParser`) → план (неизменяемые узлы выше).
+ * Пара к `InsertPlanner`; исполнителей по плану строит `PatchWriterBuilder`.
  *
- * Поток: класс ресурса, корни дерева изменений (+ родитель и связь вложенного маршрута) → `WriteRootNode` над
+ * Поток: класс ресурса, корни дерева операций (+ родитель и связь вложенного маршрута) → `WriteRootNode` над
  * `PatchJoinNode|PatchReplaceNode|PatchOperationNode`. Корни — одно место (несколько корней POST — объединение, как у
  * `InsertPlanner`). Вложенный маршрут — форма (`RouteParentNode`: кто родитель, колонки связи), его id — значение,
  * в план не попадает.
  *
- * План строится по форме дерева изменений, как план вставки по документу: место — ресурс и все его элементы этого
+ * План строится по форме дерева операций, как план вставки по документу: место — ресурс и все его операции этого
  * места (корень; все дети одной связи у всех родителей места). У места:
- *  - `PatchOperationNode` с ветвями только тех операций, что встретились у элементов (`add` → `InsertResourceNode` с
- *    таблицами `InsertPlanner::tables()`, `update`/`keep` → `UpdateResourceNode` с таблицами `tables()`, `remove` →
- *    `DeleteResourceNode`);
+ *  - `PatchOperationNode` с ветвями только тех операций, что встретились в месте (`InsertOperation` → `add`:
+ *    `InsertResourceNode` с таблицами `InsertPlanner::tables()`; `UpdateOperation`/`KeepOperation` → `update`:
+ *    `UpdateResourceNode` с таблицами `tables()`; `DeleteOperation` → `remove`: `DeleteResourceNode`);
  *  - связи, которые есть хотя бы у одного элемента места, — левый глубокий список над ним: связи по владению
  *    (`relationships()`, в порядке объявления) — сначала `PatchReplaceNode`, если связь заменяет целиком хотя бы
  *    один элемент места, потом `PatchJoinNode`, если у связи есть хотя бы один ребёнок (его `child` — место из детей
@@ -995,9 +1409,10 @@ final readonly class RouteParentNode
  *    без узла связи; у POST узла замены нет, план равен плану `InsertPlanner`. Связи по внешнему ключу пишет строка
  *    ресурса, узла нет.
  *
- * Форма плана говорит, что в месте бывает; для какого элемента — данные: `patch:op` выбирает ветвь
- * `PatchOperationNode`, `patch:replace` связи — выполнять ли удаление в `PatchReplaceNode`. Поэтому `add`, `remove` и
- * `update` в одной связи — один узел места с тремя ветвями. Вход проверен парсером; несоответствие — LogicException.
+ * Форма плана говорит, что в месте бывает; для какого элемента — данные: класс операции выбирает ветвь
+ * `PatchOperationNode`, `RelationshipOperation::$replace` — выполнять ли удаление в `PatchReplaceNode`. Поэтому
+ * вставка, удаление и изменение в одной связи — один узел места с тремя ветвями. Вход проверен парсером;
+ * несоответствие — LogicException.
  *
  * Уровень таблиц изменения (`tables()`): сначала сторона, ключ которой уже известен (левая, с главной таблицей; её
  * ключ — id ресурса), потом правая — по ключу, который вернула левая, независимо от направления внешнего ключа (у
@@ -1011,7 +1426,8 @@ final class PatchPlanner
 {
     /**
      * @param class-string<Resource>      $resource     ресурс точки входа
-     * @param list<array>                 $roots        корни дерева изменений: список из `insert()` или `[update()]`
+     * @param list<WriteOperation>        $roots        корни дерева операций: список из `insert()`, `[update()]`
+     *                                                  или `[delete()]`
      * @param class-string<Resource>|null $parent       родитель вложенного маршрута (`/certificates/{id}/domains` →
      *                                                  CertificateResource), null — маршрут не вложенный
      * @param string|null                 $relationship связь родителя к ресурсу точки входа (`domains`)
@@ -1019,7 +1435,7 @@ final class PatchPlanner
     public function plan(string $resource, array $roots, ?string $parent = null, ?string $relationship = null): WriteRootNode
     {
         return new WriteRootNode(
-            input: $this->place(resource: $resource, items: $roots),
+            input: $this->place(resource: $resource, operations: $roots),
             route: $parent === null ? null : self::route(parent: $parent, relationship: (string) $relationship, resource: $resource),
         );
     }
@@ -1047,42 +1463,72 @@ final class PatchPlanner
 
     /**
      * @param class-string<Resource> $resource
-     * @param list<array>            $items    элементы дерева изменений этого места
+     * @param list<WriteOperation>   $operations операции этого места
      */
-    private function place(string $resource, array $items): PatchJoinNode|PatchReplaceNode|PatchOperationNode
+    private function place(string $resource, array $operations): PatchJoinNode|PatchReplaceNode|PatchOperationNode
     {
-        $operations = array_map(static fn(array $item): string => (string) $item['patch:op'], $items);
+        $inserts = array_any(
+            $operations,
+            static fn(WriteOperation $operation): bool => $operation instanceof InsertOperation,
+        );
+        $updates = array_any(
+            $operations,
+            static fn(WriteOperation $operation): bool => $operation instanceof UpdateOperation
+                || $operation instanceof KeepOperation,
+        );
+        $deletes = array_any(
+            $operations,
+            static fn(WriteOperation $operation): bool => $operation instanceof DeleteOperation,
+        );
         $node = new PatchOperationNode(
             resource: $resource,
-            add: in_array('add', $operations, true)
+            add: $inserts
                 ? new InsertResourceNode(
                     resource: $resource,
                     input: new InsertPlanner()->tables(resource: $resource),
                 )
                 : null,
-            update: array_intersect(['update', 'keep'], $operations) !== []
+            update: $updates
                 ? new UpdateResourceNode(
                     resource: $resource,
                     input: $this->tables(resource: $resource),
                 )
                 : null,
-            remove: in_array('remove', $operations, true)
-                ? new DeleteResourceNode(resource: $resource)
+            remove: $deletes
+                ? new DeleteResourceNode(
+                    resource: $resource,
+                )
                 : null,
         );
 
         foreach (array_keys($resource::relationships()) as $name) {
             $name = (string) $name;
-            // Связь изменения — с признаком замены; связь по внешнему ключу его не несёт: её пишет строка ресурса
-            $present = array_values(array_filter($items, static fn(array $item): bool => isset($item['relationships'][$name]['patch:replace'])));
+            // Только связи по владению: связь по внешнему ключу лежит в `references`, её пишет строка ресурса
+            $present = array_values(array_filter(
+                array_map(
+                    static fn(WriteOperation $operation): ?RelationshipOperation => $operation->relationship(
+                        name: $name,
+                    ),
+                    $operations,
+                ),
+                static fn(?RelationshipOperation $relationship): bool => $relationship !== null,
+            ));
             if ($present === []) {
                 continue;
             }
-            $relationship = $resource::relationship($name) ?? throw new LogicException("{$resource}: unknown relationship {$name}");
+            $relationship = $resource::relationship($name)
+                ?? throw new LogicException("{$resource}: unknown relationship {$name}");
             /** @var array{0: string, 1: string} $relation */
             $relation = $relationship->relation;
-            $children = array_merge(...array_map(static fn(array $item): array => $item['relationships'][$name]['data'], $present));
-            if (array_any($present, static fn(array $item): bool => $item['relationships'][$name]['patch:replace'])) {
+            $children = array_merge(...array_map(
+                static fn(RelationshipOperation $present_relationship): array => $present_relationship->children,
+                $present,
+            ));
+            $replaces = array_any(
+                $present,
+                static fn(RelationshipOperation $present_relationship): bool => $present_relationship->replace,
+            );
+            if ($replaces) {
                 $node = new PatchReplaceNode(
                     name: $name,
                     relation: $relation,
@@ -1095,7 +1541,7 @@ final class PatchPlanner
                     name: $name,
                     relation: $relation,
                     parent: $node,
-                    child: $this->place(resource: $relationship->resource, items: $children),
+                    child: $this->place(resource: $relationship->resource, operations: $children),
                 );
             }
         }
@@ -1192,9 +1638,35 @@ final class PatchPlanner
 // Исполнители
 
 /**
+ * Контракт исполнителей уровня ресурсов этого файла: как `Executor\PushExecutor`, но на вход идёт операция дерева
+ * (`WriteOperation`), а не ресурс документа массивом.
+ *
+ * Поток: операция + `$link` (колонки связи от родителя: колонка → значение) → ключи ресурса (колонка модели →
+ * значение) наверх; пусто — строки нет.
+ *
+ * @temporary Только для прототипа. В `src/` это станет самим `PushExecutor`: его `push()` будет принимать операцию,
+ *            когда вставка (`InsertResourceWriter`, `InsertJoinWriter`) перейдёт на дерево операций.
+ */
+interface OperationPushExecutor
+{
+    /**
+     * @param array<string, mixed> $link
+     * @return array<string, mixed>
+     */
+    public function push(WriteOperation $operation, array $link = []): array;
+
+    /**
+     * Описание поддерева без выполнения.
+     *
+     * @return array<string, mixed>
+     */
+    public function explain(): array;
+}
+
+/**
  * Корень записи: проверки по всему запросу, затем каждый корень документа в одно дерево. Вместо пары
  * `InsertRootWriter` + `InsertRouteLinkWriter` из `src/`: проверка родителя маршрута должна пройти один раз и до
- * первой записи, а не на каждом корне. Сам не PushExecutor: сверху ему ничего не приходит.
+ * первой записи, а не на каждом корне. Сам не исполнитель уровня ресурсов: сверху ему ничего не приходит.
  *
  * Поток: `route->link()` (проверка родителя, колонки связи; null — маршрут не вложенный) → `root->push(корень, link)`
  * по очереди → `list<ключи корня>`.
@@ -1204,10 +1676,10 @@ final class PatchPlanner
 final readonly class WriteRootWriter
 {
     /**
-     * @param list<array> $data корни дерева изменений
+     * @param list<WriteOperation> $data корни дерева операций
      */
     public function __construct(
-        private PushExecutor $root,
+        private OperationPushExecutor $root,
         private array $data,
         private ?RouteParentWriter $route,
     ) {}
@@ -1220,7 +1692,10 @@ final readonly class WriteRootWriter
     {
         $link = $this->route?->link() ?? [];
 
-        return array_map(fn(array $resource): array => $this->root->push($resource, $link), $this->data);
+        return array_map(
+            fn(WriteOperation $operation): array => $this->root->push($operation, $link),
+            $this->data,
+        );
     }
 
     /**
@@ -1293,40 +1768,50 @@ final readonly class RouteParentWriter
 }
 
 /**
- * Развилка по операции узла: `add` → вставка (`InsertResourceWriter`), `update`/`keep` → изменение или проверка,
- * `remove` → удаление. Пустые ключи у update/keep/remove — 404 с указателем узла. Ветви есть только для операций,
- * которые встретились в документе (`PatchPlanner`); операция без ветви — LogicException.
+ * Развилка по классу операции: `InsertOperation` → вставка (ветвь `add`), `UpdateOperation`/`KeepOperation` →
+ * изменение или проверка (ветвь `update`), `DeleteOperation` → удаление (ветвь `remove`). Пустые ключи у изменения,
+ * проверки и удаления — 404 с ресурсом в `meta` (`{type, id}`). Ветви есть только для операций, которые встретились
+ * в документе (`PatchPlanner`); операция без ветви — LogicException.
  *
- * Поток: узел (`patch:op`) + `$link` → исполнитель операции → ключи наверх (их берёт PatchJoinWriter для детей).
+ * Поток: операция + `$link` → исполнитель ветви → ключи наверх (их берёт PatchJoinWriter для детей).
  */
-final readonly class PatchOperationWriter implements PushExecutor
+final readonly class PatchOperationWriter implements OperationPushExecutor
 {
     /**
      * @param class-string<Resource> $resource
      */
     public function __construct(
         private string $resource,
-        private ?PushExecutor $add,
-        private ?PushExecutor $update,
-        private ?PushExecutor $remove,
+        private ?OperationPushExecutor $add,
+        private ?OperationPushExecutor $update,
+        private ?OperationPushExecutor $remove,
     ) {}
 
     #[\Override]
-    public function push(array $resource, array $link = []): array
+    public function push(WriteOperation $operation, array $link = []): array
     {
-        $operation = (string) $resource['patch:op'];
-        $branch = match ($operation) {
-            'add' => $this->add,
-            'update', 'keep' => $this->update,
-            'remove' => $this->remove,
-            default => throw new LogicException("Unknown operation {$operation}"),
-        };
-        $keys = ($branch ?? throw new LogicException("{$this->resource}: no {$operation} branch in the plan"))->push($resource, $link);
+        if ($operation instanceof InsertOperation) {
+            $branch = $this->add ?? throw new LogicException("{$this->resource}: no add branch in the plan");
+
+            return $branch->push($operation, $link);
+        }
+        if ($operation instanceof UpdateOperation || $operation instanceof KeepOperation) {
+            $branch = $this->update ?? throw new LogicException("{$this->resource}: no update branch in the plan");
+        } elseif ($operation instanceof DeleteOperation) {
+            $branch = $this->remove ?? throw new LogicException("{$this->resource}: no remove branch in the plan");
+        } else {
+            throw new LogicException('Unknown operation ' . $operation::class);
+        }
+
+        $keys = $branch->push($operation, $link);
         if ($keys === []) {
+            $type = $operation->resource::type();
             throw new WriteDocumentException(
                 status: '404',
-                pointer: isset($resource['patch:pointer']) ? (string) $resource['patch:pointer'] : null,
-                detail: "{$resource['type']} {$resource['id']} not found" . ($link === [] ? '' : ' under ' . json_encode($link)),
+                pointer: null,
+                detail: "{$type} {$operation->identity->id} not found"
+                    . ($link === [] ? '' : ' under ' . json_encode($link)),
+                meta: ['type' => $type, ...$operation->identity->toMeta()],
             );
         }
 
@@ -1349,15 +1834,74 @@ final readonly class PatchOperationWriter implements PushExecutor
 }
 
 /**
- * Связь по владению при PATCH (to-many и to-one): родитель (`parent`), затем его дети из `relationships[name].data`
- * в `child` с `link = [relation[1] => keys[relation[0]]]` — как `InsertJoinWriter`. To-one приходит от парсера тем же
- * списком (один ребёнок).
+ * Вставка ресурса по `InsertOperation`: переводит операцию в ресурс документа, который читает
+ * `Executor\Insert\InsertResourceWriter` из `src/` (`input`), — `{type, attributes, relationships}`, где в связях
+ * только связи по внешнему ключу (`references`) как `{data: {type, id} | null}`. Связи по владению не передаются:
+ * детей вставляет `PatchJoinWriter`.
  *
- * Поток: узел с поддеревом → `parent` → ключи → каждый ребёнок в `child` по порядку (парсер уже упорядочил: remove,
- * keep/update, add) → ключи родителя наверх. Связи нет в документе — дети не трогаются. Полную замену выполняет
- * `PatchReplaceWriter` внутри `parent`, то есть до детей.
+ * Поток: `InsertOperation` + `$link` → `input->push(ресурс, link)` → ключи вставленного ресурса.
+ *
+ * @temporary Только для прототипа: переходник к вставке из `src/`, которая принимает массив. Когда
+ *            `InsertResourceWriter` будет принимать `InsertOperation`, этот класс не нужен.
  */
-final readonly class PatchJoinWriter implements PushExecutor
+final readonly class InsertOperationWriter implements OperationPushExecutor
+{
+    /**
+     * @param class-string<Resource> $resource
+     */
+    public function __construct(
+        private string $resource,
+        private PushExecutor $input,
+    ) {}
+
+    #[\Override]
+    public function push(WriteOperation $operation, array $link = []): array
+    {
+        if (!$operation instanceof InsertOperation) {
+            throw new LogicException("{$this->resource}: insert needs InsertOperation, got " . $operation::class);
+        }
+        $relationships = [];
+        foreach ($operation->references as $name => $target) {
+            $relationship = $this->resource::relationship($name)
+                ?? throw new LogicException("{$this->resource}: unknown relationship {$name}");
+            $relationships[$name] = [
+                'data' => $target === null
+                    ? null
+                    : ['type' => $relationship->resource::type(), 'id' => (string) $target->id],
+            ];
+        }
+
+        return $this->input->push(
+            [
+                'type' => $this->resource::type(),
+                'attributes' => $operation->attributes,
+                'relationships' => $relationships,
+            ],
+            $link,
+        );
+    }
+
+    #[\Override]
+    public function explain(): array
+    {
+        return [
+            'node' => static::class,
+            'resource' => $this->resource,
+            'input' => $this->input->explain(),
+        ];
+    }
+}
+
+/**
+ * Связь по владению при PATCH (to-many и to-one): родитель (`parent`), затем его дети из
+ * `relationship(name)->children` в `child` с `link = [relation[1] => keys[relation[0]]]` — как `InsertJoinWriter`.
+ * To-one приходит от парсера тем же списком (один ребёнок).
+ *
+ * Поток: операция с поддеревом → `parent` → ключи → каждый ребёнок в `child` по порядку (парсер уже упорядочил:
+ * удаления, оставленные и изменённые, вставки) → ключи родителя наверх. Связи у операции нет — дети не трогаются.
+ * Полную замену выполняет `PatchReplaceWriter` внутри `parent`, то есть до детей.
+ */
+final readonly class PatchJoinWriter implements OperationPushExecutor
 {
     /**
      * @param array{0: string, 1: string} $relation [колонка родителя, колонка ребёнка]
@@ -1365,20 +1909,21 @@ final readonly class PatchJoinWriter implements PushExecutor
     public function __construct(
         private string $name,
         private array $relation,
-        private PushExecutor $parent,
-        private PushExecutor $child,
+        private OperationPushExecutor $parent,
+        private OperationPushExecutor $child,
     ) {}
 
     #[\Override]
-    public function push(array $resource, array $link = []): array
+    public function push(WriteOperation $operation, array $link = []): array
     {
-        $keys = $this->parent->push($resource, $link);
-        $relationship = $resource['relationships'][$this->name] ?? null;
+        $keys = $this->parent->push($operation, $link);
+        $relationship = $operation->relationship(name: $this->name);
         if ($relationship === null) {
             return $keys;
         }
-        $parent_key = $keys[$this->relation[0]] ?? throw new LogicException("No key {$this->relation[0]} for {$this->name}");
-        foreach ($relationship['data'] as $child) {
+        $parent_key = $keys[$this->relation[0]]
+            ?? throw new LogicException("No key {$this->relation[0]} for {$this->name}");
+        foreach ($relationship->children as $child) {
             $this->child->push($child, [$this->relation[1] => $parent_key]);
         }
 
@@ -1402,14 +1947,14 @@ final readonly class PatchJoinWriter implements PushExecutor
  * Полная замена связи по владению при PATCH: удаляет детей владельца, не названных в документе. Замена to-one через
  * `lid` или `null` — тот же случай без названных id: текущий ребёнок удаляется (новый вставит `PatchJoinWriter` выше).
  *
- * Поток: узел с поддеревом + `$link` → `input` → ключи владельца → если у связи `patch:replace` — `DELETE FROM
+ * Поток: операция с поддеревом + `$link` → `input` → ключи владельца → если у связи `replace` — `DELETE FROM
  * <главная таблица ребёнка> WHERE <relation[1]> = :parent AND <pk> NOT IN (id названных детей)` (без названных — все
- * дети владельца) → те же ключи наверх. Связи нет в документе или она без `patch:replace` (частичное изменение у этого
- * владельца) — только `input`.
+ * дети владельца) → те же ключи наверх. Связи у операции нет или она без `replace` (частичное изменение у этого
+ * владельца) — только `input`. Названные дети — операции с `id`: `UpdateOperation` и `KeepOperation`.
  *
  * Собственных детей удалённого ребёнка удаляет `ON DELETE CASCADE` базы.
  */
-final readonly class PatchReplaceWriter implements PushExecutor
+final readonly class PatchReplaceWriter implements OperationPushExecutor
 {
     /**
      * @param array{0: string, 1: string} $relation       [колонка владельца, колонка ребёнка]
@@ -1420,28 +1965,31 @@ final readonly class PatchReplaceWriter implements PushExecutor
         private string $name,
         private array $relation,
         private string $child_resource,
-        private PushExecutor $input,
+        private OperationPushExecutor $input,
     ) {}
 
     #[\Override]
-    public function push(array $resource, array $link = []): array
+    public function push(WriteOperation $operation, array $link = []): array
     {
-        $keys = $this->input->push($resource, $link);
-        $relationship = $resource['relationships'][$this->name] ?? null;
-        if ($relationship === null || !$relationship['patch:replace']) {
+        $keys = $this->input->push($operation, $link);
+        $relationship = $operation->relationship(name: $this->name);
+        if ($relationship === null || !$relationship->replace) {
             return $keys;
         }
-        $parent_key = $keys[$this->relation[0]] ?? throw new LogicException("No key {$this->relation[0]} for {$this->name}");
+        $parent_key = $keys[$this->relation[0]]
+            ?? throw new LogicException("No key {$this->relation[0]} for {$this->name}");
 
         $entity = Tables::mainEntity(resource: $this->child_resource);
         $primary = $this->child_resource::primaryColumn();
         if (!isset($entity::COLUMNS[$this->relation[1]])) {
             throw new LogicException("{$entity}: link column {$this->relation[1]} is not in the main table");
         }
-        $listed = array_values(array_map(
-            static fn(array $child): int => (int) $child['id'],
-            array_filter($relationship['data'], static fn(array $child): bool => isset($child['id'])),
-        ));
+        $listed = [];
+        foreach ($relationship->children as $child) {
+            if ($child instanceof UpdateOperation || $child instanceof KeepOperation) {
+                $listed[] = $child->identity->id;
+            }
+        }
 
         $delete = new Delete(new UpdateOrDeleteTarget(new QualifiedName($entity::TABLE)));
         $delete->where->and(new OperatorExpression('=', new ColumnReference($entity::column($this->relation[1])), new NamedParameter('parent_key')));
@@ -1475,19 +2023,20 @@ final readonly class PatchReplaceWriter implements PushExecutor
 }
 
 /**
- * Граница уровней при изменении: узел дерева изменений → строка «колонка модели → значение» → поддерево таблиц
- * (`PatchPlanner::tables()` по `model()`). Пара к `InsertResourceWriter`.
+ * Граница уровней при изменении: операция → строка «колонка модели → значение» → поддерево таблиц
+ * (`PatchPlanner::tables()` по `model()`). Пара к `InsertResourceWriter`. Исполняет `UpdateOperation` и
+ * `KeepOperation`; другая операция — LogicException.
  *
- * Поток: узел (`id`, `attributes`, связи по внешнему ключу) + `$link` → `input->push(строка, link + [pk => id])` →
- * ключи всех таблиц; пусто — строки главной таблицы нет (или она чужая: колонки связи от родителя — условие
- * принадлежности), наверху это 404.
+ * Поток: операция (`identity->id`, `attributes`, `references`) + `$link` → `input->push(строка, link + [pk => id])`
+ * → ключи всех таблиц; пусто — строки главной таблицы нет (или она чужая: колонки связи от родителя — условие
+ * принадлежности), наверху это 404. У `KeepOperation` строка пустая: ресурс только ищется.
  *
  * В строку идут только присланные атрибуты; `null` — это NULL в колонку (присутствие ключа, а не значение, решает,
  * что колонку трогать). Колонка связи от родителя должна быть колонкой модели, иначе принадлежность не проверить —
  * LogicException. Если первичный ключ ресурса и есть колонка связи (`delivery.certificate_id`), id, не равный
  * родителю, — пусто (404) без запроса.
  */
-final readonly class UpdateResourceWriter implements PushExecutor
+final readonly class UpdateResourceWriter implements OperationPushExecutor
 {
     /**
      * @param class-string<Resource> $resource
@@ -1498,8 +2047,11 @@ final readonly class UpdateResourceWriter implements PushExecutor
     ) {}
 
     #[\Override]
-    public function push(array $resource, array $link = []): array
+    public function push(WriteOperation $operation, array $link = []): array
     {
+        if (!$operation instanceof UpdateOperation && !$operation instanceof KeepOperation) {
+            throw new LogicException("{$this->resource}: update needs UpdateOperation or KeepOperation");
+        }
         $tree = ModelTree::of($this->resource);
         foreach (array_keys($link) as $column) {
             if (!$tree->hasColumn((string) $column)) {
@@ -1508,15 +2060,21 @@ final readonly class UpdateResourceWriter implements PushExecutor
         }
 
         $primary = $this->resource::primaryColumn();
+        $id = $operation->identity->id;
         // Первичный ключ ребёнка — сама колонка связи (`delivery.certificate_id`): id обязан совпасть с родителем
-        if (isset($link[$primary]) && (int) $link[$primary] !== (int) $resource['id']) {
+        if (isset($link[$primary]) && (int) $link[$primary] !== $id) {
             return [];
         }
+        $row = [];
+        if ($operation instanceof UpdateOperation) {
+            $row = Tables::row(
+                resource: $this->resource,
+                attributes: $operation->attributes,
+                references: $operation->references,
+            );
+        }
 
-        return $this->input->push(
-            Tables::row(resource: $this->resource, data: $resource),
-            [...$link, $primary => (int) $resource['id']],
-        );
+        return $this->input->push($row, [...$link, $primary => $id]);
     }
 
     #[\Override]
@@ -1752,9 +2310,10 @@ final readonly class UpdateOptionalTableWriter implements TableWriter
  * могут разделять другие. `Deletable` проверяется только у ресурса, которого удаляет документ; что уходит вместе с ним,
  * задаёт схема базы.
  *
- * Поток: узел (`id`) + `$link` → SQL → `[pk => id]`; пусто — строки нет.
+ * Поток: `DeleteOperation` (`identity->id`) + `$link` → SQL → `[pk => id]`; пусто — строки нет. Другая операция —
+ * LogicException.
  */
-final readonly class DeleteResourceWriter implements PushExecutor
+final readonly class DeleteResourceWriter implements OperationPushExecutor
 {
     /**
      * @param class-string<Resource> $resource
@@ -1765,20 +2324,23 @@ final readonly class DeleteResourceWriter implements PushExecutor
     ) {}
 
     #[\Override]
-    public function push(array $resource, array $link = []): array
+    public function push(WriteOperation $operation, array $link = []): array
     {
+        if (!$operation instanceof DeleteOperation) {
+            throw new LogicException("{$this->resource}: delete needs DeleteOperation, got " . $operation::class);
+        }
         $entity = Tables::mainEntity(resource: $this->resource);
         $primary = $this->resource::primaryColumn();
         $statement = new Delete(new UpdateOrDeleteTarget(new QualifiedName($entity::TABLE)));
         $statement->returning->replace([new TargetElement(new ColumnReference($entity::column($primary)))]);
         $parameters = [
-            'key_id' => (int) $resource['id'],
+            'key_id' => $operation->identity->id,
             ...Tables::where(statement: $statement, entity: $entity, primary: $primary, link: $link),
         ];
 
         return Tables::run(pdo: $this->pdo, statement: $statement, parameters: $parameters) === []
             ? []
-            : [$primary => (int) $resource['id']];
+            : [$primary => $operation->identity->id];
     }
 
     #[\Override]
@@ -1811,21 +2373,25 @@ final class Tables
     }
 
     /**
-     * @param class-string<Resource> $resource
+     * Строка ресурса из данных операции изменения: атрибут → его колонка, связь по внешнему ключу → её колонка
+     * (id цели или NULL).
+     *
+     * @param class-string<Resource>                 $resource
+     * @param array<string, mixed>                   $attributes присланные атрибуты
+     * @param array<string, PersistentIdentity|null> $references связи по внешнему ключу
      * @return array<string, mixed> колонка модели → значение
      */
-    public static function row(string $resource, array $data): array
+    public static function row(string $resource, array $attributes, array $references): array
     {
         $row = [];
-        foreach ($data['attributes'] ?? [] as $name => $value) {
+        foreach ($attributes as $name => $value) {
             $attribute = $resource::ATTRIBUTES[$name] ?? throw new LogicException("{$resource}: unknown attribute {$name}");
             $row[(string) ($attribute['column'] ?? throw new LogicException("{$resource}: composite attribute {$name} is not supported"))] = $value;
         }
-        foreach ($data['relationships'] ?? [] as $name => $relationship) {
-            $foreign = $resource::foreignRelationship((string) $name);
-            if ($foreign !== null) {
-                $row[$foreign->relation[0]] = $relationship['data'] === null ? null : (int) $relationship['data']['id'];
-            }
+        foreach ($references as $name => $target) {
+            $foreign = $resource::foreignRelationship($name)
+                ?? throw new LogicException("{$resource}: {$name} is not a foreign-key relationship");
+            $row[$foreign->relation[0]] = $target?->id;
         }
 
         return $row;
@@ -1923,10 +2489,10 @@ final class Tables
 
 /**
  * Собирает по плану PATCH (`PatchPlanner`) дерево исполнителей. Пара к `Executor\Insert\WriterBuilder`; ветвь `add`
- * собирает он сам.
+ * собирает он сам, над ней — переходник `InsertOperationWriter` (операция → ресурс документа для вставки из `src/`).
  *
- * Поток: неизменяемое дерево плана → `WriteRootWriter` (`root()`) над деревом `PushExecutor` на одно выполнение (план
- * переиспользуемый). `WriteRootNode` → `WriteRootWriter`, `RouteParentNode` → `RouteParentWriter` (с id из маршрута).
+ * Поток: неизменяемое дерево плана → `WriteRootWriter` (`root()`) над деревом `OperationPushExecutor` на одно
+ * выполнение (план переиспользуемый). `WriteRootNode` → `WriteRootWriter`, `RouteParentNode` → `RouteParentWriter` (с id из маршрута).
  *
  * Узел и исполнитель соответствуют по основе имени: `PatchJoinNode` → `PatchJoinWriter`, `PatchReplaceNode` →
  * `PatchReplaceWriter`, `PatchOperationNode` → `PatchOperationWriter`, `UpdateResourceNode` →
@@ -1946,8 +2512,8 @@ final readonly class PatchWriterBuilder
     /**
      * Корень записи. Значения, которых нет в плане, даёт вызывающий: корни документа и id родителя из маршрута.
      *
-     * @param list<array> $data     корни дерева изменений
-     * @param int|null    $route_id id родителя из вложенного маршрута; обязателен, если в плане есть `route`
+     * @param list<WriteOperation> $data     корни дерева операций
+     * @param int|null             $route_id id родителя из вложенного маршрута; обязателен, если в плане есть `route`
      */
     public function root(WriteRootNode $plan, array $data, ?int $route_id = null): WriteRootWriter
     {
@@ -1968,7 +2534,7 @@ final readonly class PatchWriterBuilder
         );
     }
 
-    public function build(PatchJoinNode|PatchReplaceNode|PatchOperationNode $plan): PushExecutor
+    public function build(PatchJoinNode|PatchReplaceNode|PatchOperationNode $plan): OperationPushExecutor
     {
         if ($plan instanceof PatchJoinNode) {
             return new PatchJoinWriter(
@@ -1990,7 +2556,10 @@ final readonly class PatchWriterBuilder
 
         return new PatchOperationWriter(
             resource: $plan->resource,
-            add: $plan->add === null ? null : new WriterBuilder(pdo: $this->pdo)->build(plan: $plan->add),
+            add: $plan->add === null ? null : new InsertOperationWriter(
+                resource: $plan->resource,
+                input: new WriterBuilder(pdo: $this->pdo)->build(plan: $plan->add),
+            ),
             update: $plan->update === null ? null : new UpdateResourceWriter(
                 resource: $plan->update->resource,
                 input: $this->table(plan: $plan->update->input),
@@ -2038,7 +2607,7 @@ final readonly class PatchWriterBuilder
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// Печать: дерево изменений, план и дерево исполнителей текстом
+// Печать: дерево операций, план и дерево исполнителей текстом
 
 function json(mixed $value): string
 {
@@ -2054,36 +2623,33 @@ function shortClassName(string $class): string
 }
 
 /**
- * Дерево изменений текстом: операция, тип, id/lid, атрибуты; связи с режимом и элементами с отступом.
+ * Дерево операций текстом: класс операции, ресурс, id или lid, присланные атрибуты; под ним связи по внешнему ключу
+ * (если есть) и связи по владению с признаком замены и операциями над детьми.
  */
-function changes(array $node, string $indent = ''): string
+function operations(WriteOperation $operation, string $indent = ''): string
 {
-    $identity = 'new';
-    if (isset($node['lid'])) {
-        $identity = "lid {$node['lid']}";
+    $output = $indent . shortClassName($operation::class) . ' ' . shortClassName($operation->resource);
+    if ($operation instanceof KeepOperation || $operation instanceof DeleteOperation) {
+        return "{$output} {$operation->identity->key()}\n";
     }
-    if (isset($node['id'])) {
-        $identity = "id {$node['id']}";
+    if (!$operation instanceof InsertOperation && !$operation instanceof UpdateOperation) {
+        throw new LogicException('Unknown operation ' . $operation::class);
     }
-    $attributes = ($node['attributes'] ?? []) === [] ? '' : ' ' . json_encode($node['attributes'], JSON_UNESCAPED_UNICODE);
-    $output = "{$indent}{$node['patch:op']} {$node['type']} {$identity}{$attributes}\n";
-    foreach ($node['relationships'] ?? [] as $name => $relationship) {
-        if (isset($relationship['patch:replace'])) {
-            $to_one = isset($relationship['patch:to-one']);
-            $kind = $to_one ? 'owned to-one' : 'owned';
-            if ($node['patch:op'] === 'add') {
-                $mode = 'new parent: everything listed is added';
-            } elseif ($to_one) {
-                $mode = $relationship['patch:replace'] ? 'replace (the current one is deleted first)' : 'keep or update the current one';
-            } elseif ($relationship['patch:replace']) {
-                $mode = 'replace (unlisted leave the relationship)';
-            } else {
-                $mode = 'partial (unlisted are kept)';
-            }
-            $output .= "{$indent}    {$name} ({$kind}): {$mode}\n";
-            foreach ($relationship['data'] as $child) {
-                $output .= changes($child, "{$indent}        ");
-            }
+    $output .= ' ' . ($operation->identity === null ? 'new' : $operation->identity->key());
+    $output .= $operation->attributes === [] ? '' : ' ' . json_encode($operation->attributes, JSON_UNESCAPED_UNICODE);
+    $output .= "\n";
+    $references = [];
+    foreach ($operation->references as $name => $target) {
+        $references[] = "{$name} → " . ($target === null ? 'null' : $target->key());
+    }
+    if ($references !== []) {
+        $output .= "{$indent}    references: " . implode(', ', $references) . "\n";
+    }
+    foreach ($operation->relationships as $name => $relationship) {
+        $replace = $relationship->replace ? 'true' : 'false';
+        $output .= "{$indent}    RelationshipOperation {$name}, replace: {$replace}\n";
+        foreach ($relationship->children as $child) {
+            $output .= operations(operation: $child, indent: "{$indent}        ");
         }
     }
 
@@ -2234,7 +2800,7 @@ echo "######## 1. PATCH /certificates/1\n", json($certificate_document), "\n\n";
 $pdo->beginTransaction();
 try {
     $certificate_root = new WriteDocumentParser()->update(document: $certificate_document, resource: CertificateWithDetailResource::class, id: '1');
-    echo "######## change tree\n", changes($certificate_root), "\n";
+    echo "######## operation tree\n", operations(operation: $certificate_root), "\n";
     $certificate_plan = new PatchPlanner()->plan(resource: CertificateWithDetailResource::class, roots: [$certificate_root]);
     echo "######## plan\n", planTree($certificate_plan), "\n";
     $certificate_writer = new PatchWriterBuilder(pdo: $pdo, lock: $lock)->root(plan: $certificate_plan, data: [$certificate_root]);
@@ -2305,7 +2871,8 @@ echo "\n######## 3. POST /certificates\n", json($post_document), "\n\n";
 $pdo->beginTransaction();
 try {
     $post_roots = new WriteDocumentParser()->insert(document: $post_document, resource: CertificateWithDetailResource::class);
-    echo "######## change tree\n", implode('', array_map(static fn(array $root): string => changes(node: $root), $post_roots)), "\n";
+    echo "######## operation tree\n";
+    echo implode('', array_map(static fn(WriteOperation $root): string => operations(operation: $root), $post_roots)), "\n";
     $post_plan = new PatchPlanner()->plan(resource: CertificateWithDetailResource::class, roots: $post_roots);
     echo "######## plan\n", planTree($post_plan), "\n";
     $post_writer = new PatchWriterBuilder(pdo: $pdo, lock: $lock)->root(plan: $post_plan, data: $post_roots);
@@ -2335,7 +2902,8 @@ echo "\n######## 4. POST /certificates/1/domains\n", json($route_document), "\n\
 $pdo->beginTransaction();
 try {
     $route_roots = new WriteDocumentParser()->insert(document: $route_document, resource: DomainResource::class);
-    echo "######## change tree\n", implode('', array_map(static fn(array $root): string => changes(node: $root), $route_roots)), "\n";
+    echo "######## operation tree\n";
+    echo implode('', array_map(static fn(WriteOperation $root): string => operations(operation: $root), $route_roots)), "\n";
     $route_plan = new PatchPlanner()->plan(
         resource: DomainResource::class,
         roots: $route_roots,
@@ -2382,7 +2950,7 @@ $domain_ids = implode(', ', $pdo->query('select id from domains where certificat
 $pdo->beginTransaction();
 try {
     $delete_root = new WriteDocumentParser()->delete(resource: CertificateWithDetailResource::class, id: '1');
-    echo "######## change tree\n", changes($delete_root), "\n";
+    echo "######## operation tree\n", operations(operation: $delete_root), "\n";
     $delete_plan = new PatchPlanner()->plan(resource: CertificateWithDetailResource::class, roots: [$delete_root]);
     echo "######## plan\n", planTree($delete_plan), "\n";
     $delete_writer = new PatchWriterBuilder(pdo: $pdo, lock: $lock)->root(plan: $delete_plan, data: [$delete_root]);
@@ -2432,7 +3000,7 @@ echo "\n######## 8. PATCH /certificates/1 (full replacement of domains)\n", json
 $pdo->beginTransaction();
 try {
     $replace_root = new WriteDocumentParser()->update(document: $replace_document, resource: CertificateWithDetailResource::class, id: '1');
-    echo "######## change tree\n", changes($replace_root), "\n";
+    echo "######## operation tree\n", operations(operation: $replace_root), "\n";
     $replace_plan = new PatchPlanner()->plan(resource: CertificateWithDetailResource::class, roots: [$replace_root]);
     echo "######## plan\n", planTree($replace_plan), "\n";
     echo "######## before\n", json(certificateState(pdo: $pdo)), "\n\n";
@@ -2462,7 +3030,7 @@ echo "\n######## 9. PATCH /certificates/1 (replacement by empty: delivery null, 
 $pdo->beginTransaction();
 try {
     $empty_root = new WriteDocumentParser()->update(document: $empty_document, resource: CertificateWithDetailResource::class, id: '1');
-    echo "######## change tree\n", changes($empty_root), "\n";
+    echo "######## operation tree\n", operations(operation: $empty_root), "\n";
     $empty_plan = new PatchPlanner()->plan(resource: CertificateWithDetailResource::class, roots: [$empty_root]);
     echo "######## plan\n", planTree($empty_plan), "\n";
     echo "######## before\n", json(certificateState(pdo: $pdo)), "\n\n";
