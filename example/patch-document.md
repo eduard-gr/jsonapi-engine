@@ -181,8 +181,9 @@ flowchart LR
 
 ### 3.5. Все ресурсы использованы
 
-Каждый ресурс `included` должен быть использован ровно один раз. Неиспользованный — 400. Поэтому результат — дерево:
-у ресурса один родитель, циклов нет.
+Каждый ресурс `included` должен быть использован ровно один раз. Неиспользованный — 400 (`is not referenced from
+data`); вторая ссылка на тот же ресурс, из другой связи или от другого родителя, — тоже 400 (`is linked more than
+once`). Поэтому результат — дерево: у ресурса один родитель, циклов нет.
 
 ### 3.6. Результат: дерево операций
 
@@ -374,7 +375,9 @@ flowchart TD
 
 Вторую и третью форму показывают сценарии 8 и 9 прототипа.
 
-У POST узла замены не бывает (у нового ресурса нечего удалять), поэтому его план совпадает с планом `InsertPlanner`.
+У POST узла замены не бывает (у нового ресурса нечего удалять): в его плане только `PatchJoinNode` и
+`PatchOperationNode` с одной ветвью `add`. Поддерево таблиц под `add` строит `InsertPlanner::tables()` из `src/`;
+уровень ресурсов — узлы прототипа, а не `InsertJoinNode`.
 
 ---
 
@@ -621,6 +624,7 @@ RelationshipOperation domains, replace: true
 ```
 
 ```sql
+select id from certificates where id = :key                                          -- корень: атрибутов нет, только поиск
 delete from domains where certificate_id = :parent_key and id not in (:listed_0, :listed_1)
 -- {"parent_key":1,"listed_0":1,"listed_1":3} → 1 rows            (удалён домен 2)
 select id from domains where id = :key and certificate_id = :link_certificate_id      -- KeepOperation 1: только проверка
@@ -628,7 +632,7 @@ select id from domains where id = :key and certificate_id = :link_certificate_id
 ```
 
 План отличается в двух местах. Под узлом связи `domains` появляется `PatchReplaceNode (domains)` — он и выполняет
-первый запрос. У места `domains` остаётся одна ветвь `update` (она исполняет `KeepOperation`). Парсер заранее требует
+`DELETE`. У места `domains` остаётся одна ветвь `update` (она исполняет `KeepOperation`). Парсер заранее требует
 `Deletable` у `DomainResource`, даже если удалять в итоге нечего.
 
 ### 7.2. Значения не изменились
@@ -655,12 +659,15 @@ select id from certificates where id = :key
 | `buyer_email`, `greeting_text` | `UPDATE` и `SELECT` строку не нашли; строка вставляется |
 
 ```sql
+select id from certificates where id = :key                                                                                                            -- → [{"id":21}]
 update certificate_details set buyer_email = :buyer_email, greeting_text = :greeting_text where certificate_id = :key and (…) returning certificate_id   -- → []
 select certificate_id from certificate_details where certificate_id = :key                                                                             -- → []
 insert into certificate_details (buyer_email, greeting_text, certificate_id) values (…) returning certificate_id                                       -- → 21
 ```
 
-Это работа `UpdateOptionalTableWriter`: изменить, а если строки нет — вставить. Если строка есть, а прислали `NULL`,
+Первый запрос — поиск корня: колонки главной таблицы не присланы, поэтому вместо `UPDATE` идёт `SELECT` (нужны ключ
+для присоединённой таблицы и сам факт, что сертификат есть). Остальное — работа `UpdateOptionalTableWriter`: изменить,
+а если строки нет — вставить. Если строка есть, а прислали `NULL`,
 в колонку пишется `NULL`; строка не удаляется.
 
 ### 7.4. Чужой ребёнок
@@ -672,6 +679,8 @@ insert into certificate_details (buyer_email, greeting_text, certificate_id) val
 ```
 
 ```sql
+select id from certificates where id = :key
+-- {"key":1} → [{"id":1}]                 корень: атрибутов нет, только поиск
 delete from domains where id = :key_id and certificate_id = :link_certificate_id returning id
 -- {"key_id":4,"link_certificate_id":1} → []
 ```
@@ -685,7 +694,9 @@ delete from domains where id = :key_id and certificate_id = :link_certificate_id
              "meta": {"type": "domain", "id": "4"}}]}
 ```
 
-К этому моменту сертификат уже изменён двумя запросами. Откатить их должна транзакция вызывающего.
+Здесь до ошибки ничего не изменено: у корня был только поиск. Но если в том же запросе прислать атрибуты сертификата,
+его `UPDATE` выполнятся раньше, чем дойдёт очередь до домена (родитель пишется первым). Откатить их должна транзакция
+вызывающего.
 
 ---
 
@@ -699,10 +710,11 @@ delete from domains where id = :key_id and certificate_id = :link_certificate_id
 
 | когда | статус | примеры |
 |---|---|---|
-| разбор, до первого запроса | 400 | неизвестный атрибут или связь; `null` у обязательного атрибута; лишний ресурс в `included` |
-| разбор | 403 | у ресурса нет маркера `Insertable` / `Updatable` / `Deletable` для запрошенной операции |
+| разбор, до первого запроса | 400 | неизвестный атрибут или связь; `null` у атрибута без `nullable`; лишний или дважды использованный ресурс в `included` |
+| разбор | 403 | у ресурса нет маркера `Insertable` / `Updatable` / `Deletable` для запрошенной операции; `id` у корня POST (клиентские id не поддерживаются) |
 | разбор | 409 | `data.type` или `data.id` не совпали с маршрутом |
-| выполнение | 404 | ресурса нет; ребёнок принадлежит другому родителю |
+| разбор | 404 | `DELETE` с id не из цифр: такого ресурса быть не может (указателя нет — документа нет) |
+| выполнение | 404 | ресурса нет; ребёнок принадлежит другому родителю; родителя из вложенного маршрута нет |
 | выполнение | 500 | ошибка базы как есть: несуществующая цель внешнего ключа, нарушение `NOT NULL` или уникальности |
 
 Ошибки разбора указывают место в документе (`source.pointer`). Ошибка 404 называет ресурс в `meta` (`{type, id}`);

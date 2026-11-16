@@ -663,6 +663,24 @@ final class WriteDocumentParser
     }
 
     /**
+     * Отмечает ресурс `included` использованным. Вторая ссылка на тот же ресурс (из другой связи или от другого
+     * родителя) — 400: иначе ресурс получил бы двух родителей и был бы записан дважды.
+     *
+     * @param string $pointer место ссылки в документе
+     */
+    private function markUsed(string $key, string $pointer): void
+    {
+        if (isset($this->used[$key])) {
+            throw new WriteDocumentException(
+                status: '400',
+                pointer: $pointer,
+                detail: "resource {$key} is linked more than once",
+            );
+        }
+        $this->used[$key] = true;
+    }
+
+    /**
      * Каждый ресурс `included` использован (достижим из `data`).
      */
     private function checkUsed(): void
@@ -963,7 +981,7 @@ final class WriteDocumentParser
                         detail: "{$key} is not in included",
                     );
                 }
-                $this->used[$key] = true;
+                $this->markUsed(key: $key, pointer: $identifier_pointer);
                 $children[] = $this->insertOperation(
                     item: $included['resource'],
                     class: $target,
@@ -1010,7 +1028,7 @@ final class WriteDocumentParser
                 continue;
             }
             if ($included !== null) {
-                $this->used[$key] = true;
+                $this->markUsed(key: $key, pointer: $identifier_pointer);
                 $children[] = $this->updateOperation(
                     item: $included['resource'],
                     class: $target,
@@ -1124,7 +1142,7 @@ final class WriteDocumentParser
                     detail: "{$key} is not in included",
                 );
             }
-            $this->used[$key] = true;
+            $this->markUsed(key: $key, pointer: $identifier_pointer);
             if (!$parent_is_new) {
                 self::deletable(
                     target: $target,
@@ -1153,7 +1171,7 @@ final class WriteDocumentParser
             );
         }
         if ($included !== null) {
-            $this->used[$key] = true;
+            $this->markUsed(key: $key, pointer: $identifier_pointer);
 
             return new RelationshipOperation(
                 replace: false,
