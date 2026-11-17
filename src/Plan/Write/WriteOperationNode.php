@@ -11,9 +11,14 @@ use Ggs\JsonApiEngine\Resource;
 
 /**
  * Узел плана записи: место дерева операций — ресурс и ветви по операциям, которые встретились у ресурсов этого места.
- * Исполнитель — `WriteOperationWriter`. Ветви нет (`null`) — операции нет в документе: `add` — поддерево вставки
- * (`Plan\Insert`) для `InsertOperation`, `update` — изменения для `UpdateOperation` (его же исполняет
- * `KeepOperation`), `remove` — удаления для `DeleteOperation`.
+ * Исполнитель — `Executor\Write\WriteOperationWriter`.
+ *
+ * Ветви нет (`null`) — такой операции в месте нет: `add` — вставка (`Plan\Insert\InsertResourceNode`) для
+ * `InsertOperation`, `update` — изменение (`Plan\Update\UpdateResourceNode`) для `UpdateOperation` (его же
+ * исполняет `KeepOperation`), `remove` — удаление (`Plan\Delete\DeleteResourceNode`) для `DeleteOperation`. Какую
+ * ветвь выполнять для конкретного элемента, решает класс его операции при выполнении.
+ *
+ * Неизменяемый, без состояния.
  */
 final readonly class WriteOperationNode
 {

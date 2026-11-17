@@ -159,6 +159,27 @@ GET /certificates?include=…&fields[…]=…&filter[…]=…&sort=…   + ко�
 
 Ошибки разделены по месту: ошибки клиента возникают только в парсере (`InvalidQueryException` — 400, `ResourceNotFoundException` — 404). Всё, что идёт после него, получает проверенное дерево, и несоответствие там — `LogicException`: ошибка кода, а не запроса.
 
+Запись (`POST`, `PATCH`, `DELETE`) устроена так же, но в обратную сторону: данные идут не снизу вверх к документу, а сверху вниз к таблицам (push вместо pull), и тоже через неизменяемый план и дерево исполнителей на одно выполнение — см. [Запись](#запись-insert-update-delete):
+
+```
+POST | PATCH | DELETE  + документ JSON:API + ресурс точки входа (+ id из маршрута)
+        │
+        ▼
+1. Разбор и валидация    WriteDocumentParser               ──►  дерево операций (Insert/Update/Keep/DeleteOperation)
+        │                insert() / update() / delete()         ошибки клиента: 400 / 403 / 409
+        ▼
+2. Планирование          WritePlanner                      ──►  узлы плана (src/Plan/Write, Insert, Update, Delete)
+        │
+        ▼
+3. Сборка исполнителя    WriterBuilder                     ──►  дерево исполнителей (src/Executor/Write, Insert, Update, Delete)
+        │
+        ▼
+4. Выполнение            WriteRootWriter::execute()        ──►  INSERT / UPDATE / DELETE, ключи корней
+                                                                нет ресурса или он чужой: 404
+```
+
+У записи клиентская ошибка есть и после парсера: существование ресурса известно только базе, поэтому 404 (`WriteNotFoundException`) возникает при выполнении, и уже сделанную часть запроса откатывает транзакция вызывающего.
+
 ### Модель Volcano
 
 Исполнитель устроен по модели итераторов Volcano (Graefe), как исполнители реляционных СУБД: запрос — дерево операторов, каждый оператор — итератор, который по требованию отдаёт следующий элемент своего потока и сам берёт элементы у своих входов.
@@ -951,7 +972,7 @@ WriteJoinWriter domains [id, certificate_id]
 
 Описание данных делится на две части (схема endpoint'а, третья часть, пока убрана):
 
-- **Сущность** (`Model\Entity`, слой `src/Model`) описывает одну таблицу: колонки, их типы, первичный и уникальные ключи, внешние ключи. О JSON:API она не знает: ресурсы собирают из сущностей свою модель данных, а будущие `insert` и `update` возьмут из них порядок записи таблиц и типы.
+- **Сущность** (`Model\Entity`, слой `src/Model`) описывает одну таблицу: колонки, их типы, первичный и уникальные ключи, внешние ключи. О JSON:API она не знает: ресурсы собирают из сущностей свою модель данных, а запись берёт из них порядок вставки таблиц модели (`PRIMARY`/`references`, см. [Запись](#запись-insert-update-delete)); типы значений при записи пока не проверяются.
 - **Класс ресурса** описывает JSON:API ресурс: `type`, атрибуты, первичный ключ, связи с другими ресурсами, модель данных (из каких сущностей ресурс читается). Он не зависит от endpoint'а: endpoint называет корневой ресурс, а всё, что объявлено в ресурсах, доступно клиенту.
 
 ### Сущность
@@ -1237,9 +1258,10 @@ public static function serialize(array $tuple): ResourceRecord
 - **Merge по неквалифицированным колонкам.** `HashToMergeRule` хранит порядок владельца колонкой без ресурса: одинаковый ключ разных таблиц не отличить.
 - **Обратная сторона связи.** `certificate.domains` и `domain.certificate` — стороны одного внешнего ключа; выводить одну из другой или из `FOREIGN` сущностей?
 - **Тип и `nullable` атрибута из сущности.** Атрибут повторяет `type` и `nullable` колонки; выводить или проверять совпадение в `validate()`?
-- **Вставка: порядок соседних связей.** Сейчас — порядок объявления в `relationships()`. Ссылка `certificate_delivery_meta` → `certificate_details` в сущностях не описана (колонка-первичный ключ не несёт `references`), поэтому не проверяется: разрешить `references` у `PRIMARY` и сортировать соседей топологически? Та же ссылка делает `delivery` без `detail` невставляемым, а отказывает только база.
+- **Запись: порядок соседних связей.** Сейчас — порядок объявления в `relationships()`. Ссылка `certificate_delivery_meta` → `certificate_details` в сущностях не описана (колонка-первичный ключ не несёт `references`), поэтому не проверяется: разрешить `references` у `PRIMARY` и сортировать соседей топологически? Та же ссылка делает `delivery` без `detail` невставляемым, а отказывает только база.
 - **Запись: ответ и точка входа.** Формат ответа решён (`201` + `Location` + `{data: {type, id}}` у `POST`, `204` у `PATCH` и `DELETE`, без перечитывания), но контроллера и транзакции нет.
-- **Вставка: подготовленные запросы.** `InsertTableWriter` готовит запрос на каждую строку: набор колонок зависит от строки, а `DEFAULT` нельзя передать параметром. Кеш по набору колонок; многострочный `INSERT` с `DEFAULT` в `VALUES` на PostgreSQL.
+- **Запись: подготовленные запросы.** `InsertTableWriter` и `StatementRunner` (изменение, удаление, проверки) готовят запрос на каждую строку: набор колонок зависит от строки, а `DEFAULT` нельзя передать параметром. Кеш по набору колонок; многострочный `INSERT` с `DEFAULT` в `VALUES` на PostgreSQL; один запрос на всех детей связи вместо запроса на ребёнка.
+- **Запись: многие-ко-многим.** Не поддерживается: связь через таблицу связки убрана до необходимости.
 - **Запись: ресурс с двумя родителями.** Ссылка по `lid` на ресурс из другой ветки дерева запрещена (400).
 - **Запись: параметры маршрута.** `POST /certificates/1/domains` работает через `RouteParentNode` плана (родитель проверяется, нет — 404); разбор маршрута не сделан. Цели связей по внешнему ключу не проверяются: несуществующая — ошибка внешнего ключа в базе.
 - **Запись: ошибки базы, типы значений, обязательные атрибуты, конкурентный доступ.** Нарушение `NOT NULL`, уникальности, внешнего ключа — исключение PDO как есть; типы значений атрибутов и обязательные атрибуты при вставке парсер не проверяет; версий строк (ETag) нет.
@@ -1273,6 +1295,35 @@ echo json_encode($document);                                            // 5–6
 
 Отладка: `SelectPlanPrinter::tree($plan)` — дерево плана, `SelectPlanPrinter::queries($plan)` — SQL и параметры каждого запроса, `IteratorBuilder::build()->explain()` — дерево итераторов.
 
+Запись соединяется так же (подробно — [Запись](#запись-insert-update-delete)):
+
+```php
+use Ggs\JsonApiEngine\Executor\Write\WriteNotFoundException;
+use Ggs\JsonApiEngine\Executor\Write\WriterBuilder;
+use Ggs\JsonApiEngine\Parser\InvalidDocumentException;
+use Ggs\JsonApiEngine\Parser\Write\WriteDocumentParser;
+use Ggs\JsonApiEngine\Plan\Write\WritePlanner;
+
+try {
+    $root = new WriteDocumentParser()->update(document: $body, resource: CertificateResource::class, id: $id);   // 1
+} catch (InvalidDocumentException $e) {
+    // $e->status: 400 / 403 / 409, тело — ['errors' => [$e->toError()]]
+}
+
+$plan = new WritePlanner()->plan(resource: CertificateResource::class, roots: [$root]);                          // 2
+$writer = new WriterBuilder(pdo: $pdo, lock: true)->root(plan: $plan, data: [$root]);                            // 3
+
+$pdo->beginTransaction();
+try {
+    $writer->execute();                                                                                          // 4
+    $pdo->commit();                                    // 204 No Content
+} catch (WriteNotFoundException $e) {
+    $pdo->rollBack();                                  // 404, тело — ['errors' => [$e->toError()]]
+}
+```
+
+Отладка записи: `$writer->explain()` — дерево исполнителей; каждый выполненный запрос с параметрами и результатом пишется в `error_log()`. `php example/patch-document.php` печатает дерево операций, план и дерево исполнителей текстом.
+
 ## Разработка
 
 ```bash
@@ -1288,7 +1339,7 @@ php example/patch-document.php                     # запись POST/PATCH/DEL
 php example/insert-plan.php                        # вставка через планировщик: документ → дерево операций → план → дерево исполнителей, ключи
 php example/insert-document.php                    # то же дерево исполнителей, собранное руками
 php example/insert-route.php                       # вложенный маршрут POST /certificates/1/domains: RouteParentNode → RouteParentWriter
-php example/update-document.php                    # старый прототип UPDATE на массивах (заменён записью в src), оставлен как история
+php example/update-document.php                    # PATCH /certificates/{id}: дерево исполнителей изменения, собранное руками; пять сценариев
 php example/db/seed.php [количество сертификатов]  # пересоздать базу примера
 ```
 

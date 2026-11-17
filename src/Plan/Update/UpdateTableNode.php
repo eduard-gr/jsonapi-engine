@@ -7,7 +7,14 @@ namespace Ggs\JsonApiEngine\Plan\Update;
 use Ggs\JsonApiEngine\Model\Entity;
 
 /**
- * Узел плана изменения: одна таблица. Исполнитель — `UpdateTableWriter`.
+ * Узел плана изменения: одна таблица модели ресурса (лист уровня таблиц). Исполнитель —
+ * `Executor\Update\UpdateTableWriter`.
+ *
+ * `key` — колонка, по которой ищется строка: первичный ключ ресурса у главной таблицы, колонка `relation[1]`
+ * соединения у присоединённой. `returning` — колонки, которые нужны правым сторонам соединений (`relation[0]`),
+ * кроме самого `key`.
+ *
+ * Неизменяемый, без состояния.
  */
 final readonly class UpdateTableNode
 {

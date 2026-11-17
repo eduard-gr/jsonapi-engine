@@ -20,7 +20,9 @@ use sad_spirit\pg_builder\SqlBuilderWalker;
 use sad_spirit\pg_builder\Values;
 
 /**
- * Лист дерева вставки: одна строка в одну таблицу. Про JSON:API ничего не знает.
+ * Лист дерева вставки: одна строка в одну таблицу. Про JSON:API ничего не знает. Строит
+ * `Executor\Write\WriterBuilder` по `InsertTableNode`; им же `UpdateOptionalTableWriter` вставляет отсутствующую
+ * строку необязательной части модели.
  *
  * Поток: строка + `$link` → свои колонки → `INSERT INTO <table> (…) VALUES (…) RETURNING <pk>` → ключи: записанные
  * колонки и первичный ключ, по именам колонок сущности (ключам `COLUMNS`).

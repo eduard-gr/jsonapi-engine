@@ -10,7 +10,7 @@ use LogicException;
 /**
  * Соединение таблиц модели при вставке: строка ресурса делится между двумя сторонами; родитель (`parent`, сторона,
  * от которой зависит другая) вставляется первым, ребёнок (`child`) получает колонку связи из его ключей. Строит
- * `WriterBuilder` по `InsertTableJoinNode` из `LeftJoin`/`InnerJoin` модели ресурса.
+ * `Executor\Write\WriterBuilder` по `InsertTableJoinNode` из `LeftJoin`/`InnerJoin` модели ресурса.
  *
  * Поток: строка + `$link` → `parent->push()` → ключи → `child->push(строка, link + [relation[1] => keys[relation[0]]])`
  * → объединённые ключи обеих сторон.

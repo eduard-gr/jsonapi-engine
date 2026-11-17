@@ -5,7 +5,11 @@ declare(strict_types=1);
 namespace Ggs\JsonApiEngine\Parser;
 
 /**
- * Ресурс, заданный параметрами маршрута, не найден. Превращается в документ ошибки JSON:API со статусом 404.
+ * Ресурс, заданный параметрами маршрута, не найден: решение принято при разборе, без запроса в базу. Превращается
+ * в документ ошибки JSON:API со статусом 404. Бросает `Write\WriteDocumentParser::delete()`, когда id из маршрута не
+ * из цифр (такого ресурса быть не может).
+ *
+ * Ресурс, которого не оказалось в базе при записи, — другое исключение: `Executor\Write\WriteNotFoundException`.
  */
 final class ResourceNotFoundException extends \RuntimeException
 {

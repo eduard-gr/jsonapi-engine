@@ -8,8 +8,8 @@ use Ggs\JsonApiEngine\Executor\TableWriter;
 
 /**
  * Необязательная часть модели при вставке (правая сторона `LeftJoin`): пропускает строку в поддерево, только если
- * в ней есть хотя бы одна колонка модели этого поддерева (`TableWriter::columns()`). Строит `WriterBuilder` по
- * `InsertOptionalTableNode`.
+ * в ней есть хотя бы одна колонка модели этого поддерева (`TableWriter::columns()`). Строит
+ * `Executor\Write\WriterBuilder` по `InsertOptionalTableNode`.
  *
  * Поток: строка + `$link` → есть колонки поддерева → `input->push(строка, link)` → его ключи; нет ни одной → ничего
  * не вставляется, ключи пустые (`[]`).
