@@ -2,17 +2,17 @@
 
 declare(strict_types=1);
 
-namespace Ggs\JsonApiEngine\Executor\Insert;
-
-use Ggs\JsonApiEngine\Executor\PushExecutor;
+namespace Ggs\JsonApiEngine\Executor;
 
 /**
- * Узел дерева вставки уровня таблиц: получает строку одного ресурса «колонка модели → значение», вставляет её части
- * в таблицы своего поддерева, возвращает их ключи. Строит `WriterBuilder` по плану `InsertPlanner::tables()` из `model()` ресурса; сверху его вызывает
- * `InsertResourceWriter` (см. PushExecutor).
+ * Контракт узла дерева записи уровня таблиц: получает строку одного ресурса «колонка модели → значение», пишет её
+ * части в таблицы своего поддерева, возвращает их ключи. Общий для вставки (`Executor\Insert\…Table…Writer`) и
+ * изменения (`Executor\Update\…Table…Writer`). Строит `Executor\Write\WriterBuilder` по плану таблиц из `model()`
+ * ресурса (`InsertPlanner::tables()`, `UpdatePlanner::tables()`); сверху его вызывает исполнитель ресурса
+ * (`InsertResourceWriter`, `UpdateResourceWriter`; см. PushExecutor).
  *
  * Поток: строка ресурса + колонки связи (`$link`) → строки в таблицах → ключи «колонка → значение» (записанные
- * колонки и первичные ключи всех вставленных таблиц, слитые в одну карту).
+ * колонки и ключи всех затронутых таблиц, слитые в одну карту); у изменения пусто — строки нет.
  */
 interface TableWriter
 {

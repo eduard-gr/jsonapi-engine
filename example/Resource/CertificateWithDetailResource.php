@@ -8,7 +8,9 @@ use Ggs\JsonApiEngine\Example\Entity\CertificateDetailsEntity;
 use Ggs\JsonApiEngine\Example\Entity\CertificatesEntity;
 use Ggs\JsonApiEngine\Model\LeftJoin;
 use Ggs\JsonApiEngine\Resource;
+use Ggs\JsonApiEngine\Resource\Deletable;
 use Ggs\JsonApiEngine\Resource\Insertable;
+use Ggs\JsonApiEngine\Resource\Updatable;
 
 /**
  * `certificate` из двух таблиц: `LeftJoin(certificates, certificate_details, [id, certificate_id])`; атрибуты деталей
@@ -20,8 +22,8 @@ use Ggs\JsonApiEngine\Resource\Insertable;
  * (планировщиком или руками), строка деталей не вставляется, если ни одной её колонки не прислали. Для SELECT
  * (`serialize()` по `QUERY1`) не предназначен.
  *
- * Можно создавать (`Insertable`), изменять и удалять (`Updatable`, `Deletable` — прототип записи
- * example/patch-document.php).
+ * Можно создавать (`Insertable`), изменять и удалять (`Updatable`, `Deletable`): сценарии записи —
+ * example/patch-document.php.
  */
 final class CertificateWithDetailResource extends Resource implements Insertable, Updatable, Deletable
 {

@@ -4,8 +4,9 @@
  * Прототип UPDATE: дерево исполнителей (push), собранное руками, для `PATCH /certificates/{id}` над
  * `CertificateWithDetailResource` (`LeftJoin(certificates, certificate_details)`). Парсера документа PATCH
  * и планировщика ещё нет: ресурс из документа подаётся в дерево как есть. Весь прототип — в этом файле, `src/`
- * не меняется; из `src/` взяты контракты `PushExecutor` и `TableWriter`, `InsertTableWriter` (вставка
- * отсутствующей необязательной части модели) и `ResourceNotFoundException` (404).
+ * не меняется; из `src/` взяты контракт `TableWriter`, `InsertTableWriter` (вставка отсутствующей необязательной
+ * части модели) и `ResourceNotFoundException` (404). Прототип заменён записью в `src/` (`Parser\Write`,
+ * `Plan\Write`, `Executor\Write`, см. example/patch-document.php) и оставлен как история.
  *
  *     php example/update-document.php            # дерево (explain), по каждому сценарию ключи и строка после UPDATE;
  *                                                # SQL каждого запроса — в stderr
@@ -52,8 +53,7 @@ use Ggs\JsonApiEngine\Example\Entity\CertificateDetailsEntity;
 use Ggs\JsonApiEngine\Example\Entity\CertificatesEntity;
 use Ggs\JsonApiEngine\Example\Resource\CertificateWithDetailResource;
 use Ggs\JsonApiEngine\Executor\Insert\InsertTableWriter;
-use Ggs\JsonApiEngine\Executor\Insert\TableWriter;
-use Ggs\JsonApiEngine\Executor\PushExecutor;
+use Ggs\JsonApiEngine\Executor\TableWriter;
 use Ggs\JsonApiEngine\Model\Entity;
 use Ggs\JsonApiEngine\Parser\ResourceNotFoundException;
 use Ggs\JsonApiEngine\Resource;
@@ -79,6 +79,26 @@ use sad_spirit\pg_builder\Update;
 
 require __DIR__ . '/../vendor/autoload.php';
 require __DIR__ . '/db/connection.php';
+
+/**
+ * Контракт исполнителей уровня ресурсов этого прототипа: ресурс документа массивом + колонки связи → ключи. Таким был
+ * `Executor\PushExecutor` из `src/`, пока запись не перешла на дерево операций (`push(WriteOperation, link)`).
+ *
+ * @temporary Только для этого прототипа: он заменён записью в `src/` (см. example/patch-document.php).
+ */
+interface PushExecutor
+{
+    /**
+     * @param array<string, mixed> $link
+     * @return array<string, mixed>
+     */
+    public function push(array $resource, array $link = []): array;
+
+    /**
+     * @return array<string, mixed>
+     */
+    public function explain(): array;
+}
 
 /**
  * Корень дерева обновления: отправляет каждый ресурс документа в дерево и собирает их ключи. Сам не PushExecutor:

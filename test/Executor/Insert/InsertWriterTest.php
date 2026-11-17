@@ -10,15 +10,21 @@ use Ggs\JsonApiEngine\Example\Resource\DeliveryResource;
 use Ggs\JsonApiEngine\Example\Resource\DetailResource;
 use Ggs\JsonApiEngine\Example\Resource\DomainResource;
 use Ggs\JsonApiEngine\Example\Resource\ProviderResource;
-use Ggs\JsonApiEngine\Executor\Insert\InsertJoinWriter;
 use Ggs\JsonApiEngine\Executor\Insert\InsertOptionalTableWriter;
 use Ggs\JsonApiEngine\Executor\Insert\InsertResourceWriter;
-use Ggs\JsonApiEngine\Executor\Insert\InsertRootWriter;
-use Ggs\JsonApiEngine\Executor\Insert\InsertRouteLinkWriter;
 use Ggs\JsonApiEngine\Executor\Insert\InsertTableJoinWriter;
 use Ggs\JsonApiEngine\Executor\Insert\InsertTableWriter;
-use Ggs\JsonApiEngine\Executor\Insert\TableTreeBuilder;
-use Ggs\JsonApiEngine\Parser\Insert\DocumentParser;
+use Ggs\JsonApiEngine\Executor\PushExecutor;
+use Ggs\JsonApiEngine\Executor\TableWriter;
+use Ggs\JsonApiEngine\Executor\Write\WriteJoinWriter;
+use Ggs\JsonApiEngine\Executor\Write\WriteOperationWriter;
+use Ggs\JsonApiEngine\Executor\Write\WriteRootWriter;
+use Ggs\JsonApiEngine\Executor\Write\WriterBuilder;
+use Ggs\JsonApiEngine\Parser\Write\KeepOperation;
+use Ggs\JsonApiEngine\Parser\Write\PersistentIdentity;
+use Ggs\JsonApiEngine\Parser\Write\WriteDocumentParser;
+use Ggs\JsonApiEngine\Plan\Insert\InsertPlanner;
+use Ggs\JsonApiEngine\Plan\Write\WritePlanner;
 use Ggs\JsonApiEngine\Resource;
 use LogicException;
 use PDO;
@@ -27,12 +33,14 @@ use PHPUnit\Framework\TestCase;
 require_once __DIR__ . '/../../../example/db/connection.php';
 
 /**
- * Дерево вставки на SQLite базе example/db (каждый тест — в транзакции с откатом): связи между ресурсами получают
- * ключ владельца, модель из двух таблиц разворачивается в InsertTableJoinWriter, пустая LEFT-сторона пропускается,
- * колонка связи из маршрута вложенного ресурса доходит до каждого корня, ресурс без Insertable не принимается.
+ * Исполнители вставки на SQLite базе example/db (каждый тест — в транзакции с откатом): дерево, собранное руками,
+ * совпадает с деревом по плану и даёт связанным ресурсам ключ владельца; модель из двух таблиц разворачивается в
+ * InsertTableJoinWriter, пустая LEFT-сторона пропускается; ресурс без Insertable и чужая операция не принимаются.
  */
 final class InsertWriterTest extends TestCase
 {
+    private const array RELATION = ['id', 'certificate_id'];
+
     private PDO $pdo;
 
     #[\Override]
@@ -50,7 +58,7 @@ final class InsertWriterTest extends TestCase
 
     public function testRelatedResourcesGetOwnerKey(): void
     {
-        $keys = $this->insert(resource: CertificateResource::class, document: [
+        $roots = new WriteDocumentParser()->insert(resource: CertificateResource::class, document: [
             'data' => [
                 'type' => 'certificate',
                 'lid' => 'c1',
@@ -68,22 +76,33 @@ final class InsertWriterTest extends TestCase
                 ['type' => 'domain', 'lid' => 'd1', 'attributes' => ['domain_name' => 't1.test']],
                 ['type' => 'domain', 'lid' => 'd2', 'attributes' => ['domain_name' => 't2.test']],
             ],
-        ], tree: fn(): InsertJoinWriter => new InsertJoinWriter(
+        ]);
+        // Дерево руками: связи владельца — левый глубокий список в порядке объявления, владелец в самом низу
+        $tree = new WriteJoinWriter(
             name: 'domains',
-            relation: ['id', 'certificate_id'],
-            parent: new InsertJoinWriter(
+            relation: self::RELATION,
+            parent: new WriteJoinWriter(
                 name: 'delivery',
-                relation: ['id', 'certificate_id'],
-                parent: new InsertJoinWriter(
+                relation: self::RELATION,
+                parent: new WriteJoinWriter(
                     name: 'detail',
-                    relation: ['id', 'certificate_id'],
-                    parent: $this->writer(CertificateResource::class),
-                    child: $this->writer(DetailResource::class),
+                    relation: self::RELATION,
+                    parent: $this->place(CertificateResource::class),
+                    child: $this->place(DetailResource::class),
                 ),
-                child: $this->writer(DeliveryResource::class),
+                child: $this->place(DeliveryResource::class),
             ),
-            child: $this->writer(DomainResource::class),
-        ));
+            child: $this->place(DomainResource::class),
+        );
+        $plan = new WritePlanner()->plan(resource: CertificateResource::class, roots: $roots);
+        self::assertSame(
+            $tree->explain(),
+            new WriterBuilder(pdo: $this->pdo, lock: false)->build(plan: $plan->input)->explain(),
+        );
+
+        // InsertTableWriter пишет каждый INSERT в error_log(): PHPUnit перехватывает его и не печатает
+        $this->expectErrorLog();
+        $keys = new WriteRootWriter(root: $tree, data: $roots, route: null)->execute();
 
         self::assertCount(1, $keys);
         $id = $keys[0]['id'];
@@ -108,7 +127,7 @@ final class InsertWriterTest extends TestCase
 
     public function testModelOfTwoTablesSkipsEmptyLeftSide(): void
     {
-        $keys = $this->insert(resource: CertificateWithDetailResource::class, document: ['data' => [
+        $roots = new WriteDocumentParser()->insert(resource: CertificateWithDetailResource::class, document: ['data' => [
             [
                 'type' => 'certificate',
                 'lid' => 'c1',
@@ -121,7 +140,13 @@ final class InsertWriterTest extends TestCase
                 'attributes' => ['code' => 'T-3', 'nominal' => '2.00'],
                 'relationships' => ['provider' => ['data' => ['type' => 'provider', 'id' => '1']]],
             ],
-        ]], tree: fn(): InsertResourceWriter => $this->writer(CertificateWithDetailResource::class));
+        ]]);
+        $this->expectErrorLog();
+        $keys = new WriteRootWriter(
+            root: $this->place(CertificateWithDetailResource::class),
+            data: $roots,
+            route: null,
+        )->execute();
 
         [$first, $second] = [$keys[0]['id'], $keys[1]['id']];
         self::assertSame($first, $keys[0]['certificate_id']);
@@ -132,25 +157,9 @@ final class InsertWriterTest extends TestCase
         );
     }
 
-    public function testRouteLinkGoesToEveryRoot(): void
-    {
-        // POST /certificates/3/domains: certificate_id — из маршрута по связи родителя, не из документа
-        $relation = CertificateResource::relationship(CertificateResource::DOMAINS)->relation;
-        $keys = $this->insert(resource: DomainResource::class, document: ['data' => [
-            ['type' => 'domain', 'lid' => 'd1', 'attributes' => ['domain_name' => 'r1.test']],
-            ['type' => 'domain', 'lid' => 'd2', 'attributes' => ['domain_name' => 'r2.test']],
-        ]], tree: fn(): InsertResourceWriter => $this->writer(DomainResource::class), link: [$relation[1] => 3]);
-
-        self::assertSame([3, 3], array_column($keys, 'certificate_id'));
-        self::assertSame(
-            [['certificate_id' => 3], ['certificate_id' => 3]],
-            $this->rows("select certificate_id from domains where domain_name in ('r1.test', 'r2.test') order by id"),
-        );
-    }
-
     public function testTableTreeFollowsModel(): void
     {
-        $tree = new TableTreeBuilder(pdo: $this->pdo)->build(CertificateWithDetailResource::class)->explain();
+        $tree = $this->tables(CertificateWithDetailResource::class)->explain();
 
         self::assertSame(InsertTableJoinWriter::class, $tree['node']);
         self::assertSame(['id', 'certificate_id'], $tree['relation']);
@@ -165,39 +174,44 @@ final class InsertWriterTest extends TestCase
     public function testResourceWithoutInsertableIsRejected(): void
     {
         $this->expectException(LogicException::class);
-        new TableTreeBuilder(pdo: $this->pdo)->build(ProviderResource::class);
+        new InsertResourceWriter(
+            resource: ProviderResource::class,
+            input: $this->tables(DomainResource::class),
+        );
+    }
+
+    public function testOtherOperationIsRejected(): void
+    {
+        $this->expectException(LogicException::class);
+        new InsertResourceWriter(
+            resource: DomainResource::class,
+            input: $this->tables(DomainResource::class),
+        )->push(new KeepOperation(resource: DomainResource::class, identity: new PersistentIdentity(id: 1)));
     }
 
     /**
-     * @param class-string<Resource>                 $resource
-     * @param callable(): \Ggs\JsonApiEngine\Executor\PushExecutor $tree
-     * @param array<string, mixed>                   $link колонки связи из маршрута, всем корням
-     * @return list<array<string, mixed>>
+     * Место ресурса с одной ветвью вставки.
+     *
+     * @param class-string<Resource> $resource
      */
-    private function insert(string $resource, array $document, callable $tree, array $link = []): array
+    private function place(string $resource): PushExecutor
     {
-        // InsertTableWriter пишет каждый INSERT в error_log(): PHPUnit перехватывает его и не печатает
-        $this->expectErrorLog();
-
-        $tree = $link === []
-            ? $tree()
-            : new InsertRouteLinkWriter(
-                link: $link,
-                input: $tree(),
-            );
-
-        return new InsertRootWriter(
-            root: $tree,
-            data: new DocumentParser()->parse(document: $document, resource: $resource),
-        )->execute();
+        return new WriteOperationWriter(
+            resource: $resource,
+            add: new InsertResourceWriter(resource: $resource, input: $this->tables($resource)),
+            update: null,
+            remove: null,
+        );
     }
 
     /**
      * @param class-string<Resource> $resource
      */
-    private function writer(string $resource): InsertResourceWriter
+    private function tables(string $resource): TableWriter
     {
-        return new InsertResourceWriter(resource: $resource, input: new TableTreeBuilder(pdo: $this->pdo)->build($resource));
+        return new WriterBuilder(pdo: $this->pdo, lock: false)->insertTables(
+            plan: new InsertPlanner()->tables(resource: $resource),
+        );
     }
 
     /**

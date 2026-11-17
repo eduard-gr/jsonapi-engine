@@ -8,13 +8,15 @@ use Ggs\JsonApiEngine\Document\ResourceRecord;
 use Ggs\JsonApiEngine\Example\Entity\CertificateDeliveryMetaEntity;
 use Ggs\JsonApiEngine\Operator;
 use Ggs\JsonApiEngine\Resource;
+use Ggs\JsonApiEngine\Resource\Deletable;
 use Ggs\JsonApiEngine\Resource\Insertable;
+use Ggs\JsonApiEngine\Resource\Updatable;
 
 /**
  * `delivery`: таблица `certificate_delivery_meta`, идентификатор — её первичный ключ `certificate_id`.
  *
  * Можно создавать (`Insertable`): вставку см. `Executor\Insert\InsertResourceWriter`; изменять и удалять
- * (`Updatable`, `Deletable` — прототип записи example/patch-document.php).
+ * (`Updatable`, `Deletable`).
  */
 final class DeliveryResource extends Resource implements Insertable, Updatable, Deletable
 {

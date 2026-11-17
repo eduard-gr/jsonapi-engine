@@ -9,13 +9,15 @@ use Ggs\JsonApiEngine\Example\Entity\DomainLogsEntity;
 use Ggs\JsonApiEngine\Example\Entity\DomainsEntity;
 use Ggs\JsonApiEngine\Resource\OneToMany;
 use Ggs\JsonApiEngine\Resource;
+use Ggs\JsonApiEngine\Resource\Deletable;
 use Ggs\JsonApiEngine\Resource\Insertable;
+use Ggs\JsonApiEngine\Resource\Updatable;
 
 /**
  * `domain`: таблица `domains` (QUERY2). Связь `logs` (1:N).
  *
  * Можно создавать (`Insertable`): вставку см. `Executor\Insert\InsertResourceWriter`; изменять и удалять
- * (`Updatable`, `Deletable` — прототип записи example/patch-document.php).
+ * (`Updatable`, `Deletable`).
  */
 final class DomainResource extends Resource implements Insertable, Updatable, Deletable
 {

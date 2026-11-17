@@ -2,18 +2,17 @@
 
 /**
  * Вставка по вложенному маршруту: `POST /certificates/1/domains` — новые домены существующего сертификата 1.
- * Документ → `DocumentParser` → `InsertPlanner` (план по форме документа) → `WriterBuilder::root()` с колонками связи
- * из маршрута → строки в SQLite базе example/db.
+ * Документ → `WriteDocumentParser::insert()` → `WritePlanner` (план с родителем маршрута) → `WriterBuilder::root()` с
+ * id из маршрута → строки в SQLite базе example/db.
  *
  *     php example/insert-route.php            # дерево исполнителей (explain) и ключи корней; SQL каждого INSERT — в stderr
  *     php example/insert-route.php 2>sql.log  # SQL отдельно
  *
- * Сертификат — не в документе, а в маршруте: `InsertPlanner::routeLink()` берёт связь родителя
- * (`CertificateResource::DOMAINS`, `relation` `[id, certificate_id]`) и превращает id из маршрута в колонки связи
- * `['certificate_id' => 1]`. Это значение, а не форма плана, поэтому в плане его нет: `WriterBuilder::root()` ставит
- * над деревом узел `InsertRouteLinkWriter`, который добавляет `certificate_id` к каждому корню. Своей связи
- * `certificate` у `DomainResource` нет и не нужно. Существование сертификата не проверяется: несуществующий id —
- * ошибка внешнего ключа в базе.
+ * Сертификат — не в документе, а в маршруте: `WritePlanner::plan()` получает родителя и его связь
+ * (`CertificateResource::DOMAINS`, `relation` `[id, certificate_id]`) и кладёт в план `RouteParentNode`. Сам id —
+ * значение, а не форма плана, поэтому в плане его нет: его получает `WriterBuilder::root()`. `RouteParentWriter` один
+ * раз, до первой вставки, проверяет, что сертификат есть (иначе `WriteNotFoundException`, 404), и даёт каждому корню
+ * колонку связи `certificate_id = 1`. Своей связи `certificate` у `DomainResource` нет и не нужно.
  *
  * Разбор маршрута — забота вызывающего (роутера); здесь id просто задан. Вставка идёт в транзакции, которая в конце
  * откатывается: база не меняется.
@@ -23,9 +22,9 @@ declare(strict_types=1);
 
 use Ggs\JsonApiEngine\Example\Resource\CertificateResource;
 use Ggs\JsonApiEngine\Example\Resource\DomainResource;
-use Ggs\JsonApiEngine\Executor\Insert\WriterBuilder;
-use Ggs\JsonApiEngine\Parser\Insert\DocumentParser;
-use Ggs\JsonApiEngine\Plan\Insert\InsertPlanner;
+use Ggs\JsonApiEngine\Executor\Write\WriterBuilder;
+use Ggs\JsonApiEngine\Parser\Write\WriteDocumentParser;
+use Ggs\JsonApiEngine\Plan\Write\WritePlanner;
 
 require __DIR__ . '/../vendor/autoload.php';
 require __DIR__ . '/db/connection.php';
@@ -41,19 +40,19 @@ const DOCUMENT = [
 ];
 
 $pdo = getPDO();
-$planner = new InsertPlanner();
 
-$data = new DocumentParser()->parse(document: DOCUMENT, resource: DomainResource::class);
-$plan = $planner->plan(resource: DomainResource::class, data: $data);
-$link = $planner->routeLink(
+$roots = new WriteDocumentParser()->insert(document: DOCUMENT, resource: DomainResource::class);
+$plan = new WritePlanner()->plan(
+    resource: DomainResource::class,
+    roots: $roots,
     parent: CertificateResource::class,
     relationship: CertificateResource::DOMAINS,
-    id: CERTIFICATE_ID,
 );
-$insert = new WriterBuilder(pdo: $pdo)->root(
+// lock — FOR KEY SHARE в проверке родителя: в PostgreSQL true; SQLite примера такой конструкции не знает
+$insert = new WriterBuilder(pdo: $pdo, lock: false)->root(
     plan: $plan,
-    data: $data,
-    link: $link,
+    data: $roots,
+    route_id: CERTIFICATE_ID,
 );
 
 echo json_encode($insert->explain(), JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES), "\n\n";

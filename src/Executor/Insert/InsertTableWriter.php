@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Ggs\JsonApiEngine\Executor\Insert;
 
+use Ggs\JsonApiEngine\Executor\TableWriter;
 use Ggs\JsonApiEngine\Model\Entity;
 use PDO;
 use sad_spirit\pg_builder\Insert;

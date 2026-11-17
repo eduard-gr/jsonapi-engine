@@ -1,20 +1,22 @@
 <?php
 
 /**
- * Вставка с деревом исполнителей, собранным руками: документ → `Parser\Insert\DocumentParser` (вложенное дерево
- * новых ресурсов) → дерево вставки (`Executor\Insert\…Writer`, push) → строки в таблицах SQLite базы example/db.
- * То же дерево по плану строит `InsertPlanner` + `WriterBuilder` — example/insert-plan.php.
+ * Вставка с деревом исполнителей, собранным руками: документ → `Parser\Write\WriteDocumentParser::insert()` (дерево
+ * операций) → дерево исполнителей (`…Writer`, push) → строки в таблицах SQLite базы example/db. То же дерево по плану
+ * строит `WritePlanner` + `WriterBuilder` — example/insert-plan.php.
  *
  *     php example/insert-document.php            # дерево (explain) и ключи корня; SQL каждого INSERT — в stderr
  *     php example/insert-document.php 2>sql.log  # SQL отдельно
  *
  * `POST /certificates` для `CertificateWithDetailResource`: сертификат с деталями-атрибутами, `delivery` и три домена.
  * Руками собраны оба уровня дерева:
- *  - уровень ресурсов — левый глубокий список `InsertJoinWriter` (родитель — владелец связи, `parent`; новые дети —
- *    `child`): сначала `delivery`, потом `domains`;
+ *  - уровень ресурсов — левый глубокий список `WriteJoinWriter` (родитель — владелец связи, `parent`; новые дети —
+ *    `child`): сначала `delivery`, потом `domains`; место каждого ресурса — `WriteOperationWriter` с одной ветвью
+ *    `add` (`InsertResourceWriter`): в документе вставки других операций нет;
  *  - уровень таблиц сертификата — `InsertTableJoinWriter`: родитель `certificates`, ребёнок `certificate_details`,
  *    обёрнутый в `InsertOptionalTableWriter` (правая сторона `LeftJoin`: без колонок деталей она пропускается).
- *    Для ресурсов из одной таблицы поддерево таблиц строит `TableTreeBuilder` из `model()`.
+ *    Для ресурсов из одной таблицы поддерево таблиц строит `WriterBuilder::insertTables()` по
+ *    `InsertPlanner::tables()` из `model()`.
  * `delivery` вставляется после деталей: `certificate_delivery_meta.certificate_id` ссылается на `certificate_details`
  * (SQLite с `foreign_keys = ON` иначе отказывает). Вставка идёт в транзакции, которая в конце откатывается: база
  * не меняется.
@@ -27,14 +29,16 @@ use Ggs\JsonApiEngine\Example\Entity\CertificatesEntity;
 use Ggs\JsonApiEngine\Example\Resource\CertificateWithDetailResource;
 use Ggs\JsonApiEngine\Example\Resource\DeliveryResource;
 use Ggs\JsonApiEngine\Example\Resource\DomainResource;
-use Ggs\JsonApiEngine\Executor\Insert\InsertJoinWriter;
 use Ggs\JsonApiEngine\Executor\Insert\InsertOptionalTableWriter;
 use Ggs\JsonApiEngine\Executor\Insert\InsertResourceWriter;
-use Ggs\JsonApiEngine\Executor\Insert\InsertRootWriter;
 use Ggs\JsonApiEngine\Executor\Insert\InsertTableJoinWriter;
 use Ggs\JsonApiEngine\Executor\Insert\InsertTableWriter;
-use Ggs\JsonApiEngine\Executor\Insert\TableTreeBuilder;
-use Ggs\JsonApiEngine\Parser\Insert\DocumentParser;
+use Ggs\JsonApiEngine\Executor\Write\WriteJoinWriter;
+use Ggs\JsonApiEngine\Executor\Write\WriteOperationWriter;
+use Ggs\JsonApiEngine\Executor\Write\WriteRootWriter;
+use Ggs\JsonApiEngine\Executor\Write\WriterBuilder;
+use Ggs\JsonApiEngine\Parser\Write\WriteDocumentParser;
+use Ggs\JsonApiEngine\Plan\Insert\InsertPlanner;
 
 require __DIR__ . '/../vendor/autoload.php';
 require __DIR__ . '/db/connection.php';
@@ -106,30 +110,50 @@ $certificate_tables = new InsertTableJoinWriter(
 );
 
 // Ресурсы из одной таблицы: поддерево таблиц — по model() ресурса
-$tables = new TableTreeBuilder(pdo: $pdo);
+$builder = new WriterBuilder(
+    pdo: $pdo,
+    lock: false,
+);
+$planner = new InsertPlanner();
 
-$insert = new InsertRootWriter(
-    root: new InsertJoinWriter(
+$insert = new WriteRootWriter(
+    root: new WriteJoinWriter(
         name: CertificateWithDetailResource::DOMAINS,
         relation: CertificateWithDetailResource::relationship(CertificateWithDetailResource::DOMAINS)->relation,
-        parent: new InsertJoinWriter(
+        parent: new WriteJoinWriter(
             name: CertificateWithDetailResource::DELIVERY,
             relation: CertificateWithDetailResource::relationship(CertificateWithDetailResource::DELIVERY)->relation,
-            parent: new InsertResourceWriter(
+            parent: new WriteOperationWriter(
                 resource: CertificateWithDetailResource::class,
-                input: $certificate_tables,
+                add: new InsertResourceWriter(
+                    resource: CertificateWithDetailResource::class,
+                    input: $certificate_tables,
+                ),
+                update: null,
+                remove: null,
             ),
-            child: new InsertResourceWriter(
+            child: new WriteOperationWriter(
                 resource: DeliveryResource::class,
-                input: $tables->build(DeliveryResource::class),
+                add: new InsertResourceWriter(
+                    resource: DeliveryResource::class,
+                    input: $builder->insertTables(plan: $planner->tables(resource: DeliveryResource::class)),
+                ),
+                update: null,
+                remove: null,
             ),
         ),
-        child: new InsertResourceWriter(
+        child: new WriteOperationWriter(
             resource: DomainResource::class,
-            input: $tables->build(DomainResource::class),
+            add: new InsertResourceWriter(
+                resource: DomainResource::class,
+                input: $builder->insertTables(plan: $planner->tables(resource: DomainResource::class)),
+            ),
+            update: null,
+            remove: null,
         ),
     ),
-    data: new DocumentParser()->parse(document: DOCUMENT, resource: CertificateWithDetailResource::class),
+    data: new WriteDocumentParser()->insert(document: DOCUMENT, resource: CertificateWithDetailResource::class),
+    route: null,
 );
 
 echo json_encode($insert->explain(), JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES), "\n\n";

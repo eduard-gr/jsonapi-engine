@@ -1,9 +1,9 @@
 <?php
 
 /**
- * Вставка через планировщик: документ → `DocumentParser` → `InsertPlanner` (план по форме документа) →
- * `WriterBuilder` (исполнители) → строки в SQLite базе example/db. Ручная сборка того же дерева —
- * example/insert-document.php.
+ * Вставка через планировщик: документ → `WriteDocumentParser::insert()` (дерево операций) → `WritePlanner` (план по
+ * форме дерева операций) → `WriterBuilder` (исполнители) → строки в SQLite базе example/db. Ручная сборка того же
+ * дерева — example/insert-document.php; тот же конвейер для PATCH и DELETE — example/patch-document.php.
  *
  *     php example/insert-plan.php             # дерево исполнителей (explain) и ключи корня; SQL каждого INSERT — в stderr
  *     php example/insert-plan.php 2>sql.log   # SQL отдельно
@@ -11,7 +11,8 @@
  * `POST /certificates` для `CertificateWithDetailResource`: детали (`buyer_email`, `recipient_name`) — атрибуты
  * сертификата из второй таблицы модели (`LeftJoin(certificates, certificate_details)`), плюс `delivery` и два домена.
  * Планировщик сам строит:
- *  - уровень ресурсов — цепочку связей в порядке объявления (`delivery`, `domains`);
+ *  - уровень ресурсов — цепочку связей `WriteJoinNode` в порядке объявления (`delivery`, `domains`), у каждого места
+ *    `WriteOperationNode` с одной ветвью `add`;
  *  - уровень таблиц сертификата — `InsertTableJoinNode(parent: certificates, child: InsertOptionalTableNode(
  *    certificate_details))`: детали — правая сторона `LeftJoin`, необязательная часть модели. Без атрибутов деталей
  *    строка `certificate_details` не вставилась бы, но тогда упала бы и `delivery`: `certificate_delivery_meta`
@@ -22,9 +23,9 @@
 declare(strict_types=1);
 
 use Ggs\JsonApiEngine\Example\Resource\CertificateWithDetailResource;
-use Ggs\JsonApiEngine\Executor\Insert\WriterBuilder;
-use Ggs\JsonApiEngine\Parser\Insert\DocumentParser;
-use Ggs\JsonApiEngine\Plan\Insert\InsertPlanner;
+use Ggs\JsonApiEngine\Executor\Write\WriterBuilder;
+use Ggs\JsonApiEngine\Parser\Write\WriteDocumentParser;
+use Ggs\JsonApiEngine\Plan\Write\WritePlanner;
 
 require __DIR__ . '/../vendor/autoload.php';
 require __DIR__ . '/db/connection.php';
@@ -54,9 +55,10 @@ const DOCUMENT = [
 
 $pdo = getPDO();
 
-$data = new DocumentParser()->parse(document: DOCUMENT, resource: CertificateWithDetailResource::class);
-$plan = new InsertPlanner()->plan(resource: CertificateWithDetailResource::class, data: $data);
-$insert = new WriterBuilder(pdo: $pdo)->root(plan: $plan, data: $data);
+$roots = new WriteDocumentParser()->insert(document: DOCUMENT, resource: CertificateWithDetailResource::class);
+$plan = new WritePlanner()->plan(resource: CertificateWithDetailResource::class, roots: $roots);
+// lock — FOR KEY SHARE в проверках существования: в PostgreSQL true; SQLite примера такой конструкции не знает
+$insert = new WriterBuilder(pdo: $pdo, lock: false)->root(plan: $plan, data: $roots);
 
 echo json_encode($insert->explain(), JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES), "\n\n";
 

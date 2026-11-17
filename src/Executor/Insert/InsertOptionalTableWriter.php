@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Ggs\JsonApiEngine\Executor\Insert;
 
+use Ggs\JsonApiEngine\Executor\TableWriter;
+
 /**
  * Необязательная часть модели при вставке (правая сторона `LeftJoin`): пропускает строку в поддерево, только если
  * в ней есть хотя бы одна колонка модели этого поддерева (`TableWriter::columns()`). Строит `WriterBuilder` по

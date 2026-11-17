@@ -9,10 +9,11 @@ PHP-библиотека, реализующая JSON API.
 | Операция | Статус         |
 |----------|----------------|
 | `select` | В разработке   |
-| `insert` | В разработке: парсер документа, планировщик, исполнитель; нет ответа и точки входа |
-| `update` | Запланировано  |
+| `insert` | В разработке: парсер документа, планировщик, исполнители; нет ответа и точки входа |
+| `update` | В разработке: тот же конвейер записи (`PATCH`), со связями по владению |
+| `delete` | В разработке: тот же конвейер записи (`DELETE`), зависимое удаляет каскад базы |
 
-Основная разработка — `select`; `insert` перенесён из прототипа (см. [Вставка](#вставка-insert)).
+Основная разработка — `select`; запись (`insert`, `update`, `delete`) перенесена из прототипа (см. [Запись](#запись-insert-update-delete)).
 
 ## Состояние
 
@@ -28,7 +29,7 @@ PHP-библиотека, реализующая JSON API.
 | 5. Выполнение (итераторы Volcano), сериализация | `src/Executor/Select/` | готово |
 | 6. Документ JSON:API | `src/Document/` | готово |
 | Точка входа библиотеки, транзакция, пагинация | — | нет; весь путь собирает контроллер примера `example/Controller/CertificatesController` |
-| Вставка: документ → дерево новых ресурсов → план → дерево вставки | `Parser\Insert\DocumentParser`, `Plan\Insert\`, `Executor\Insert\WriterBuilder`, `Executor\…Writer`, `Resource\Insertable` | парсер документа, планировщик и исполнитель готовы; нет ответа и контроллера `POST` |
+| Запись (`POST`, `PATCH`, `DELETE`): документ → дерево операций → план → дерево исполнителей | `Parser\Write\`, `Plan\Write\` (+ `Plan\Insert\`, `Update\`, `Delete\`), `Executor\Write\` (+ `Executor\Insert\`, `Update\`, `Delete\`), `Resource\Insertable`/`Updatable`/`Deletable` | парсер, планировщик и исполнители готовы; нет ответа и контроллера, целей внешних ключей, многих-ко-многим |
 
 Проверено на SQLite и PDO (`example/db`): документ по плану для запроса примера совпадает с эталоном `test/Fixture/document.json`. Целевая СУБД — PostgreSQL; против неё пока ничего не проверяется.
 
@@ -356,7 +357,7 @@ sort=-created_at,provider.name,domains.domain_name
 
 ### 2. Планирование
 
-План (`src/Plan`, по операторам: `Plan/Select/`, `Plan/Insert/`; перенесено из прототипа `../php-tests/src/test24.php`) отделён от выполнения (`src/Executor`; как и планировщики, по операторам: итераторы выборки — `Executor/Select/`, исполнители вставки — `Executor/Insert/`): план — неизменяемые узлы без состояния, которые строит и переписывает планировщик; итераторы — состояние одного выполнения. План можно выполнять сколько угодно раз, дерево итераторов — один. `Executor` зависит от `Plan`, но не наоборот.
+План (`src/Plan`, по операторам: `Plan/Select/`, `Plan/Insert/`, `Plan/Update/`, `Plan/Delete/`, общее для записи — `Plan/Write/`; выборка перенесена из прототипа `../php-tests/src/test24.php`) отделён от выполнения (`src/Executor`; как и планировщики, по операторам: итераторы выборки — `Executor/Select/`, исполнители записи — `Executor/Write/`, `Insert/`, `Update/`, `Delete/`): план — неизменяемые узлы без состояния, которые строит и переписывает планировщик; итераторы — состояние одного выполнения. План можно выполнять сколько угодно раз, дерево итераторов — один. `Executor` зависит от `Plan`, но не наоборот.
 
 Как устроены шаги и почему план без модели стоимости — [Модель оптимизатора](#модель-оптимизатора).
 
@@ -852,60 +853,99 @@ echo json_encode($flow->explain(), JSON_PRETTY_PRINT);
 
 Пустая связь «к одному» — `"data": null`, «ко многим» — `"data": []`: так клиент отличает пустую связь от незагруженной.
 
-## Вставка (`insert`)
+## Запись (`insert`, `update`, `delete`)
 
-Путь: тело `POST` (документ JSON:API) → `Parser\Insert\DocumentParser` → вложенное дерево новых ресурсов → `Plan\Insert\InsertPlanner` (план) → `Executor\Insert\WriterBuilder` → дерево вставки (push) → строки в таблицах. Примеры — `example/insert-plan.php` (через планировщик), `example/insert-document.php` (то же дерево руками) и `example/insert-route.php` (вложенный маршрут, `InsertRouteLinkWriter`), тесты — `test/Parser/Insert/DocumentParserTest.php`, `test/Plan/Insert/InsertPlannerTest.php`, `test/Executor/Insert/InsertWriterTest.php`.
+Один конвейер для `POST`, `PATCH` и `DELETE`: документ JSON:API → `Parser\Write\WriteDocumentParser` → дерево операций → `Plan\Write\WritePlanner` (план) → `Executor\Write\WriterBuilder` → дерево исполнителей (push) → строки в таблицах. Примеры — `example/patch-document.php` (девять сценариев: все три запроса, вложенный маршрут, замена связей), `example/insert-plan.php`, `example/insert-document.php` (дерево руками) и `example/insert-route.php`; пошаговый разбор `PATCH` с диаграммами — `example/patch-document.md`. Тесты — `test/Parser/Write/`, `test/Plan/Write/`, `test/Plan/Insert/`, `test/Plan/Update/`, `test/Executor/Write/`, `test/Executor/Insert/`.
 
 ```php
-$data = (new DocumentParser())->parse(document: $body, resource: CertificateResource::class);   // 400
-$plan = (new InsertPlanner())->plan(resource: CertificateResource::class, data: $data);
+$parser = new WriteDocumentParser();
+$roots = $parser->insert(document: $body, resource: CertificateResource::class);              // POST: список корней
+$roots = [$parser->update(document: $body, resource: CertificateResource::class, id: $id)];   // PATCH
+$roots = [$parser->delete(resource: CertificateResource::class, id: $id)];                    // DELETE
+// InvalidDocumentException: 400 / 403 / 409 с JSON Pointer, до первого запроса в базу
+
+$plan = new WritePlanner()->plan(resource: CertificateResource::class, roots: $roots);
 $pdo->beginTransaction();
-$keys = (new WriterBuilder(pdo: $pdo))->root(plan: $plan, data: $data)->execute();       // ключи корней
-$pdo->commit();
+$keys = new WriterBuilder(pdo: $pdo, lock: true)->root(plan: $plan, data: $roots)->execute();  // ключи корней
+$pdo->commit();                                    // WriteNotFoundException (404) — откатить
 ```
 
-**Что можно создавать — решает ресурс.** Маркерный интерфейс `Resource\Insertable` (потом `Updatable`, `Deletable`; чтение — свойство любого ресурса). Без него ресурс нельзя создать ни корнем, ни новым ребёнком, но сослаться на существующую запись `{type, id}` можно (`provider` у сертификата). У сущностей таких флагов нет; запрет писать колонку — `mode` READ атрибута. Ограничения точки входа или роли — будущая схема.
+Ответ: `POST` одного ресурса — `201 Created` + `Location` + `{data: {type, id}}`, списка — `201` без `Location`, `data` — идентификаторы в порядке запроса; `PATCH` и `DELETE` — `204 No Content`. Документ после записи не перечитывается: свежие данные клиент берёт через `GET`. Ответ, контроллер и транзакция — забота вызывающего.
 
-**Входной документ.** Новые связанные ресурсы передаются в `included` (нестандартный sideposting), ссылки на них — через `lid` (JSON:API 1.1); `data` может быть списком (несколько корней). Ссылка `{type, id}` — на существующий ресурс:
+**Что можно делать — решает ресурс.** Маркерные интерфейсы `Resource\Insertable`, `Resource\Updatable`, `Resource\Deletable` (чтение — свойство любого ресурса). Парсер проверяет их до первого запроса, без маркера — 403: вставка — `Insertable`; изменение (корень `PATCH`, даже если меняются только связи; ребёнок `{id}` + ресурс в `included`) — `Updatable`; удаление, полная замена to-many и замена to-one — `Deletable` цели, по форме документа. Сослаться на существующую запись `{type, id}` можно без маркеров (`provider` у сертификата). У сущностей таких флагов нет; запрет писать колонку — `mode` READ атрибута. Ограничения точки входа или роли — будущая схема.
+
+**Входной документ.** Новые связанные ресурсы передаются в `included` (нестандартный sideposting) и названы `lid` (JSON:API 1.1); `data` у `POST` может быть списком (несколько корней). Операция над элементом связи to-many — в `meta.op` идентификатора:
 
 ```php
-['data' => ['type' => 'certificate', 'lid' => 'c1',
-    'attributes' => ['code' => 'CERT-0001', 'nominal' => '100.00'],
+['data' => ['type' => 'certificate', 'id' => '1',
+    'attributes' => ['nominal' => '2500.00', 'recipient_name' => null],           // null — NULL в колонку
     'relationships' => [
-        'provider' => ['data' => ['type' => 'provider', 'id' => '1']],   // существующий
-        'domains'  => ['data' => [['type' => 'domain', 'lid' => 'd1']]], // новый, из included
+        'provider' => ['data' => ['type' => 'provider', 'id' => '2']],            // внешний ключ: только существующий
+        'delivery' => ['data' => ['type' => 'delivery', 'lid' => 'del1']],        // to-one: заменить новой
+        'domains'  => ['data' => [
+            ['type' => 'domain', 'id' => '3'],                                    // есть в included — изменить
+            ['type' => 'domain', 'id' => '2', 'meta' => ['op' => 'remove']],      // удалить
+            ['type' => 'domain', 'lid' => 'd1'],                                  // новый, из included
+        ]],
     ]],
- 'included' => [['type' => 'domain', 'lid' => 'd1', 'attributes' => ['domain_name' => 'example.com']]]]
+ 'included' => [
+    ['type' => 'domain', 'id' => '3', 'attributes' => ['is_primary' => true]],
+    ['type' => 'domain', 'lid' => 'd1', 'attributes' => ['domain_name' => 'example.com']],
+    ['type' => 'delivery', 'lid' => 'del1', 'attributes' => ['delivery_channel' => 'SMS']],
+ ]]
 ```
 
-**Парсер документа** проверяет весь документ до первого `INSERT` (поэтому он не итеративный) и разворачивает его в дерево: ссылка `{type, lid}` заменяется самим ресурсом, каждый ресурс из `included` указан ровно один раз и достижим из `data` (у ресурса один родитель, циклов нет). Связь по внешнему ключу ресурса принимает только `{type, id}`, остальные связи — только новые ресурсы. Ошибки — `InvalidDocumentException` (400) с JSON Pointer.
+| элемент связи to-many | операция |
+|---|---|
+| `{type, lid}` + ресурс в `included` | вставить нового ребёнка (`InsertOperation`) |
+| `{type, id}` + ресурс в `included` | изменить своего ребёнка (`UpdateOperation`) |
+| `{type, id}` | оставить, только проверить принадлежность (`KeepOperation`) |
+| `{type, id, meta: {op: remove}}` | удалить ребёнка (`DeleteOperation`) |
 
-**Дерево вставки** — два уровня, исполнители с суффиксом `…Writer` (у чтения — `…Iterator`, `…Node` остаётся за планом):
+Список без единой пометки `meta.op` — стандартная полная замена JSON:API: дети, не названные в списке, удаляются. Хоть одна пометка — частичное изменение: неназванные не трогаются. Связь to-one по владению — без `meta.op`, по форме: `{lid}` + included — заменить (текущий удаляется), `{id}` + included — изменить, `{id}` — проверить, `null` — удалить текущего. Связи нет в документе — её детей не трогают. Создаются только корень и его потомки по владению; связь по внешнему ключу принимает только `{type, id}` существующего ресурса или `null`.
 
-- уровень ресурсов (`PushExecutor`): `InsertJoinWriter(name, relation, parent, child)` вставляет владельца связи (`parent`), берёт новых детей из `relationships[name]` и отправляет их в `child` с колонкой связи из ключей владельца; связи одного владельца — левый глубокий список, как в SELECT;
-- граница — `InsertResourceWriter`: ресурс → строка «колонка модели → значение» (атрибуты, внешние ключи) → поддерево таблиц;
-- уровень таблиц (`TableWriter`), по модели ресурса (`model()`): `InsertTableJoinWriter` делит строку между таблицами модели (родитель — сторона с первичным ключом — первым, по `PRIMARY`/`references` сущностей), `InsertOptionalTableWriter` оборачивает правую сторону `LeftJoin` и пропускает её, если её колонок нет в строке, `InsertTableWriter` — `INSERT … RETURNING` в одну таблицу (SQL через pg_builder, запрос — в `error_log()`).
+**Парсер** (`WriteDocumentParser`) проверяет весь документ до первого запроса и сразу выдаёт **дерево операций**: `InsertOperation`, `UpdateOperation`, `KeepOperation`, `DeleteOperation` (вид операции — класс), связь по владению — `RelationshipOperation(replace, children)`, имя ресурса — `PersistentIdentity` (`id`) или `LocalIdentity` (`lid`). Каждый ресурс `included` использован ровно один раз (у ресурса один родитель, циклов нет); дети связи уже в порядке выполнения: удаления, оставленные и изменённые, вставки — освобождённое значение уникальной колонки можно занять новым ребёнком в том же запросе. `meta.op`, `included` и место в документе дальше парсера не идут. Ошибки — `InvalidDocumentException` со статусом 400 (форма документа), 403 (нет возможности ресурса, клиентский `id`) или 409 (`type`/`id` не совпали с маршрутом) и JSON Pointer.
 
-Ключи возвращаются из `push()` наверх, общего контекста нет. `InsertRootWriter` отправляет в дерево каждый корень и возвращает их ключи; транзакцию открывает вызывающий. Колонки связи из маршрута вложенного ресурса добавляет к корням отдельный узел `InsertRouteLinkWriter` над деревом.
+**Планировщик** (`WritePlanner::plan(resource, roots, parent, relationship)`) строит план по форме дерева операций, как план SELECT — по дереву запроса. Место — ресурс и все его операции в одной позиции дерева (корни; все дети одной связи). План — неизменяемые узлы:
 
-**Планировщик** (`Plan\Insert\InsertPlanner::plan(resource, data)`) строит план по форме документа, как план SELECT — по дереву запроса: в него попадают только связи, встреченные у ресурсов места хотя бы раз (объединение по всем корням и детям); план — неизменяемые узлы `InsertJoinNode`, `InsertResourceNode`, `InsertTableJoinNode`, `InsertOptionalTableNode`, `InsertTableNode` (исполнитель — тот же стебель с `…Writer`, собирает `WriterBuilder`). Правила порядка:
+- `WriteOperationNode(resource, add, update, remove)` — развилка места с ветвями только тех операций, что в нём встретились: `InsertResourceNode`, `UpdateResourceNode` (исполняет и `KeepOperation`), `DeleteResourceNode`;
+- `WriteJoinNode(name, relation, parent, child)` — связь по владению: владелец — `parent`, место детей — `child`; связи одного владельца — левый глубокий список в **порядке объявления** в `relationships()`: зависимую связь объявляют позже (`delivery` после `detail`, потому что `certificate_delivery_meta` ссылается на `certificate_details`; сущности такую ссылку не описывают);
+- `WriteReplaceNode(name, relation, child_resource, input)` — полная замена связи, стоит под узлом связи как его `parent`, а при замене пустым — без узла связи; у `POST` его не бывает;
+- `WriteRootNode(input, route)` — корень; `route` — `RouteParentNode` вложенного маршрута;
+- уровень таблиц по `model()` ресурса: вставка — `InsertPlanner::tables()` (`InsertTableJoinNode(relation, parent, child)`, родитель — сторона, от которой зависит другая, по `PRIMARY`/`references` сущностей; правая сторона `LeftJoin` — `InsertOptionalTableNode`), изменение — `UpdatePlanner::tables()` (`UpdateTableJoinNode(relation, main, joined)`: сначала главная таблица, потом присоединённая по ключу, который вернула главная; правая сторона `LeftJoin` — `UpdateOptionalTableNode`: изменить, а если строки нет — вставить).
 
-- в дерево идут связи с первичным ключом на стороне владельца (`OneToMany`, обратная `OneToOne`): владелец — `parent`, дети — `child`; связь по внешнему ключу ресурса пишет сама строка ресурса;
-- связи одного владельца — левый глубокий список в **порядке объявления** в `relationships()`: зависимую связь объявляют позже (`delivery` после `detail`, потому что `certificate_delivery_meta` ссылается на `certificate_details`; сущности такую ссылку не описывают);
-- внутри модели — по `PRIMARY`/`references` сущностей: `InsertTableJoinNode(relation, parent, child)`, родитель — сторона, от которой зависит другая, вставляется первым (`InsertPlanner::tables()`; для дерева, собранного руками, — `Executor\Insert\TableTreeBuilder`).
+В плане только форма: значений и id в нём нет, один план годится для любого запроса той же формы. Какая ветвь развилки и выполнять ли замену у конкретного элемента — говорят данные (класс операции, `RelationshipOperation::$replace`).
 
-**Вложенный маршрут.** Ресурс к существующему родителю создаётся по маршруту, а не по связи в документе: `POST /certificates/1/domains` — `InsertPlanner::routeLink(CertificateResource::class, 'domains', 1)` даёт `['certificate_id' => 1]` (`relation[1]` связи родителя), его получает `WriterBuilder::root(plan, data, link)` и ставит над деревом узел `InsertRouteLinkWriter(link, input)`; параметр — значение, а не форма плана, поэтому узел есть только в дереве исполнителей. Своя связь `certificate` у `DomainResource` не нужна (она попала бы в `fields` по умолчанию и изменила бы документ SELECT).
+**Дерево исполнителей** — два уровня, суффикс `…Writer` (у чтения — `…Iterator`, `…Node` остаётся за планом); узел плана и исполнитель соответствуют по основе имени, собирает `WriterBuilder`:
+
+- уровень ресурсов (`PushExecutor`, `push(WriteOperation $operation, array $link): array`): `WriteJoinWriter` выполняет владельца (`parent`) и отправляет его детей в `child` с колонкой связи из ключей владельца; `WriteReplaceWriter` удаляет неназванных детей (`DELETE … WHERE <колонка связи> = :parent AND <pk> NOT IN (…)`); `WriteOperationWriter` выбирает ветвь по классу операции, пустые ключи у изменения, проверки и удаления — `WriteNotFoundException` (404, ресурс в `meta`: `{type, id}`);
+- граница — `InsertResourceWriter`, `UpdateResourceWriter`, `DeleteResourceWriter`: операция → строка «колонка модели → значение» (атрибуты, внешние ключи) → поддерево таблиц; удаление — одна строка главной таблицы, зависимое удаляет база (`ON DELETE CASCADE`);
+- уровень таблиц (`TableWriter`): `InsertTableJoinWriter`, `InsertOptionalTableWriter`, `InsertTableWriter` (`INSERT … RETURNING`); `UpdateTableJoinWriter`, `UpdateOptionalTableWriter`, `UpdateTableWriter` (`UPDATE … WHERE <ключ> = :key AND <колонка связи с родителем> AND (<колонка> IS DISTINCT FROM …) RETURNING`; без результата — `SELECT`, чтобы отличить «нечего менять» от «строки нет»). SQL через pg_builder, запрос — в `error_log()`.
+
+Ключи возвращаются из `push()` наверх, общего контекста нет. У изменения и удаления ребёнка колонка связи с родителем стоит в `WHERE`: чужой ребёнок не найдётся — 404. `WriteRootWriter` отправляет в дерево каждый корень и возвращает их ключи; транзакцию открывает вызывающий.
+
+**Вложенный маршрут.** Ресурс к существующему родителю создаётся по маршруту, а не по связи в документе: `POST /certificates/1/domains` — `WritePlanner::plan(DomainResource::class, $roots, parent: CertificateResource::class, relationship: 'domains')` кладёт в план `RouteParentNode`; id родителя — значение, его получает `WriterBuilder::root(plan, data, route_id)`. `RouteParentWriter` один раз, до первой записи, проверяет, что родитель есть (`SELECT … FOR KEY SHARE` на PostgreSQL, флаг `lock`; нет — 404), и даёт каждому корню колонку связи. Своя связь `certificate` у `DomainResource` не нужна (она попала бы в `fields` по умолчанию и изменила бы документ SELECT).
+
+Дерево исполнителей `PATCH` из примера выше:
 
 ```
-InsertJoinWriter domains [id, certificate_id]
-├─ parent: InsertJoinWriter delivery [id, certificate_id]
-│  ├─ parent: InsertResourceWriter CertificateWithDetailResource
-│  │  └─ InsertTableJoinWriter [id → certificate_id]
-│  │     ├─ parent: InsertTableWriter certificates
-│  │     └─ child:  InsertOptionalTableWriter └─ InsertTableWriter certificate_details
-│  └─ child:  InsertResourceWriter DeliveryResource └─ InsertTableWriter certificate_delivery_meta
-└─ child:  InsertResourceWriter DomainResource └─ InsertTableWriter domains
+WriteJoinWriter domains [id, certificate_id]
+├─ parent: WriteJoinWriter delivery [id, certificate_id]
+│  ├─ parent: WriteReplaceWriter delivery
+│  │  └─ input: WriteOperationWriter CertificateWithDetailResource
+│  │     └─ update: UpdateResourceWriter
+│  │        └─ UpdateTableJoinWriter [id → certificate_id]
+│  │           ├─ main:   UpdateTableWriter certificates
+│  │           └─ joined: UpdateOptionalTableWriter (UpdateTableWriter | InsertTableWriter certificate_details)
+│  └─ child: WriteOperationWriter DeliveryResource
+│     └─ add: InsertResourceWriter └─ InsertTableWriter certificate_delivery_meta
+└─ child: WriteOperationWriter DomainResource
+   ├─ add:    InsertResourceWriter └─ InsertTableWriter domains
+   ├─ update: UpdateResourceWriter └─ UpdateTableWriter domains
+   └─ remove: DeleteResourceWriter domains
 ```
+
+**Не делается:** типы значений атрибутов и обязательные атрибуты при вставке не проверяются; цель связи по внешнему ключу не проверяется (несуществующая — ошибка внешнего ключа базы); многие-ко-многим нет; перенос существующего ребёнка к другому родителю не поддерживается; необязательная правая сторона модели при изменении — одна таблица.
 
 ## Описание данных
 
@@ -1198,10 +1238,12 @@ public static function serialize(array $tuple): ResourceRecord
 - **Обратная сторона связи.** `certificate.domains` и `domain.certificate` — стороны одного внешнего ключа; выводить одну из другой или из `FOREIGN` сущностей?
 - **Тип и `nullable` атрибута из сущности.** Атрибут повторяет `type` и `nullable` колонки; выводить или проверять совпадение в `validate()`?
 - **Вставка: порядок соседних связей.** Сейчас — порядок объявления в `relationships()`. Ссылка `certificate_delivery_meta` → `certificate_details` в сущностях не описана (колонка-первичный ключ не несёт `references`), поэтому не проверяется: разрешить `references` у `PRIMARY` и сортировать соседей топологически? Та же ссылка делает `delivery` без `detail` невставляемым, а отказывает только база.
-- **Вставка: ответ и точка входа.** Ответ на `POST` (созданные ресурсы через SELECT-конвейер по ключам корней), контроллер, транзакция.
+- **Запись: ответ и точка входа.** Формат ответа решён (`201` + `Location` + `{data: {type, id}}` у `POST`, `204` у `PATCH` и `DELETE`, без перечитывания), но контроллера и транзакции нет.
 - **Вставка: подготовленные запросы.** `InsertTableWriter` готовит запрос на каждую строку: набор колонок зависит от строки, а `DEFAULT` нельзя передать параметром. Кеш по набору колонок; многострочный `INSERT` с `DEFAULT` в `VALUES` на PostgreSQL.
-- **Вставка: ресурс с двумя родителями.** Ссылка по `lid` на ресурс из другой ветки дерева запрещена.
-- **Вставка: параметры маршрута.** `POST /certificates/1/domains` работает через `InsertPlanner::routeLink()`; разбор маршрута и проверка существования родителя (сейчас — ошибка внешнего ключа в базе) не сделаны.
+- **Запись: ресурс с двумя родителями.** Ссылка по `lid` на ресурс из другой ветки дерева запрещена (400).
+- **Запись: параметры маршрута.** `POST /certificates/1/domains` работает через `RouteParentNode` плана (родитель проверяется, нет — 404); разбор маршрута не сделан. Цели связей по внешнему ключу не проверяются: несуществующая — ошибка внешнего ключа в базе.
+- **Запись: ошибки базы, типы значений, обязательные атрибуты, конкурентный доступ.** Нарушение `NOT NULL`, уникальности, внешнего ключа — исключение PDO как есть; типы значений атрибутов и обязательные атрибуты при вставке парсер не проверяет; версий строк (ETag) нет.
+- **Запись: `PUT` и `PATCH`.** Сейчас только `PATCH`, где список to-many без `meta.op` — полная замена; строго частичный `PATCH` и `PUT` как полная перезапись обсуждались и отложены.
 - **Обратные связи без `include`.** Связь, у которой ключ на другой стороне (`certificate.domains`), без `include` не известна: не отдавать её или отдавать без `data`?
 
 ## Использование
@@ -1242,10 +1284,11 @@ php example/certificates.php [URL] [--document]    # CertificatesController: п�
 php example/query-plan.php [--steps|--sql|--explain]  # дерево запроса из кода (без парсера) → план → документ; --steps — план после каждого шага
 php example/query-tree.php                         # дерево запроса для include=provider,detail,delivery,domains.logs
 php example/query-tree.php '/certificates?include=domains.logs&fields[certificate]=code'
-php example/insert-plan.php                        # вставка через планировщик: документ → план → дерево вставки, ключи; SQL в stderr; транзакция откатывается
-php example/insert-document.php                    # то же дерево вставки, собранное руками
-php example/insert-route.php                       # вложенный маршрут POST /certificates/1/domains: routeLink → InsertRouteLinkWriter над деревом
-php example/update-document.php                    # прототип UPDATE (PATCH /certificates/{id}): дерево …Writer руками, всё в одном файле; SQL в stderr; транзакции откатываются
+php example/patch-document.php                     # запись POST/PATCH/DELETE на девяти сценариях: документ → дерево операций → план → исполнители; SQL в stderr; транзакции откатываются
+php example/insert-plan.php                        # вставка через планировщик: документ → дерево операций → план → дерево исполнителей, ключи
+php example/insert-document.php                    # то же дерево исполнителей, собранное руками
+php example/insert-route.php                       # вложенный маршрут POST /certificates/1/domains: RouteParentNode → RouteParentWriter
+php example/update-document.php                    # старый прототип UPDATE на массивах (заменён записью в src), оставлен как история
 php example/db/seed.php [количество сертификатов]  # пересоздать базу примера
 ```
 
@@ -1260,8 +1303,10 @@ php example/db/seed.php [количество сертификатов]  # пе�
 | `test/Executor/Select/SerializeIteratorTest.php` | Сериализация по плану: ресурсы из запросов плана примера на SQLite совпадают с эталоном по атрибутам и связи `provider`; составной атрибут, приведение типов, связь по внешнему ключу, ключи, `null` у пустого `LEFT JOIN`. |
 | `test/Executor/Select/RegisterIteratorTest.php` | `RegisterIterator`: повторный `type:id` даёт зарегистрированный объект, `null` проходит на своём месте, ресурсы попадают в реестр. |
 | `test/Executor/Select/AscendingKeyIteratorTest.php` | `AscendingKeyIterator`: упорядоченный поток проходит без изменений (с `null`), строгий порядок отвергает повтор ключа, нестрогий — убывание; неупорядоченный `outer` слияния — исключение. |
-| `test/Parser/Insert/DocumentParserTest.php` | Парсер документа вставки: дерево из `data` + `included`, порядок корней, ошибки клиента с указателем. |
-| `test/Plan/Insert/InsertPlannerTest.php` | Планировщик вставки: дерево по плану совпадает с собранным руками, только связи из документа, объединение по корням, модель из двух таблиц, `routeLink()`, выполнение плана с колонкой маршрута. |
-| `test/Executor/Insert/InsertWriterTest.php` | Дерево вставки на SQLite примера (транзакция с откатом): ключ владельца у связанных ресурсов, модель из двух таблиц и пропуск пустой LEFT-стороны, колонка связи из вложенного маршрута, `TableTreeBuilder`, ресурс без `Insertable`. |
+| `test/Parser/Write/WriteDocumentParserTest.php` | Парсер записи: дерево операций для `POST`, `PATCH` и `DELETE` (классы операций, порядок детей, признак замены), ошибки клиента со статусом и указателем. |
+| `test/Plan/Write/WritePlannerTest.php` | Планировщик записи: ветви места только для встреченных операций, связи в порядке объявления, узел замены под узлом связи и без него, объединение по корням, родитель вложенного маршрута. |
+| `test/Plan/Insert/InsertPlannerTest.php`, `test/Plan/Update/UpdatePlannerTest.php` | Поддеревья таблиц вставки и изменения по модели: одна таблица, модель из двух таблиц, ресурс без `Insertable`. |
+| `test/Executor/Write/WriteExecutionTest.php` | Запись целиком на SQLite примера (транзакция с откатом): `PATCH` обеих таблиц модели и связей, неизменённые значения, отсутствующая строка необязательной таблицы, полная замена и замена пустым, чужой ребёнок — 404, `POST` дерева, вложенный маршрут, `DELETE` с каскадом базы. |
+| `test/Executor/Insert/InsertWriterTest.php` | Исполнители вставки на SQLite примера: дерево руками совпадает с деревом по плану, ключ владельца у связанных ресурсов, модель из двух таблиц и пропуск пустой LEFT-стороны, ресурс без `Insertable`, чужая операция. |
 | `test/Executor/Insert/OptionalParentTest.php` | Необязательная сторона модели — родитель (`LeftJoin(vouchers, vendors, [vendor_id, id])`, своя схема в SQLite в памяти): план оборачивает `vendors` в `InsertOptionalTableNode` и ставит её родителем; с атрибутами продавца он вставляется первым и его ключ уходит в `vendor_id`, без них пропускается и `vendor_id` остаётся NULL. |
 | `test/DocumentTreeTest.php` | Дерево из `document.php` с константами ресурсов: документ совпадает с эталоном `test/Fixture/document.json`, каждый ресурс встречается один раз, связь по внешнему ключу без и с `include`, пустая доставка, топология `explain()`. |

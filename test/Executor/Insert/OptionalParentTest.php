@@ -4,12 +4,13 @@ declare(strict_types=1);
 
 namespace Ggs\JsonApiEngine\Test\Executor\Insert;
 
-use Ggs\JsonApiEngine\Executor\Insert\WriterBuilder;
-use Ggs\JsonApiEngine\Parser\Insert\DocumentParser;
+use Ggs\JsonApiEngine\Executor\Write\WriterBuilder;
+use Ggs\JsonApiEngine\Parser\Write\WriteDocumentParser;
 use Ggs\JsonApiEngine\Plan\Insert\InsertOptionalTableNode;
 use Ggs\JsonApiEngine\Plan\Insert\InsertPlanner;
 use Ggs\JsonApiEngine\Plan\Insert\InsertTableJoinNode;
 use Ggs\JsonApiEngine\Plan\Insert\InsertTableNode;
+use Ggs\JsonApiEngine\Plan\Write\WritePlanner;
 use Ggs\JsonApiEngine\Test\Executor\Insert\Fixture\VoucherWithVendorResource;
 use PDO;
 use PHPUnit\Framework\TestCase;
@@ -83,10 +84,10 @@ final class OptionalParentTest extends TestCase
         // InsertTableWriter пишет каждый INSERT в error_log(): PHPUnit перехватывает его и не печатает
         $this->expectErrorLog();
 
-        $data = new DocumentParser()->parse(document: $document, resource: VoucherWithVendorResource::class);
-        $plan = new InsertPlanner()->plan(resource: VoucherWithVendorResource::class, data: $data);
+        $roots = new WriteDocumentParser()->insert(document: $document, resource: VoucherWithVendorResource::class);
+        $plan = new WritePlanner()->plan(resource: VoucherWithVendorResource::class, roots: $roots);
 
-        return new WriterBuilder(pdo: $this->pdo)->root(plan: $plan, data: $data)->execute();
+        return new WriterBuilder(pdo: $this->pdo, lock: false)->root(plan: $plan, data: $roots)->execute();
     }
 
     /**
