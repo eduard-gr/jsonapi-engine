@@ -4,21 +4,20 @@ declare(strict_types=1);
 
 namespace Ggs\JsonApiEngine\Example\Resource;
 
-use Ggs\JsonApiEngine\Document\ResourceRecord;
 use Ggs\JsonApiEngine\Example\Entity\CertificateDeliveryMetaEntity;
 use Ggs\JsonApiEngine\Operator;
 use Ggs\JsonApiEngine\Resource;
-use Ggs\JsonApiEngine\Resource\Deletable;
-use Ggs\JsonApiEngine\Resource\Insertable;
-use Ggs\JsonApiEngine\Resource\Updatable;
+use Ggs\JsonApiEngine\Resource\DeletableInterface;
+use Ggs\JsonApiEngine\Resource\InsertableInterface;
+use Ggs\JsonApiEngine\Resource\UpdatableInterface;
 
 /**
  * `delivery`: таблица `certificate_delivery_meta`, идентификатор — её первичный ключ `certificate_id`.
  *
- * Можно создавать (`Insertable`): вставку см. `Executor\Insert\InsertResourceWriter`; изменять и удалять
- * (`Updatable`, `Deletable`).
+ * Можно создавать (`InsertableInterface`): вставку см. `Executor\Insert\InsertResourceWriter`; изменять и удалять
+ * (`UpdatableInterface`, `DeletableInterface`).
  */
-final class DeliveryResource extends Resource implements Insertable, Updatable, Deletable
+final class DeliveryResource extends Resource implements InsertableInterface, UpdatableInterface, DeletableInterface
 {
     public const string TYPE = 'delivery';
 
@@ -49,35 +48,13 @@ final class DeliveryResource extends Resource implements Insertable, Updatable, 
         ],
     ];
 
-    public static function relationships(): array
+    public static function getRelationships(): array
     {
         return [];
     }
 
-    public static function model(): string
+    public static function getModel(): string
     {
         return CertificateDeliveryMetaEntity::class;
-    }
-
-    /**
-     * Доставка из строки QUERY1: идентификатор — алиас `meta_id` (`certificate_delivery_meta.certificate_id`).
-     * `meta_id` NULL — LEFT JOIN не нашёл запись доставки: ресурса нет.
-     */
-    public static function serialize(array $tuple): ?ResourceRecord
-    {
-        if ($tuple['meta_id'] === null) {
-            return null;
-        }
-
-        return new ResourceRecord(
-            id: $tuple['meta_id'],
-            type: self::TYPE,
-            attributes: [
-                self::DELIVERY_CHANNEL => $tuple['delivery_channel'],
-                self::IS_SENT => (bool) $tuple['is_sent'],
-                self::EXTERNAL_PROVIDER_ID => $tuple['external_provider_id'],
-            ],
-            relationships: [],
-        );
     }
 }

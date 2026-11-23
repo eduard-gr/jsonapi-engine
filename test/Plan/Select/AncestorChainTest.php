@@ -4,20 +4,22 @@ declare(strict_types=1);
 
 namespace Ggs\JsonApiEngine\Test\Plan\Select;
 
+use Ggs\JsonApiEngine\Example\Container\ArrayContainer;
+use Ggs\JsonApiEngine\Example\Container\ExampleResources;
 use Ggs\JsonApiEngine\Example\Controller\CertificatesController;
 use Ggs\JsonApiEngine\Example\Resource\CertificateResource;
 use Ggs\JsonApiEngine\Example\Resource\DeliveryResource;
 use Ggs\JsonApiEngine\Example\Resource\DomainResource;
 use Ggs\JsonApiEngine\Example\Resource\LogResource;
 use Ggs\JsonApiEngine\Example\Resource\ProviderResource;
-use Ggs\JsonApiEngine\Executor\Select\SqlScanIterator;
+use Ggs\JsonApiEngine\Executor\Select\EntityScanReader;
 use Ggs\JsonApiEngine\Plan\Select\BuildSqlPass;
 use Ggs\JsonApiEngine\Plan\Select\HashJoinNode;
 use Ggs\JsonApiEngine\Plan\Select\JoinNode;
 use Ggs\JsonApiEngine\Plan\Select\ResourceNode;
-use Ggs\JsonApiEngine\Plan\Select\SharedRowJoinNode;
-use Ggs\JsonApiEngine\Plan\Select\SharedScanNode;
-use Ggs\JsonApiEngine\Plan\Select\SqlScanNode;
+use Ggs\JsonApiEngine\Plan\Select\EntitySharedJoinNode;
+use Ggs\JsonApiEngine\Plan\Select\EntityScanNodeDraft;
+use Ggs\JsonApiEngine\Plan\Select\EntityScanNode;
 use PHPUnit\Framework\TestCase;
 use sad_spirit\pg_builder\SqlBuilderWalker;
 
@@ -42,7 +44,7 @@ final class AncestorChainTest extends TestCase
 
     public function testChildQueriesRepeatParentConditions(): void
     {
-        $owners = self::owners(query: self::QUERY);
+        $owners = self::getOwners(query: self::QUERY);
         $certificates = 'select t0.id as id from certificates as t0'
             . ' left join certificate_delivery_meta as t1 on t0.id = t1.certificate_id'
             . ' where t0.status = :%1$s_t0_status_0 and ( t1.certificate_id is null or t1.is_sent = :%1$s_t1_is_sent_1 )';
@@ -52,7 +54,7 @@ final class AncestorChainTest extends TestCase
             . ' select t0.id as t0_id, t0.domain_name as t0_domain_name, t0.is_primary as t0_is_primary,'
             . ' t0.created_at as t0_created_at, t0.certificate_id as t0_certificate_id'
             . ' from domains as t0 where t0.certificate_id in ( select id from p1 ) order by t0.id',
-            self::sql(owner: $owners[DomainResource::class]),
+            self::getSql(owner: $owners[DomainResource::class]),
         );
         self::assertSame(['p1_t0_status_0' => 'ACTIVE', 'p1_t1_is_sent_1' => true], $owners[DomainResource::class]->parameters);
 
@@ -63,14 +65,14 @@ final class AncestorChainTest extends TestCase
             . ' select t0.id as t0_id, t0.log_level as t0_log_level, t0.message as t0_message,'
             . ' t0.created_at as t0_created_at, t0.domain_id as t0_domain_id'
             . ' from domain_logs as t0 where t0.domain_id in ( select id from p1 ) order by t0.domain_id, t0.id',
-            self::sql(owner: $owners[LogResource::class]),
+            self::getSql(owner: $owners[LogResource::class]),
         );
         self::assertSame(['p2_t0_status_0' => 'ACTIVE', 'p2_t1_is_sent_1' => true], $owners[LogResource::class]->parameters);
 
         // Справочник PreloadNode читается целиком; у самого корня предков нет
-        self::assertStringStartsWith('select ', self::sql(owner: $owners[ProviderResource::class]));
-        self::assertStringNotContainsString(' in ( select', self::sql(owner: $owners[ProviderResource::class]));
-        self::assertStringStartsWith('select ', self::sql(owner: $owners[CertificateResource::class]));
+        self::assertStringStartsWith('select ', self::getSql(owner: $owners[ProviderResource::class]));
+        self::assertStringNotContainsString(' in ( select', self::getSql(owner: $owners[ProviderResource::class]));
+        self::assertStringStartsWith('select ', self::getSql(owner: $owners[CertificateResource::class]));
     }
 
     /**
@@ -79,7 +81,7 @@ final class AncestorChainTest extends TestCase
      */
     public function testChildQueriesKeepAncestorsWithoutFilters(): void
     {
-        $owners = self::owners(query: ['include' => 'detail,delivery,domains.logs']);
+        $owners = self::getOwners(query: ['include' => 'detail,delivery,domains.logs']);
         $certificates = 'select t0.id as id from certificates as t0'
             . ' left join certificate_details as t1 on t0.id = t1.certificate_id'
             . ' left join certificate_delivery_meta as t2 on t0.id = t2.certificate_id';
@@ -89,7 +91,7 @@ final class AncestorChainTest extends TestCase
             . ' select t0.id as t0_id, t0.domain_name as t0_domain_name, t0.is_primary as t0_is_primary,'
             . ' t0.created_at as t0_created_at, t0.certificate_id as t0_certificate_id'
             . ' from domains as t0 where t0.certificate_id in ( select id from p1 ) order by t0.id',
-            self::sql(owner: $owners[DomainResource::class]),
+            self::getSql(owner: $owners[DomainResource::class]),
         );
         self::assertSame(
             "with p2 as ( {$certificates} ),"
@@ -97,44 +99,44 @@ final class AncestorChainTest extends TestCase
             . ' select t0.id as t0_id, t0.log_level as t0_log_level, t0.message as t0_message,'
             . ' t0.created_at as t0_created_at, t0.domain_id as t0_domain_id'
             . ' from domain_logs as t0 where t0.domain_id in ( select id from p1 ) order by t0.domain_id, t0.id',
-            self::sql(owner: $owners[LogResource::class]),
+            self::getSql(owner: $owners[LogResource::class]),
         );
         self::assertSame([], $owners[DomainResource::class]->parameters);
         self::assertSame([], $owners[LogResource::class]->parameters);
 
         // На данных примера CTE ничего не отсекает: все домены и логи
         $pdo = getPDO();
-        self::assertCount((int) $pdo->query('select count(*) from domains')->fetchColumn(), self::rows(owner: $owners[DomainResource::class]));
-        self::assertCount((int) $pdo->query('select count(*) from domain_logs')->fetchColumn(), self::rows(owner: $owners[LogResource::class]));
+        self::assertCount((int) $pdo->query('select count(*) from domains')->fetchColumn(), self::getRows(owner: $owners[DomainResource::class]));
+        self::assertCount((int) $pdo->query('select count(*) from domain_logs')->fetchColumn(), self::getRows(owner: $owners[LogResource::class]));
     }
 
     public function testChildQueriesReturnOnlyChildrenOfParents(): void
     {
-        $owners = self::owners(query: self::QUERY);
+        $owners = self::getOwners(query: self::QUERY);
         $pdo = getPDO();
 
         $domains = $pdo->query('select id from domains where certificate_id in (' . self::CERTIFICATES . ') order by id')
             ->fetchAll(\PDO::FETCH_COLUMN);
         self::assertNotSame([], $domains);
         self::assertLessThan((int) $pdo->query('select count(*) from domains')->fetchColumn(), \count($domains));
-        self::assertSame($domains, array_column(self::rows(owner: $owners[DomainResource::class]), 't0_id'));
+        self::assertSame($domains, array_column(self::getRows(owner: $owners[DomainResource::class]), 't0_id'));
 
         $logs = $pdo->query(
             'select id from domain_logs where domain_id in (select id from domains where certificate_id in ('
             . self::CERTIFICATES . ')) order by domain_id, id',
         )->fetchAll(\PDO::FETCH_COLUMN);
         self::assertNotSame([], $logs);
-        self::assertSame($logs, array_column(self::rows(owner: $owners[LogResource::class]), 't0_id'));
+        self::assertSame($logs, array_column(self::getRows(owner: $owners[LogResource::class]), 't0_id'));
     }
 
     /**
-     * Документ с фильтром: каждый домен в included — домен сертификата из data (ребёнок без родителя был бы
-     * LogicException), и доменов ровно столько, сколько у этих сертификатов.
+     * Документ с фильтром: каждый домен в included — домен сертификата из data (ребёнок без родителя в
+     * документ не попал бы, но SQL его и не возвращает), и доменов ровно столько, сколько у этих сертификатов.
      */
     public function testDocumentWithFilterHasOnlyChildrenOfData(): void
     {
         $document = json_decode(
-            json_encode((new CertificatesController(pdo: getPDO()))->get(query: self::QUERY), \JSON_THROW_ON_ERROR),
+            json_encode((new CertificatesController(pdo: getPDO(), container: new ArrayContainer(services: ExampleResources::getAll())))->get(query: self::QUERY), \JSON_THROW_ON_ERROR),
             true,
             flags: \JSON_THROW_ON_ERROR,
         );
@@ -166,7 +168,7 @@ final class AncestorChainTest extends TestCase
      */
     public function testBranchInsideRowUsesKeyOfOneToOneResource(): void
     {
-        $plan = (new BuildSqlPass())(plan: new SharedScanNode(input: new SharedRowJoinNode(
+        $plan = (new BuildSqlPass())(plan: new EntityScanNodeDraft(input: new EntitySharedJoinNode(
             name: CertificateResource::DELIVERY,
             relation: ['id', 'certificate_id'],
             outer: new ResourceNode(
@@ -178,21 +180,21 @@ final class AncestorChainTest extends TestCase
                 name: 'domains',
                 relation: ['certificate_id', 'certificate_id'],
                 outer: new ResourceNode(resource: DeliveryResource::class, fields: ['is_sent']),
-                inner: new SharedScanNode(input: new ResourceNode(resource: DomainResource::class, fields: ['domain_name'])),
+                inner: new EntityScanNodeDraft(input: new ResourceNode(resource: DomainResource::class, fields: ['domain_name'])),
             ),
         )));
-        self::assertInstanceOf(SqlScanNode::class, $plan);
-        self::assertInstanceOf(SharedRowJoinNode::class, $plan->input);
+        self::assertInstanceOf(EntityScanNode::class, $plan);
+        self::assertInstanceOf(EntitySharedJoinNode::class, $plan->input);
         self::assertInstanceOf(HashJoinNode::class, $plan->input->inner);
         $domains = $plan->input->inner->inner;
-        self::assertInstanceOf(SqlScanNode::class, $domains);
+        self::assertInstanceOf(EntityScanNode::class, $domains);
 
         self::assertSame(
             'with p1 as ( select t1.certificate_id as certificate_id from certificates as t0'
             . ' left join certificate_delivery_meta as t1 on t0.id = t1.certificate_id where t0.status = :p1_t0_status_0 )'
             . ' select t0.id as t0_id, t0.domain_name as t0_domain_name, t0.certificate_id as t0_certificate_id'
             . ' from domains as t0 where t0.certificate_id in ( select certificate_id from p1 ) order by t0.id',
-            self::sql(owner: $domains),
+            self::getSql(owner: $domains),
         );
 
         $expected = getPDO()->query(
@@ -200,30 +202,30 @@ final class AncestorChainTest extends TestCase
             . " left join certificate_delivery_meta m on c.id = m.certificate_id where c.status = 'ACTIVE') order by d.id",
         )->fetchAll(\PDO::FETCH_COLUMN);
         self::assertNotSame([], $expected);
-        self::assertSame($expected, array_column(self::rows(owner: $domains), 't0_id'));
+        self::assertSame($expected, array_column(self::getRows(owner: $domains), 't0_id'));
     }
 
     /**
      * Владельцы запросов плана после шага sql по классу ресурса-владельца.
      *
      * @param array<string, mixed> $query
-     * @return array<string, SqlScanNode>
+     * @return array<string, EntityScanNode>
      */
-    private static function owners(array $query): array
+    private static function getOwners(array $query): array
     {
         $owners = [];
-        self::collect(node: (new CertificatesController(pdo: getPDO()))->plan(query: $query), owners: $owners);
+        self::collect(node: (new CertificatesController(pdo: getPDO(), container: new ArrayContainer(services: ExampleResources::getAll())))->plan(query: $query), owners: $owners);
 
         return $owners;
     }
 
     /**
-     * @param array<string, SqlScanNode> $owners
+     * @param array<string, EntityScanNode> $owners
      */
-    private static function collect(ResourceNode|SharedScanNode|SqlScanNode|JoinNode $node, array &$owners): void
+    private static function collect(ResourceNode|EntityScanNodeDraft|EntityScanNode|ForeignDataScanNode|JoinNode $node, array &$owners): void
     {
-        if ($node instanceof SqlScanNode) {
-            $owners[$node->rowOwner()->resource] = $node;
+        if ($node instanceof EntityScanNode) {
+            $owners[$node->getRootResourceNode()->resource] = $node;
 
             return;
         }
@@ -236,14 +238,14 @@ final class AncestorChainTest extends TestCase
     /**
      * @return list<array<string, mixed>>
      */
-    private static function rows(SqlScanNode $owner): array
+    private static function getRows(EntityScanNode $owner): array
     {
-        $scan = new SqlScanIterator(pdo: getPDO(), sql: $owner->select->dispatch(new SqlBuilderWalker()), parameters: $owner->parameters);
+        $scan = new EntityScanReader(pdo: getPDO(), sql: $owner->select->dispatch(new SqlBuilderWalker()), parameters: $owner->parameters);
 
         return iterator_to_array($scan, false);
     }
 
-    private static function sql(SqlScanNode $owner): string
+    private static function getSql(EntityScanNode $owner): string
     {
 
         return (string) preg_replace('/\s+/', ' ', $owner->select->dispatch(new SqlBuilderWalker()));

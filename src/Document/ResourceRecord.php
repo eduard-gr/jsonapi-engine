@@ -11,28 +11,28 @@ use OutOfBoundsException;
  * Resource object JSON:API: один ресурс с id, type, attributes и relationships.
  *
  * Кроме того, хранит служебные ключи плана выполнения (keys) — целые числа, нужные узлам
- * для соединения и сортировки (например, внешний ключ certificate_id домена для HashNestJoinIterator).
+ * для соединения и сортировки (например, внешний ключ certificate_id домена для HashNestJoinReader).
  * В JSON они не выводятся. Узлы получают ключ по имени через getKey(); имя 'id' зарезервировано
  * за id самого ресурса, поэтому любой ключ соединения — это просто строка-имя.
  *
- * Объект изменяемый: создаётся в SerializeIterator, затем по ходу потока узлы соединения
- * добавляют ему связи: SharedRowJoinIterator — 1:1, HashNestJoinIterator и MergeNestJoinIterator — 1:N.
+ * Объект изменяемый: создаётся в SerializeReader (или своим `serialize()` ресурса, который тот вызывает), затем по ходу потока узлы соединения
+ * добавляют ему связи: EntitySharedJoinReader — 1:1, HashNestJoinReader и MergeNestJoinReader — 1:N.
  *
  * Связь N:1 по внешнему ключу из своей строки (например, provider сертификата по provider_id)
  * записывается сразу при создании — в $relationships сериализатора, без соединения. Тогда
  * связь есть всегда, даже если связанные ресурсы не загружаются, а NULL во внешнем ключе
  * даёт пустую связь. Чтобы сами ресурсы справочника попали в included, их загружает
- * в реестр PreloadIterator. Связи 1:N так не записать: их внешний ключ лежит в строке связанного
+ * в реестр PreloadReader. Связи 1:N так не записать: их внешний ключ лежит в строке связанного
  * ресурса, а не главного.
  *
- * Каждый ресурс существует в одном экземпляре на выполнение: RegisterIterator регистрирует его
+ * Каждый ресурс существует в одном экземпляре на выполнение: RegisterReader регистрирует его
  * в ResourceRegistry, и при повторной встрече того же type:id (например, если провайдер
  * выбирается JOIN-ом в строку каждого своего сертификата) возвращается уже зарегистрированный
  * объект. Поэтому связь, записанная ресурсу, видна везде, где он встречается.
  *
  * Связи хранят только ссылки {id, type}, а не сами объекты. В документ ресурсы попадают
- * через Document: data — из потока корня дерева, included — обходом связей (related())
- * с поиском ресурсов по ключу (key()) в реестре.
+ * через Document: data — из потока корня дерева, included — обходом связей (getRelated())
+ * с поиском ресурсов по ключу (getRegistryKey()) в реестре.
  */
 class ResourceRecord implements \JsonSerializable
 {
@@ -41,7 +41,7 @@ class ResourceRecord implements \JsonSerializable
      * @param string $type Тип ресурса JSON:API, например 'certificate'
      * @param array $attributes Поля ресурса, кроме id и type
      * @param array $relationships Связи в формате JSON:API: имя связи => ['data' => ...].
-     *        Ссылки — в том же виде, что даёт identifier(): ['id' => (string) id, 'type' => ...],
+     *        Ссылки — в том же виде, что даёт getIdentifier(): ['id' => (string) id, 'type' => ...],
      *        иначе в одном документе окажутся ссылки разного вида
      * @param array<string, int> $keys Служебные ключи плана выполнения (например, внешний ключ
      *        certificate_id для узлов соединения). В JSON не выводятся. Значения — только целые числа.
@@ -84,7 +84,7 @@ class ResourceRecord implements \JsonSerializable
      *
      * Однозначен: id — целое число, поэтому двоеточие в нём встретиться не может
      */
-    public function key(): string
+    public function getRegistryKey(): string
     {
         return $this->type . ':' . $this->id;
     }
@@ -98,7 +98,7 @@ class ResourceRecord implements \JsonSerializable
      *
      * @return list<string>
      */
-    public function related(): array
+    public function getRelated(): array
     {
         $keys = [];
 
@@ -122,8 +122,8 @@ class ResourceRecord implements \JsonSerializable
      * Значение служебного ключа ресурса по имени — всегда целое число.
      * Имя 'id' зарезервировано и даёт id самого ресурса.
      *
-     * Ключи нужны только плану выполнения (например, как ключ соединения в HashNestJoinIterator
-     * или MergeNestJoinIterator, или ключ сортировки SortIterator) и в JSON не попадают: так внешние
+     * Ключи нужны только плану выполнения (например, как ключ соединения в HashNestJoinReader
+     * или MergeNestJoinReader, или ключ сортировки SortReader) и в JSON не попадают: так внешние
      * ключи вроде certificate_id не оказываются в attributes, чего JSON:API не рекомендует.
      *
      * Через этот метод узлы получают любой ключ по имени — и id главного ресурса, и внешний ключ
@@ -149,9 +149,24 @@ class ResourceRecord implements \JsonSerializable
     }
 
     /**
+     * Записывает служебный ключ плана выполнения (см. getKey()); повторный вызов с тем же именем заменяет значение.
+     * Нужен SerializeReader: ресурс, собранный своим `serialize()` ресурса, получает ключи соединений от узла.
+     *
+     * @throws InvalidArgumentException если ключ назван 'id': это имя зарезервировано за id ресурса
+     */
+    public function setKey(string $name, int $value): void
+    {
+        if ($name === 'id') {
+            throw new InvalidArgumentException("Key name 'id' of resource {$this->type}:{$this->id} is reserved for resource id");
+        }
+
+        $this->keys[$name] = $value;
+    }
+
+    /**
      * Resource identifier object для ссылок в relationships
      */
-    public function identifier(): array
+    public function getIdentifier(): array
     {
         return [
             'id' => (string) $this->id, // По спецификации JSON:API id должен быть строкой
@@ -169,7 +184,7 @@ class ResourceRecord implements \JsonSerializable
         ?ResourceRecord $related,
     ): void {
         $this->relationships[$name] = [
-            'data' => $related?->identifier()
+            'data' => $related?->getIdentifier()
         ];
     }
 
@@ -181,7 +196,7 @@ class ResourceRecord implements \JsonSerializable
         string $name,
         ResourceRecord $related,
     ): void {
-        $this->relationships[$name]['data'][] = $related->identifier();
+        $this->relationships[$name]['data'][] = $related->getIdentifier();
     }
 
     /**
@@ -197,7 +212,7 @@ class ResourceRecord implements \JsonSerializable
     ): void {
         $this->relationships[$name] = [
             'data' => array_map(
-                static fn(ResourceRecord $record): array => $record->identifier(),
+                static fn(ResourceRecord $record): array => $record->getIdentifier(),
                 array_values($related)
             )
         ];
@@ -209,7 +224,7 @@ class ResourceRecord implements \JsonSerializable
     #[\Override]
     public function jsonSerialize(): array
     {
-        $resource = $this->identifier();
+        $resource = $this->getIdentifier();
 
         // attributes необязателен по спецификации, добавляем только если они есть
         if (!empty($this->attributes)) {

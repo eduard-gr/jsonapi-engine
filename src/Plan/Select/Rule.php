@@ -11,7 +11,7 @@ namespace Ggs\JsonApiEngine\Plan\Select;
  * (фиксированная точка). Деревья не сравниваются — замены считаются, поэтому в узлах могут быть объекты
  * (Select), и правило можно ставить в любом месте последовательности.
  */
-abstract class Rule implements Pass
+abstract class Rule implements PassInterface
 {
     /**
      * Преобразование одного узла. Правило локальное: смотрит только на узел и его прямые входы.
@@ -19,18 +19,18 @@ abstract class Rule implements Pass
      * Имя параметра — часть контракта: transformUp вызывает apply(node: $node), поэтому каждое правило
      * обязано назвать параметр $node. Другое имя — Error: Unknown named parameter $node при выполнении.
      *
-     * @param ResourceNode|SharedScanNode|SqlScanNode|JoinNode $node узел, входы которого уже преобразованы
-     * @return ResourceNode|SharedScanNode|SqlScanNode|JoinNode|null замена узла или null, если правило не подходит
+     * @param ResourceNode|EntityScanNodeDraft|EntityScanNode|ForeignDataScanNode|JoinNode $node узел, входы которого уже преобразованы
+     * @return ResourceNode|EntityScanNodeDraft|EntityScanNode|ForeignDataScanNode|JoinNode|null замена узла или null, если правило не подходит
      */
-    abstract public function apply(ResourceNode|SharedScanNode|SqlScanNode|JoinNode $node): ResourceNode|SharedScanNode|SqlScanNode|JoinNode|null;
+    abstract public function apply(ResourceNode|EntityScanNodeDraft|EntityScanNode|ForeignDataScanNode|JoinNode $node): ResourceNode|EntityScanNodeDraft|EntityScanNode|ForeignDataScanNode|JoinNode|null;
 
     /**
      * Применяет правило ко всему дереву до фиксированной точки.
      *
-     * @param ResourceNode|SharedScanNode|SqlScanNode|JoinNode $plan корень дерева
+     * @param ResourceNode|EntityScanNodeDraft|EntityScanNode|ForeignDataScanNode|JoinNode $plan корень дерева
      */
     #[\Override]
-    final public function __invoke(ResourceNode|SharedScanNode|SqlScanNode|JoinNode $plan): ResourceNode|SharedScanNode|SqlScanNode|JoinNode
+    final public function __invoke(ResourceNode|EntityScanNodeDraft|EntityScanNode|ForeignDataScanNode|JoinNode $plan): ResourceNode|EntityScanNodeDraft|EntityScanNode|ForeignDataScanNode|JoinNode
     {
         do {
             // Сбрасывается перед каждым кругом; transformUp выставит true, если правило где-то сработало
@@ -44,31 +44,31 @@ abstract class Rule implements Pass
     /**
      * Снизу вверх: сначала входы, потом сам узел. Так правило всегда видит входы уже преобразованными.
      *
-     * @param ResourceNode|SharedScanNode|SqlScanNode|JoinNode $node    корень поддерева
+     * @param ResourceNode|EntityScanNodeDraft|EntityScanNode|ForeignDataScanNode|JoinNode $node    корень поддерева
      * @param bool                                             $changed по ссылке: true, если правило сработало хотя бы на одном узле
      */
-    private function transformUp(ResourceNode|SharedScanNode|SqlScanNode|JoinNode $node, bool &$changed): ResourceNode|SharedScanNode|SqlScanNode|JoinNode
+    private function transformUp(ResourceNode|EntityScanNodeDraft|EntityScanNode|ForeignDataScanNode|JoinNode $node, bool &$changed): ResourceNode|EntityScanNodeDraft|EntityScanNode|ForeignDataScanNode|JoinNode
     {
-        // После шага sql дерево не переписывается: SqlScanNode ставит последний шаг
-        if ($node instanceof SqlScanNode) {
-            throw new \LogicException(message: static::class . ' met SqlScanNode: rules must run before the sql step');
+        // После шага sql дерево не переписывается: EntityScanNode ставит последний шаг
+        if ($node instanceof EntityScanNode) {
+            throw new \LogicException(message: static::class . ' met EntityScanNode: rules must run before the sql step');
         }
 
-        // Входы обходятся по классу узла: у JoinNode — два, у SharedScanNode — один, у ResourceNode — нет
+        // Входы обходятся по классу узла: у JoinNode — два, у EntityScanNodeDraft — один, у ResourceNode — нет
         if ($node instanceof JoinNode) {
             $node = $node
                 ->withOuter(outer: $this->transformUp(node: $node->outer, changed: $changed))
                 ->withInner(inner: $this->transformUp(node: $node->inner, changed: $changed));
-        } elseif ($node instanceof SharedScanNode) {
-            // transformUp возвращает любой узел, а вход SharedScanNode — только SharedRowJoinNode или ResourceNode.
+        } elseif ($node instanceof EntityScanNodeDraft) {
+            // transformUp возвращает любой узел, а вход EntityScanNodeDraft — только EntitySharedJoinNode или ResourceNode.
             // Если правило заменило верх закрытой строки на что-то другое (например, подняло ветку),
             // это ошибка плана: строка уже закрыта, ветки в ней быть не может. Такие правила
-            // должны идти до SharedScanPass.
+            // должны идти до EntityScanNodeDraftPass.
             $input = $this->transformUp(node: $node->input, changed: $changed);
-            if (!$input instanceof SharedRowJoinNode && !$input instanceof ResourceNode) {
+            if (!$input instanceof EntitySharedJoinNode && !$input instanceof ResourceNode) {
                 // sprintf принимает значения через ...$values — они позиционные
                 throw new \LogicException(message: sprintf(
-                    '%s replaced the top of a closed row with %s: SharedScanNode input must be SharedRowJoinNode or ResourceNode, the rule must run before SharedScanPass',
+                    '%s replaced the top of a closed row with %s: EntityScanNodeDraft input must be EntitySharedJoinNode or ResourceNode, the rule must run before EntityScanNodeDraftPass',
                     static::class,
                     $input::class,
                 ));

@@ -15,7 +15,7 @@ namespace Ggs\JsonApiEngine\Plan\Select;
 final class PreloadBelowNestJoinRule extends Rule
 {
     #[\Override]
-    public function apply(ResourceNode|SharedScanNode|SqlScanNode|JoinNode $node): ResourceNode|SharedScanNode|SqlScanNode|JoinNode|null
+    public function apply(ResourceNode|EntityScanNodeDraft|EntityScanNode|ForeignDataScanNode|JoinNode $node): ResourceNode|EntityScanNodeDraft|EntityScanNode|ForeignDataScanNode|JoinNode|null
     {
         if (!$node instanceof PreloadNode
             || !($node->outer instanceof HashNestJoinNode || $node->outer instanceof MergeNestJoinNode)) {

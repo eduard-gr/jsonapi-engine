@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace Ggs\JsonApiEngine\Test\Model;
 
-use Ggs\JsonApiEngine\Model\Entity;
+use Ggs\JsonApiEngine\Model\DatabaseEntitySource;
 use Ggs\JsonApiEngine\Test\Model\Fixture\Entity\CertificateKeysEntity;
 use Ggs\JsonApiEngine\Test\Model\Fixture\Entity\CertificatesEntity;
 use Ggs\JsonApiEngine\Test\Model\Fixture\Invalid;
@@ -18,13 +18,13 @@ final class EntityValidationTest extends TestCase
     /**
      * Сущности фикстур: таблицы тестовой БД (`Entity/`) и таблицы только для модульных тестов (`Model/`).
      *
-     * @return iterable<string, array{class-string<Entity>}>
+     * @return iterable<string, array{class-string<DatabaseEntitySource>}>
      */
-    public static function entities(): iterable
+    public static function getEntities(): iterable
     {
         foreach (['Entity', 'Model'] as $directory) {
             foreach (glob(__DIR__ . "/Fixture/{$directory}/*.php") ?: [] as $file) {
-                /** @var class-string<Entity> $class */
+                /** @var class-string<DatabaseEntitySource> $class */
                 $class = "Ggs\\JsonApiEngine\\Test\\Model\\Fixture\\{$directory}\\" . basename($file, '.php');
                 yield "{$directory}/" . basename($file, '.php') => [$class];
             }
@@ -32,9 +32,9 @@ final class EntityValidationTest extends TestCase
     }
 
     /**
-     * @param class-string<Entity> $class
+     * @param class-string<DatabaseEntitySource> $class
      */
-    #[DataProvider('entities')]
+    #[DataProvider('getEntities')]
     public function testFixtureEntitiesAreValid(string $class): void
     {
         $class::validate();
@@ -42,9 +42,9 @@ final class EntityValidationTest extends TestCase
     }
 
     /**
-     * @return iterable<string, array{class-string<Entity>, list<string>}>
+     * @return iterable<string, array{class-string<DatabaseEntitySource>, list<string>}>
      */
-    public static function invalid(): iterable
+    public static function getInvalidEntities(): iterable
     {
         yield 'no primary' => [Invalid\NoPrimaryEntity::class, [
             'TABLE must be a non-empty string',
@@ -63,10 +63,10 @@ final class EntityValidationTest extends TestCase
     }
 
     /**
-     * @param class-string<Entity> $class
+     * @param class-string<DatabaseEntitySource> $class
      * @param list<string>         $messages
      */
-    #[DataProvider('invalid')]
+    #[DataProvider('getInvalidEntities')]
     public function testInvalidEntities(string $class, array $messages): void
     {
         try {
@@ -81,15 +81,15 @@ final class EntityValidationTest extends TestCase
 
     public function testStaticMetadata(): void
     {
-        self::assertSame('id', CertificatesEntity::primaryColumn());
-        self::assertSame('key_id', CertificateKeysEntity::primaryColumn());
-        self::assertSame('size', CertificateKeysEntity::column(CertificateKeysEntity::KEY_SIZE));
-        self::assertSame('user_id', CertificatesEntity::column(CertificatesEntity::USER_ID));
+        self::assertSame('id', CertificatesEntity::getPrimaryKeyColumnName());
+        self::assertSame('key_id', CertificateKeysEntity::getPrimaryKeyColumnName());
+        self::assertSame('size', CertificateKeysEntity::getColumn(CertificateKeysEntity::KEY_SIZE));
+        self::assertSame('user_id', CertificatesEntity::getColumn(CertificatesEntity::USER_ID));
         self::assertTrue(CertificateKeysEntity::isUnique(CertificateKeysEntity::CERTIFICATE_ID));
         self::assertTrue(CertificateKeysEntity::isUnique(CertificateKeysEntity::KEY_ID));
         self::assertFalse(CertificateKeysEntity::isUnique(CertificateKeysEntity::KEY_SIZE));
 
         $this->expectException(\LogicException::class);
-        Invalid\NoPrimaryEntity::primaryColumn();
+        Invalid\NoPrimaryEntity::getPrimaryKeyColumnName();
     }
 }

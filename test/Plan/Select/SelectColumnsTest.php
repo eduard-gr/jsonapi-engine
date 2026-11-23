@@ -14,22 +14,23 @@ use Ggs\JsonApiEngine\Parser\QueryParser;
 use Ggs\JsonApiEngine\Plan\Select\JoinNode;
 use Ggs\JsonApiEngine\Plan\Select\ResourceNode;
 use Ggs\JsonApiEngine\Plan\Select\SelectPlanner;
-use Ggs\JsonApiEngine\Plan\Select\SharedRowJoinNode;
-use Ggs\JsonApiEngine\Plan\Select\SharedScanNode;
-use Ggs\JsonApiEngine\Plan\Select\SqlScanNode;
+use Ggs\JsonApiEngine\Plan\Select\EntitySharedJoinNode;
+use Ggs\JsonApiEngine\Plan\Select\EntityScanNodeDraft;
+use Ggs\JsonApiEngine\Plan\Select\EntityScanNode;
+use Ggs\JsonApiEngine\Test\Plan\Select\Fixture\RequiredColumnsResource;
 use PHPUnit\Framework\TestCase;
 use sad_spirit\pg_builder\SqlBuilderWalker;
 
 /**
  * Запросы плана (шаг sql): список колонок (первичный ключ, колонки fields и ключи соединений каждого ресурса
  * под именами <алиас ресурса>_<колонка>), карта колонок у владельца, отсечение лишних LEFT JOIN строки и ORDER BY
- * (order, клиентский sort, первичный ключ последним).
+ * (order, клиентский sort, первичный ключ последним), колонки Resource::getRequiredColumns().
  */
 final class SelectColumnsTest extends TestCase
 {
     public function testExampleQueries(): void
     {
-        $owners = self::owners(query: ['include' => 'provider,detail,delivery,domains.logs']);
+        $owners = self::getOwners(query: ['include' => 'provider,detail,delivery,domains.logs']);
 
         self::assertSame([CertificateResource::class, ProviderResource::class, DomainResource::class, LogResource::class], array_keys($owners));
 
@@ -45,7 +46,7 @@ final class SelectColumnsTest extends TestCase
             . ' left join certificate_details as t1 on t0.id = t1.certificate_id'
             . ' left join certificate_delivery_meta as t2 on t0.id = t2.certificate_id'
             . ' order by t0.id',
-            self::sql(owner: $owners[CertificateResource::class]),
+            self::getSql(owner: $owners[CertificateResource::class]),
         );
         // Ключ provider_id нужен PreloadNode над строкой, id — HashNestJoinNode domains: оба приходят сверху
         self::assertSame(
@@ -68,7 +69,7 @@ final class SelectColumnsTest extends TestCase
         self::assertSame(
             'select t0.id as t0_id, t0."name" as t0_name, t0.website as t0_website, t0.created_at as t0_created_at'
             . ' from providers as t0 order by t0.id',
-            self::sql(owner: $owners[ProviderResource::class]),
+            self::getSql(owner: $owners[ProviderResource::class]),
         );
         // certificate_id — ключ domains (inner), id — ключ logs (outer)
         self::assertSame(
@@ -81,14 +82,14 @@ final class SelectColumnsTest extends TestCase
         );
 
         // MergeNestJoinNode logs: домены по id (это и первичный ключ), логи по domain_id, затем по id
-        self::assertStringEndsWith(' order by t0.id', self::sql(owner: $owners[DomainResource::class]));
-        self::assertStringEndsWith(' order by t0.domain_id, t0.id', self::sql(owner: $owners[LogResource::class]));
+        self::assertStringEndsWith(' order by t0.id', self::getSql(owner: $owners[DomainResource::class]));
+        self::assertStringEndsWith(' order by t0.domain_id, t0.id', self::getSql(owner: $owners[LogResource::class]));
     }
 
     public function testClientSortOfRowOwner(): void
     {
         // sort владельца по position; сортировка 1-1 ресурса (detail) на порядок строк не влияет
-        $owner = new SharedScanNode(input: new SharedRowJoinNode(
+        $owner = new EntityScanNodeDraft(input: new EntitySharedJoinNode(
             name: 'detail',
             relation: ['id', 'certificate_id'],
             outer: new ResourceNode(resource: CertificateResource::class, sort: [
@@ -102,22 +103,22 @@ final class SelectColumnsTest extends TestCase
 
         self::assertStringEndsWith(
             ' order by t0.created_at desc, t0.code, t0.id',
-            self::sql(owner: $owner->withSelect()),
+            self::getSql(owner: $owner->withSelect()),
         );
     }
 
     public function testPrimaryKeyInSortIsNotRepeated(): void
     {
-        $owner = new SharedScanNode(input: new ResourceNode(resource: ProviderResource::class, sort: [
+        $owner = new EntityScanNodeDraft(input: new ResourceNode(resource: ProviderResource::class, sort: [
             ['attribute' => 'id', 'descending' => true, 'position' => 0],
         ]));
 
-        self::assertStringEndsWith(' order by t0.id desc', self::sql(owner: $owner->withSelect()));
+        self::assertStringEndsWith(' order by t0.id desc', self::getSql(owner: $owner->withSelect()));
     }
 
     public function testOnlyRequestedFieldsAndKeys(): void
     {
-        $owners = self::owners(query: [
+        $owners = self::getOwners(query: [
             'include' => 'delivery',
             'fields' => ['certificate' => 'code', 'delivery' => 'is_sent'],
         ]);
@@ -127,7 +128,56 @@ final class SelectColumnsTest extends TestCase
             'select t0.id as t0_id, t0.code as t0_code, t1.certificate_id as t1_certificate_id, t1.is_sent as t1_is_sent'
             . ' from certificates as t0 left join certificate_delivery_meta as t1 on t0.id = t1.certificate_id'
             . ' order by t0.id',
-            self::sql(owner: $owners[CertificateResource::class]),
+            self::getSql(owner: $owners[CertificateResource::class]),
+        );
+    }
+
+    public function testRequiredColumnsOfResource(): void
+    {
+        // status ресурс просит всегда; атрибута с этой колонкой нет, в fields её не бывает
+        $owner = (new EntityScanNodeDraft(input: new ResourceNode(resource: RequiredColumnsResource::class)))->withSelect();
+        self::assertSame(
+            'select t0.id as t0_id, t0.status as t0_status from certificates as t0 order by t0.id',
+            self::getSql(owner: $owner),
+        );
+        self::assertSame(['id' => 't0_id', 'status' => 't0_status'], $owner->columns[0]['columns']);
+        self::assertSame([], $owner->columns[0]['fields']);
+
+        // key_algorithm — только вместе с key_size: её таблица key_algorithms подключается, хотя атрибута нет
+        $owner = (new EntityScanNodeDraft(input: new ResourceNode(
+            resource: RequiredColumnsResource::class,
+            fields: [RequiredColumnsResource::KEY_SIZE],
+        )))->withSelect();
+        self::assertSame(
+            [
+                'id' => 't0_id',
+                'key_size' => 't0_key_size',
+                'status' => 't0_status',
+                'key_algorithm' => 't0_key_algorithm',
+            ],
+            $owner->columns[0]['columns'],
+        );
+        self::assertStringContainsString(' left join key_algorithms as ', self::getSql(owner: $owner));
+        self::assertSame([RequiredColumnsResource::KEY_SIZE], $owner->columns[0]['fields']);
+    }
+
+    public function testRequiredColumnsAreNotInAncestorChain(): void
+    {
+        // Тело CTE предка выбирает только ключ связи: колонки getRequiredColumns() родителя в нём не нужны
+        $parent = new EntityScanNodeDraft(input: new ResourceNode(resource: RequiredColumnsResource::class));
+        $child = (new EntityScanNodeDraft(input: new ResourceNode(resource: DomainResource::class)))->withSelect(
+            keys: ['certificate_id'],
+            ancestors: [[
+                'node' => $parent,
+                'resource' => $parent->getRootResourceNode(),
+                'key' => 'id',
+                'column' => 'certificate_id',
+            ]],
+        );
+
+        self::assertStringStartsWith(
+            'with p1 as ( select t0.id as id from certificates as t0 ) select ',
+            self::getSql(owner: $child),
         );
     }
 
@@ -135,9 +185,9 @@ final class SelectColumnsTest extends TestCase
      * Владельцы запросов плана после шага sql по классу ресурса-владельца.
      *
      * @param array<string, mixed> $query
-     * @return array<class-string, SqlScanNode>
+     * @return array<class-string, EntityScanNode>
      */
-    private static function owners(array $query): array
+    private static function getOwners(array $query): array
     {
         $tree = (new QueryParser())->parse(resource: CertificateResource::class, query: $query);
         $owners = [];
@@ -147,12 +197,12 @@ final class SelectColumnsTest extends TestCase
     }
 
     /**
-     * @param array<class-string, SqlScanNode> $owners
+     * @param array<class-string, EntityScanNode> $owners
      */
-    private static function collect(ResourceNode|SharedScanNode|SqlScanNode|JoinNode $node, array &$owners): void
+    private static function collect(ResourceNode|EntityScanNodeDraft|EntityScanNode|ForeignDataScanNode|JoinNode $node, array &$owners): void
     {
-        if ($node instanceof SqlScanNode) {
-            $owners[$node->rowOwner()->resource] = $node;
+        if ($node instanceof EntityScanNode) {
+            $owners[$node->getRootResourceNode()->resource] = $node;
             self::collect(node: $node->input, owners: $owners);
         } elseif ($node instanceof JoinNode) {
             self::collect(node: $node->outer, owners: $owners);
@@ -160,7 +210,7 @@ final class SelectColumnsTest extends TestCase
         }
     }
 
-    private static function sql(SqlScanNode $owner): string
+    private static function getSql(EntityScanNode $owner): string
     {
 
         return (string) preg_replace('/\s+/', ' ', $owner->select->dispatch(new SqlBuilderWalker()));

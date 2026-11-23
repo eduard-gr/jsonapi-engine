@@ -9,8 +9,9 @@ use Ggs\JsonApiEngine\Resource;
 use Ggs\JsonApiEngine\Resource\ManyToOne;
 
 /**
- * Ресурс для SerializeIteratorTest без модели: составной атрибут `validity` (две колонки, свой метод),
- * атрибуты с приведением по type и связь по внешнему ключу `issuer` (ManyToOne).
+ * Ресурс для SerializeReaderTest без модели: атрибуты с приведением по type, связь по внешнему ключу `issuer`
+ * (ManyToOne) и составной атрибут `validity` (две колонки) без своего `serialize()` — по описанию его не собрать,
+ * запросить его в `fields` — LogicException узла.
  */
 final class VoucherResource extends Resource
 {
@@ -29,18 +30,10 @@ final class VoucherResource extends Resource
         self::VALIDITY => ['columns' => ['valid_from', 'valid_to']],
     ];
 
-    public static function relationships(): array
+    public static function getRelationships(): array
     {
         return [
             self::ISSUER => new ManyToOne(resource: ProviderResource::class, relation: ['issuer_id', 'id']),
         ];
-    }
-
-    /**
-     * @param array<string, mixed> $values `valid_from`, `valid_to`
-     */
-    public static function serializeValidity(array $values): array
-    {
-        return ['from' => $values['valid_from'], 'to' => $values['valid_to']];
     }
 }

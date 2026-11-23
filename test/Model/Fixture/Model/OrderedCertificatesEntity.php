@@ -4,12 +4,12 @@ declare(strict_types=1);
 
 namespace Ggs\JsonApiEngine\Test\Model\Fixture\Model;
 
-use Ggs\JsonApiEngine\Model\Entity;
+use Ggs\JsonApiEngine\Model\DatabaseEntitySource;
 
 /**
  * Сертификаты со ссылкой на заказ.
  */
-final class OrderedCertificatesEntity extends Entity
+final class OrderedCertificatesEntity extends DatabaseEntitySource
 {
     public const string TABLE = 'certificates';
 

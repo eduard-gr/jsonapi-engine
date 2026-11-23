@@ -2,15 +2,15 @@
 
 /**
  * Вставка по вложенному маршруту: `POST /certificates/1/domains` — новые домены существующего сертификата 1.
- * Документ → `WriteDocumentParser::insert()` → `WritePlanner` (план с родителем маршрута) → `WriterBuilder::root()` с
+ * Документ → `WriteDocumentParser::insert()` → `WritePlanner` (план с родителем маршрута) → `WriterBuilder::getRoot()` с
  * id из маршрута → строки в SQLite базе example/db.
  *
  *     php example/insert-route.php            # дерево исполнителей (explain) и ключи корней; SQL каждого INSERT — в stderr
  *     php example/insert-route.php 2>sql.log  # SQL отдельно
  *
  * Сертификат — не в документе, а в маршруте: `WritePlanner::plan()` получает родителя и его связь
- * (`CertificateResource::DOMAINS`, `relation` `[id, certificate_id]`) и кладёт в план `RouteParentNode`. Сам id —
- * значение, а не форма плана, поэтому в плане его нет: его получает `WriterBuilder::root()`. `RouteParentWriter` один
+ * (`CertificateResource::DOMAINS`, `relation` `[id, certificate_id]`) и кладёт в план `EntityRouteParentNode`. Сам id —
+ * значение, а не форма плана, поэтому в плане его нет: его получает `WriterBuilder::getRoot()`. `EntityRouteParentWriter` один
  * раз, до первой вставки, проверяет, что сертификат есть (иначе `WriteNotFoundException`, 404), и даёт каждому корню
  * колонку связи `certificate_id = 1`. Своей связи `certificate` у `DomainResource` нет и не нужно.
  *
@@ -20,6 +20,8 @@
 
 declare(strict_types=1);
 
+use Ggs\JsonApiEngine\Example\Container\ArrayContainer;
+use Ggs\JsonApiEngine\Example\Container\ExampleResources;
 use Ggs\JsonApiEngine\Example\Resource\CertificateResource;
 use Ggs\JsonApiEngine\Example\Resource\DomainResource;
 use Ggs\JsonApiEngine\Executor\Write\WriterBuilder;
@@ -49,7 +51,7 @@ $plan = new WritePlanner()->plan(
     relationship: CertificateResource::DOMAINS,
 );
 // lock — FOR KEY SHARE в проверке родителя: в PostgreSQL true; SQLite примера такой конструкции не знает
-$insert = new WriterBuilder(pdo: $pdo, lock: false)->root(
+$insert = new WriterBuilder(pdo: $pdo, lock: false, container: new ArrayContainer(services: ExampleResources::getAll()))->getRoot(
     plan: $plan,
     data: $roots,
     route_id: CERTIFICATE_ID,

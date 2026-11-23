@@ -36,7 +36,7 @@ final readonly class InsertOperation extends WriteOperation
     }
 
     #[\Override]
-    public function relationship(string $name): ?RelationshipOperation
+    public function getRelationship(string $name): ?RelationshipOperation
     {
         return $this->relationships[$name] ?? null;
     }

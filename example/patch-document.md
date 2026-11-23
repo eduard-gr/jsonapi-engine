@@ -33,7 +33,7 @@ php example/patch-document.php 2>sql.log     # деревья — в stdout, SQL
 flowchart LR
     A["Документ JSON:API<br/>data + included"] -->|"WriteDocumentParser::update()"| B["Дерево операций<br/>объекты …Operation"]
     B -->|"WritePlanner::plan()"| C["План<br/>неизменяемые узлы …Node"]
-    C -->|"WriterBuilder::root()"| D["Дерево исполнителей<br/>…Writer"]
+    C -->|"WriterBuilder::getRoot()"| D["Дерево исполнителей<br/>…Writer"]
     D -->|"WriteRootWriter::execute()"| E["SQL в базе<br/>ключи корня"]
 ```
 
@@ -143,7 +143,7 @@ flowchart LR
 ### 3.3. Обход корня
 
 Корень существует, поэтому его операция — `UpdateOperation`. Проверяется, что ресурс можно изменять (маркер
-`Updatable`, иначе 403), затем атрибуты и связи.
+`UpdatableInterface`, иначе 403), затем атрибуты и связи.
 
 **Атрибуты.** Каждый должен быть известен, не быть первичным ключом и не быть только для чтения; `null` допустим только
 у атрибута с `nullable`. `recipient_name: null` проходит (`nullable`), `buyer_email: null` дал бы 400.
@@ -158,8 +158,8 @@ flowchart LR
 | `null` | удалить текущую | |
 
 Ссылка `delivery:lid:del1` найдена в индексе и помечена использованной. Замена удаляет текущую доставку, поэтому
-проверяется `Deletable` у `DeliveryResource`; новый ресурс разбирается рекурсивно в `InsertOperation` (проверяется
-`Insertable`). Связь получает `replace: true`.
+проверяется `DeletableInterface` у `DeliveryResource`; новый ресурс разбирается рекурсивно в `InsertOperation` (проверяется
+`InsertableInterface`). Связь получает `replace: true`.
 
 **Связь `domains`** — один ко многим, владение. Сначала парсер смотрит, есть ли в списке хоть одна пометка `meta.op`.
 Есть (у домена 2), значит изменение частичное: `replace: false`. Без пометок это была бы полная замена списка.
@@ -167,9 +167,9 @@ flowchart LR
 
 | элемент | в `included` | операция | проверка возможности |
 |---|---|---|---|
-| `{domain, id 3}` | да, `/included/0` | `UpdateOperation` | `Updatable` |
-| `{domain, id 2, meta.op remove}` | нет | `DeleteOperation` | `Deletable` |
-| `{domain, lid d1}` | да, `/included/1` | `InsertOperation` | `Insertable` |
+| `{domain, id 3}` | да, `/included/0` | `UpdateOperation` | `UpdatableInterface` |
+| `{domain, id 2, meta.op remove}` | нет | `DeleteOperation` | `DeletableInterface` |
+| `{domain, lid d1}` | да, `/included/1` | `InsertOperation` | `InsertableInterface` |
 
 (Элемент `{id}` без ресурса в `included` и без пометки получил бы `KeepOperation`: ничего не менять, только
 проверить, что ребёнок принадлежит родителю.)
@@ -250,29 +250,30 @@ WriteOperationNode (CertificateWithDetailResource)
     update: UpdateResourceNode
 ```
 
-Ветвей `add` (для `InsertOperation`) и `remove` (для `DeleteOperation`) нет: таких операций у корня нет. Ветвь
-`update` исполняет и `UpdateOperation`, и `KeepOperation`.
+Ветвей `add` (для `InsertOperation`), `keep` (для `KeepOperation`) и `remove` (для `DeleteOperation`) нет: таких
+операций у корня нет. Ветвь `update` исполняет только `UpdateOperation`; ресурс, который только ищут, идёт в свою
+ветвь `keep` (`KeepEntityNode`, раздел 7.1).
 
-**Шаг 2. Таблицы модели корня.** Ветвь `update` получает дерево таблиц по `model()` ресурса
+**Шаг 2. Таблицы модели корня.** Ветвь `update` получает дерево таблиц по `getModel()` ресурса
 (`LeftJoin(certificates, certificate_details, [id, certificate_id])`):
 
 ```
 WriteOperationNode (CertificateWithDetailResource)
     update: UpdateResourceNode
-        input: UpdateTableJoinNode (relation: [id, certificate_id])
-            main:   UpdateTableNode (certificates,        key: id,             returning: [id])
-            joined: UpdateOptionalTableNode
-                update: UpdateTableNode (certificate_details, key: certificate_id)
-                insert: InsertTableNode (certificate_details)
+        input: UpdateEntityJoinNode (relation: [id, certificate_id])
+            main:   UpdateEntityNode (certificates,        key: id,             returning: [id])
+            joined: UpdateOptionalEntityNode
+                update: UpdateEntityNode (certificate_details, key: certificate_id)
+                insert: InsertEntityNode (certificate_details)
 ```
 
 - `main` — главная таблица. Её строка ищется по `key: id`, значение которого известно сразу: это id ресурса.
 - `joined` — присоединённая. Её строка ищется по `key: certificate_id`; значение она получит от `main`, поэтому у `main`
   в `returning` стоит `id`.
-- Правая сторона `LeftJoin` необязательна: строки может не быть. Поэтому она обёрнута в `UpdateOptionalTableNode` с двумя
+- Правая сторона `LeftJoin` необязательна: строки может не быть. Поэтому она обёрнута в `UpdateOptionalEntityNode` с двумя
   входами — изменить строку или, если её нет, вставить.
 
-**Шаг 3. Связь `delivery`.** Связи обходятся в порядке объявления в `relationships()` ресурса: `provider`, `delivery`,
+**Шаг 3. Связь `delivery`.** Связи обходятся в порядке объявления в `getRelationships()` ресурса: `provider`, `delivery`,
 `domains`. `provider` — связь по внешнему ключу: её пишет сама строка сертификата, узла у неё нет. `delivery` в документе
 есть, и для неё планировщик решает два вопроса по очереди.
 
@@ -280,7 +281,7 @@ WriteOperationNode (CertificateWithDetailResource)
 замены — он удалит текущую доставку:
 
 ```
-WriteReplaceNode (delivery, relation: [id, certificate_id], child_resource: DeliveryResource)
+EntityReplaceNode (delivery, relation: [id, certificate_id], child_resource: DeliveryResource)
     input: WriteOperationNode (CertificateWithDetailResource) …       ← всё из шагов 1–2
 ```
 
@@ -288,10 +289,10 @@ WriteReplaceNode (delivery, relation: [id, certificate_id], child_resource: Deli
 
 ```
 WriteJoinNode (delivery, relation: [id, certificate_id])
-    parent: WriteReplaceNode (delivery) …                             ← узел замены над сертификатом
+    parent: EntityReplaceNode (delivery) …                             ← узел замены над сертификатом
     child:  WriteOperationNode (DeliveryResource)
         add: InsertResourceNode
-            input: InsertTableNode (certificate_delivery_meta)
+            input: InsertEntityNode (certificate_delivery_meta)
 ```
 
 `child` — место детей связи. Операция одна, `InsertOperation`, поэтому ветвь одна. Узел замены стоит внутри `parent`,
@@ -304,9 +305,9 @@ WriteJoinNode (delivery, relation: [id, certificate_id])
 WriteJoinNode (domains, relation: [id, certificate_id])
     parent: WriteJoinNode (delivery) …                                ← всё из шага 3
     child:  WriteOperationNode (DomainResource)
-        add:    InsertResourceNode → InsertTableNode (domains)
-        update: UpdateResourceNode → UpdateTableNode (domains, key: id)
-        remove: DeleteResourceNode
+        add:    InsertResourceNode → InsertEntityNode (domains)
+        update: UpdateResourceNode → UpdateEntityNode (domains, key: id)
+        remove: DeleteEntityNode
 ```
 
 В месте `domains` три операции трёх разных классов, поэтому у развилки три ветви. Узел при этом один: будь в
@@ -326,7 +327,7 @@ WriteJoinNode (domains, relation: [id, certificate_id])
 certificate                               WriteRootNode
 ├── delivery (замена)                     └── WriteJoinNode domains
 │   └── del1                                  ├── parent: WriteJoinNode delivery
-└── domains (частично)                        │   ├── parent: WriteReplaceNode delivery
+└── domains (частично)                        │   ├── parent: EntityReplaceNode delivery
     ├── 2                                     │   │   └── input: WriteOperationNode certificate
     ├── 3                                     │   └── child:  WriteOperationNode delivery
     └── d1                                    └── child:  WriteOperationNode domain
@@ -343,17 +344,17 @@ flowchart TD
     R["WriteRootNode"] --> JD["WriteJoinNode<br/>domains"]
     JD -->|parent| JV["WriteJoinNode<br/>delivery"]
     JD -->|child| OD["WriteOperationNode<br/>DomainResource"]
-    JV -->|parent| RV["WriteReplaceNode<br/>delivery"]
+    JV -->|parent| RV["EntityReplaceNode<br/>delivery"]
     RV -->|input| OC["WriteOperationNode<br/>CertificateWithDetailResource"]
     JV -->|child| OV["WriteOperationNode<br/>DeliveryResource"]
     OC -->|update| UC["UpdateResourceNode"]
-    UC --> TJ["UpdateTableJoinNode<br/>id = certificate_id"]
-    TJ -->|main| T1["UpdateTableNode<br/>certificates"]
-    TJ -->|joined| T2["UpdateOptionalTableNode<br/>certificate_details"]
+    UC --> TJ["UpdateEntityJoinNode<br/>id = certificate_id"]
+    TJ -->|main| T1["UpdateEntityNode<br/>certificates"]
+    TJ -->|joined| T2["UpdateOptionalEntityNode<br/>certificate_details"]
     OV -->|add| IV["InsertResourceNode<br/>certificate_delivery_meta"]
     OD -->|add| ID["InsertResourceNode<br/>domains"]
     OD -->|update| UD["UpdateResourceNode<br/>domains"]
-    OD -->|remove| DD["DeleteResourceNode"]
+    OD -->|remove| DD["DeleteEntityNode"]
 ```
 
 ### 4.4. Что в план не попадает
@@ -362,8 +363,8 @@ flowchart TD
 
 | остаётся данными | что из этого есть в плане | почему не всё |
 |---|---|---|
-| операция элемента (класс операции) | ветви `add` / `update` / `remove` места | один узел места обслуживает все элементы; ветвь выбирается по элементу |
-| признак полной замены (`RelationshipOperation::$replace`) | узел `WriteReplaceNode` связи | место одно на всех владельцев: один может заменять связь, другой — менять частично |
+| операция элемента (класс операции) | ветви `add` / `update` / `keep` / `remove` места | один узел места обслуживает все элементы; ветвь выбирается по элементу |
+| признак полной замены (`RelationshipOperation::$replace`) | узел `EntityReplaceNode` связи | место одно на всех владельцев: один может заменять связь, другой — менять частично |
 | id и значения атрибутов | ничего | план не зависит от значений |
 
 Три формы одной связи в плане:
@@ -371,20 +372,20 @@ flowchart TD
 | в документе | узлы связи |
 |---|---|
 | частичное изменение (есть `meta.op`) | только `WriteJoinNode` |
-| полная замена с элементами, замена to-one через `lid` | `WriteReplaceNode` под `WriteJoinNode` |
-| полная замена пустым списком, `delivery: null` | только `WriteReplaceNode` — детей нет, передавать нечего |
+| полная замена с элементами, замена to-one через `lid` | `EntityReplaceNode` под `WriteJoinNode` |
+| полная замена пустым списком, `delivery: null` | только `EntityReplaceNode` — детей нет, передавать нечего |
 
 Вторую и третью форму показывают сценарии 8 и 9 в `example/patch-document.php`.
 
 У POST узла замены не бывает (у нового ресурса нечего удалять): в его плане только `WriteJoinNode` и
-`WriteOperationNode` с одной ветвью `add`. Поддерево таблиц под `add` строит `InsertPlanner::tables()`, под `update` —
-`UpdatePlanner::tables()`.
+`WriteOperationNode` с одной ветвью `add`. Поддерево таблиц под `add` строит `InsertPlanner::getEntities()`, под `update` —
+`UpdatePlanner::getEntities()`.
 
 ---
 
 ## 5. Шаг 3. Сборщик: план → дерево исполнителей
 
-`WriterBuilder(pdo, lock)->root(plan, data: [корень])`.
+`WriterBuilder(pdo, lock)->getRoot(plan, data: [корень])`.
 
 Сборщик ничего не решает: каждый узел плана превращается в исполнитель с тем же именем (`…Node` → `…Writer`) и той же
 формой. Добавляется только то, чего в плане нет:
@@ -393,22 +394,24 @@ flowchart TD
 |---|---|
 | соединение с базой (`PDO`) | исполнителям, которые выполняют SQL |
 | корни дерева операций | `WriteRootWriter` |
-| id родителя из вложенного маршрута | `RouteParentWriter` (здесь нет) |
+| id родителя из вложенного маршрута | `EntityRouteParentWriter` (здесь нет) |
 | флаг `lock` (`FOR KEY SHARE`; в SQLite выключен) | проверкам существования |
 
 | узел плана | исполнитель | что делает |
 |---|---|---|
 | `WriteRootNode` | `WriteRootWriter` | запускает дерево для каждого корня |
 | `WriteJoinNode` | `WriteJoinWriter` | владелец, затем его дети с ключом владельца |
-| `WriteReplaceNode` | `WriteReplaceWriter` | владелец, затем `DELETE` его детей, не названных в документе |
+| `EntityReplaceNode` | `EntityReplaceWriter` | владелец, затем `DELETE` его детей, не названных в документе |
 | `WriteOperationNode` | `WriteOperationWriter` | развилка по классу операции |
 | `UpdateResourceNode` | `UpdateResourceWriter` | операция → строка «колонка → значение» |
-| `UpdateTableJoinNode` | `UpdateTableJoinWriter` | главная таблица, затем присоединённая |
-| `UpdateOptionalTableNode` | `UpdateOptionalTableWriter` | изменить, а если строки нет — вставить |
-| `UpdateTableNode` | `UpdateTableWriter` | `UPDATE` или `SELECT` одной таблицы |
+| `UpdateEntityJoinNode` | `UpdateEntityJoinWriter` | главная таблица, затем присоединённая |
+| `UpdateOptionalEntityNode` | `UpdateOptionalEntityWriter` | изменить, а если строки нет — вставить |
+| `UpdateEntityNode` | `UpdateEntityWriter` | `UPDATE` или `SELECT` одной таблицы |
 | `InsertResourceNode` | `InsertResourceWriter` | операция → строка «колонка → значение» |
-| `InsertTableNode` | `InsertTableWriter` | `INSERT` одной таблицы |
-| `DeleteResourceNode` | `DeleteResourceWriter` | `DELETE` строки главной таблицы |
+| `InsertEntityNode` | `InsertEntityWriter` | `INSERT` одной таблицы |
+| `KeepEntityNode` | `KeepEntityWriter` | `SELECT` строки главной таблицы: ресурс только ищут (`KeepOperation`) |
+| `WriteLinkedKeyNode` | `WriteLinkedKeyWriter` | сторож над ветвью `update`/`keep`/`remove`: первичный ключ ресурса — колонка связи, id операции обязан совпасть с ключом родителя |
+| `DeleteEntityNode` | `DeleteEntityWriter` | `DELETE` строки главной таблицы |
 
 Дерево исполнителей примера (форма та же, что у плана):
 
@@ -416,20 +419,20 @@ flowchart TD
 WriteRootWriter (data: 1)
     root: WriteJoinWriter (domains)
         parent: WriteJoinWriter (delivery)
-            parent: WriteReplaceWriter (delivery, child_resource: DeliveryResource)
+            parent: EntityReplaceWriter (delivery, child_resource: DeliveryResource)
                 input: WriteOperationWriter (CertificateWithDetailResource)
                     update: UpdateResourceWriter
-                        input: UpdateTableJoinWriter (relation: [id, certificate_id])
-                            main:   UpdateTableWriter (certificates, key: id, returning: [id])
-                            joined: UpdateOptionalTableWriter
-                                update: UpdateTableWriter (certificate_details, key: certificate_id)
-                                insert: InsertTableWriter (certificate_details)
+                        input: UpdateEntityJoinWriter (relation: [id, certificate_id])
+                            main:   UpdateEntityWriter (certificates, key: id, returning: [id])
+                            joined: UpdateOptionalEntityWriter
+                                update: UpdateEntityWriter (certificate_details, key: certificate_id)
+                                insert: InsertEntityWriter (certificate_details)
             child: WriteOperationWriter (DeliveryResource)
-                add: InsertResourceWriter → InsertTableWriter (certificate_delivery_meta)
+                add: InsertResourceWriter → InsertEntityWriter (certificate_delivery_meta)
         child: WriteOperationWriter (DomainResource)
-            add:    InsertResourceWriter → InsertTableWriter (domains)
-            update: UpdateResourceWriter → UpdateTableWriter (domains, key: id)
-            remove: DeleteResourceWriter (domains)
+            add:    InsertResourceWriter → InsertEntityWriter (domains)
+            update: UpdateResourceWriter → UpdateEntityWriter (domains, key: id)
+            remove: DeleteEntityWriter (domains)
 ```
 
 ---
@@ -438,14 +441,14 @@ WriteRootWriter (data: 1)
 
 ### 6.1. Правило движения
 
-У каждого исполнителя уровня ресурсов один метод (контракт `Executor\PushExecutor`):
+У каждого исполнителя уровня ресурсов один метод (контракт `Executor\PushExecutorInterface`):
 
 ```php
 push(WriteOperation $operation, array $link = []): array   // возвращает ключи
 ```
 
-Исполнители уровня таблиц (`…Table…Writer`) принимают уже строку «колонка → значение» (контракт
-`Executor\TableWriter`).
+Исполнители уровня таблиц (`…Entity…Writer`) принимают уже строку «колонка → значение» (контракт
+`Executor\EntityWriterInterface`).
 
 - **вниз** идут операция из дерева операций и `$link` — колонки связи от родителя (`[certificate_id => 1]`);
 - **вверх** возвращаются ключи записанной строки (`[id => 1, …]`);
@@ -460,7 +463,7 @@ sequenceDiagram
     participant R as WriteRootWriter
     participant JD as WriteJoinWriter domains
     participant JV as WriteJoinWriter delivery
-    participant RV as WriteReplaceWriter delivery
+    participant RV as EntityReplaceWriter delivery
     participant OC as WriteOperationWriter certificate
     participant OV as WriteOperationWriter delivery
     participant OD as WriteOperationWriter domain
@@ -505,7 +508,7 @@ sequenceDiagram
 Вызов спускается по цепочке `parent` до самого низа, и запись начинается оттуда.
 
 **1. Сертификат: спуск до развилки.** `WriteRootWriter` → `WriteJoinWriter(domains)` → `WriteJoinWriter(delivery)` →
-`WriteReplaceWriter(delivery)` → `WriteOperationWriter(certificate)`. Узлы связи и замены сначала передают операцию
+`EntityReplaceWriter(delivery)` → `WriteOperationWriter(certificate)`. Узлы связи и замены сначала передают операцию
 вниз, ничего не делая. Развилка видит `UpdateOperation` и отдаёт её ветви `update`.
 
 **2. Операция → строка.** `UpdateResourceWriter` превращает операцию в строку «колонка модели → значение» и добавляет
@@ -518,7 +521,7 @@ link:   {id: 1}
 
 В строку попадают только присланные атрибуты. `null` — такое же значение, как остальные: важно присутствие ключа.
 
-**3. Главная таблица.** `UpdateTableWriter(certificates)` берёт из строки свои колонки (`nominal`) и ищет строку по
+**3. Главная таблица.** `UpdateEntityWriter(certificates)` берёт из строки свои колонки (`nominal`) и ищет строку по
 `link[id]`:
 
 ```sql
@@ -530,8 +533,8 @@ where id = :key and (nominal is distinct from :nominal) returning id
 Условие `is distinct from` не даёт перезаписать строку, если значение то же. Вверх уходят ключи
 `{nominal: "2500.00", id: 1}`.
 
-**4. Присоединённая таблица.** `UpdateTableJoinWriter` берёт из ключей главной `id` и кладёт его в `$link` под именем
-колонки присоединённой стороны: `{id: 1, certificate_id: 1}`. `UpdateOptionalTableWriter` видит в строке колонки
+**4. Присоединённая таблица.** `UpdateEntityJoinWriter` берёт из ключей главной `id` и кладёт его в `$link` под именем
+колонки присоединённой стороны: `{id: 1, certificate_id: 1}`. `UpdateOptionalEntityWriter` видит в строке колонки
 деталей и вызывает изменение:
 
 ```sql
@@ -548,7 +551,7 @@ returning certificate_id
 {"nominal": "2500.00", "id": 1, "buyer_email": "new-buyer@example.com", "recipient_name": null, "certificate_id": 1}
 ```
 
-**5. Связь `delivery`.** Ключи вернулись в `WriteReplaceWriter(delivery)`. Он берёт из них ключ владельца (`id = 1`,
+**5. Связь `delivery`.** Ключи вернулись в `EntityReplaceWriter(delivery)`. Он берёт из них ключ владельца (`id = 1`,
 колонка `relation[0]`). У связи `replace: true`, поэтому удаляются дети, которых нет в списке. В списке только
 новый ребёнок без id, значит удаляются все:
 
@@ -627,13 +630,14 @@ RelationshipOperation domains, replace: true
 select id from certificates where id = :key                                          -- корень: атрибутов нет, только поиск
 delete from domains where certificate_id = :parent_key and id not in (:listed_0, :listed_1)
 -- {"parent_key":1,"listed_0":1,"listed_1":3} → 1 rows            (удалён домен 2)
-select id from domains where id = :key and certificate_id = :link_certificate_id      -- KeepOperation 1: только проверка
-select id from domains where id = :key and certificate_id = :link_certificate_id      -- KeepOperation 3: только проверка
+select id from domains where id = :key_id and certificate_id = :link_certificate_id   -- KeepOperation 1: только проверка
+select id from domains where id = :key_id and certificate_id = :link_certificate_id   -- KeepOperation 3: только проверка
 ```
 
-План отличается в двух местах. Под узлом связи `domains` появляется `WriteReplaceNode (domains)` — он и выполняет
-`DELETE`. У места `domains` остаётся одна ветвь `update` (она исполняет `KeepOperation`). Парсер заранее требует
-`Deletable` у `DomainResource`, даже если удалять в итоге нечего.
+План отличается в двух местах. Под узлом связи `domains` появляется `EntityReplaceNode (domains)` — он и выполняет
+`DELETE`. У места `domains` одна ветвь — `keep` (`KeepEntityNode` → `KeepEntityWriter`): домены только ищутся,
+по одному `SELECT` главной таблицы, поддерева таблиц изменения у ветви нет. Парсер заранее требует
+`DeletableInterface` у `DomainResource`, даже если удалять в итоге нечего.
 
 ### 7.2. Значения не изменились
 
@@ -666,7 +670,7 @@ insert into certificate_details (buyer_email, greeting_text, certificate_id) val
 ```
 
 Первый запрос — поиск корня: колонки главной таблицы не присланы, поэтому вместо `UPDATE` идёт `SELECT` (нужны ключ
-для присоединённой таблицы и сам факт, что сертификат есть). Остальное — работа `UpdateOptionalTableWriter`: изменить,
+для присоединённой таблицы и сам факт, что сертификат есть). Остальное — работа `UpdateOptionalEntityWriter`: изменить,
 а если строки нет — вставить. Если строка есть, а прислали `NULL`,
 в колонку пишется `NULL`; строка не удаляется.
 
@@ -714,7 +718,7 @@ delete from domains where id = :key_id and certificate_id = :link_certificate_id
 | когда | статус | примеры |
 |---|---|---|
 | разбор, до первого запроса | 400 | неизвестный атрибут или связь; `null` у атрибута без `nullable`; лишний или дважды использованный ресурс в `included` |
-| разбор | 403 | у ресурса нет маркера `Insertable` / `Updatable` / `Deletable` для запрошенной операции; `id` у корня POST (клиентские id не поддерживаются) |
+| разбор | 403 | у ресурса нет маркера `InsertableInterface` / `UpdatableInterface` / `DeletableInterface` для запрошенной операции; `id` у корня POST (клиентские id не поддерживаются) |
 | разбор | 409 | `data.type` или `data.id` не совпали с маршрутом |
 | разбор | 404 | `DELETE` с id не из цифр: такого ресурса быть не может (`Parser\ResourceNotFoundException`) |
 | выполнение | 404 | ресурса нет; ребёнок принадлежит другому родителю; родителя из вложенного маршрута нет |
@@ -722,7 +726,9 @@ delete from domains where id = :key_id and certificate_id = :link_certificate_id
 
 Ошибки разбора — `Parser\InvalidDocumentException` со статусом, они указывают место в документе (`source.pointer`).
 Ошибка 404 при выполнении — `Executor\Write\WriteNotFoundException`, она называет ресурс в `meta` (`{type, id}`), в
-том числе родителя из вложенного маршрута: места в документе у неё нет.
+том числе родителя из вложенного маршрута: места в документе у неё нет. Так же устроена ошибка 400 при выполнении —
+`Executor\Write\WriteInvalidAttributeException`: значение атрибута не принял метод `deserialize()` самого ресурса
+(`Resource\DeserializeInterface`), в `meta` — `{type, id | lid, attribute}`.
 
 ---
 
@@ -736,17 +742,17 @@ delete from domains where id = :key_id and certificate_id = :link_certificate_id
 | разбор | `Parser\Write` | `WriteDocumentParser` | `update()` (PATCH), а также `insert()` (POST) и `delete()` (DELETE) с общим ядром |
 | дерево операций | `Parser\Write` | `WriteOperation`: `InsertOperation`, `UpdateOperation`, `KeepOperation`, `DeleteOperation` | операция над одним ресурсом; вид операции — класс |
 | дерево операций | `Parser\Write` | `RelationshipOperation` | связь по владению: признак замены и операции над детьми |
-| дерево операций | `Parser\Write` | `ResourceIdentity`: `PersistentIdentity`, `LocalIdentity` | имя ресурса: `id` или `lid` |
+| дерево операций | `Parser\Write` | `ResourceIdentityInterface`: `PersistentIdentity`, `LocalIdentity` | имя ресурса: `id` или `lid` |
 | план | `Plan\Write` | `WritePlanner` | дерево операций → узлы плана |
-| план | `Plan\Write` | `WriteRootNode`, `RouteParentNode`, `WriteJoinNode`, `WriteReplaceNode`, `WriteOperationNode` | корень, родитель вложенного маршрута, связь, полная замена связи, развилка по операции |
-| план | `Plan\Insert` | `InsertPlanner`, `InsertResourceNode`, `InsertTableJoinNode`, `InsertOptionalTableNode`, `InsertTableNode` | вставка ресурса и его таблиц; `tables()` — дерево таблиц по `model()` |
-| план | `Plan\Update` | `UpdatePlanner`, `UpdateResourceNode`, `UpdateTableJoinNode`, `UpdateOptionalTableNode`, `UpdateTableNode` | изменение ресурса и его таблиц; `tables()` — дерево таблиц по `model()` |
-| план | `Plan\Delete` | `DeleteResourceNode` | удаление ресурса |
+| план | `Plan\Write` | `WriteRootNode`, `EntityRouteParentNode`, `WriteJoinNode`, `EntityReplaceNode`, `WriteOperationNode`, `KeepEntityNode`, `WriteLinkedKeyNode` | корень, родитель вложенного маршрута, связь, полная замена связи, развилка по операции, поиск ресурса без изменения, сторож ветви ресурса с первичным ключом — колонкой связи |
+| план | `Plan\Insert` | `InsertPlanner`, `InsertResourceNode`, `InsertEntityJoinNode`, `InsertOptionalEntityNode`, `InsertEntityNode` | вставка ресурса и его таблиц; `getEntities()` — дерево таблиц по `getModel()` |
+| план | `Plan\Update` | `UpdatePlanner`, `UpdateResourceNode`, `UpdateEntityJoinNode`, `UpdateOptionalEntityNode`, `UpdateEntityNode` | изменение ресурса и его таблиц; `getEntities()` — дерево таблиц по `getModel()` |
+| план | `Plan\Delete` | `DeleteEntityNode` | удаление ресурса |
 | сборка | `Executor\Write` | `WriterBuilder` | план → исполнители |
-| выполнение | `Executor` | `PushExecutor`, `TableWriter` | контракты уровня ресурсов и уровня таблиц |
+| выполнение | `Executor` | `PushExecutorInterface`, `EntityWriterInterface` | контракты уровня ресурсов и уровня таблиц |
 | выполнение | `Executor\Write`, `Insert`, `Update`, `Delete` | одноимённые `…Writer` | см. таблицу в разделе 5 |
-| выполнение | `Executor\Write` | `ResourceRow`, `StatementRunner` | строка ресурса из данных операции; выполнение запроса pg_builder с логом |
+| выполнение | `Executor\Write` | `ResourceDeserializer`, `StatementRunner` | строка ресурса из данных операции; выполнение запроса pg_builder с логом |
 | ошибки | `Parser`, `Executor\Write` | `InvalidDocumentException`, `WriteNotFoundException` | 400/403/409 разбора с указателем; 404 выполнения с ресурсом в `meta` |
-| возможности | `Resource` | `Insertable`, `Updatable`, `Deletable` | маркеры на классе ресурса, проверяет парсер |
+| возможности | `Resource` | `InsertableInterface`, `UpdatableInterface`, `DeletableInterface` | маркеры на классе ресурса, проверяет парсер |
 
 POST и DELETE идут по тому же конвейеру: POST — корни `InsertOperation`, DELETE — корень `DeleteOperation`.

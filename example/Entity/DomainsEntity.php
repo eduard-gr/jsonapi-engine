@@ -4,12 +4,12 @@ declare(strict_types=1);
 
 namespace Ggs\JsonApiEngine\Example\Entity;
 
-use Ggs\JsonApiEngine\Model\Entity;
+use Ggs\JsonApiEngine\Model\DatabaseEntitySource;
 
 /**
  * Таблица `domains`: домены сертификата, 1:N от `certificates`.
  */
-final class DomainsEntity extends Entity
+final class DomainsEntity extends DatabaseEntitySource
 {
     public const string TABLE = 'domains';
 

@@ -7,7 +7,7 @@ namespace Ggs\JsonApiEngine\Model;
 /**
  * Проверка констант-имён: по строковой константе на каждое имя, значение — само имя.
  *
- * Общая для `Entity` (ключи `COLUMNS`) и описаний поверх сущностей (`Resource`: ключи
+ * Общая для `DataSource` и его наследника `DatabaseEntitySource` (ключи `COLUMNS`) и описаний поверх источников (`Resource`: ключи
  * `ATTRIBUTES` и имена связей). Вызывается только из `validate()`, в тестах.
  */
 trait NamedConstants
@@ -22,7 +22,7 @@ trait NamedConstants
      *
      * @return list<string> ошибки
      */
-    private static function namedConstantErrors(array $names, array $except, string $source): array
+    private static function getNamedConstantErrors(array $names, array $except, string $source): array
     {
         $errors = [];
         $named = [];

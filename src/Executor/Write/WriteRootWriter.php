@@ -4,13 +4,13 @@ declare(strict_types=1);
 
 namespace Ggs\JsonApiEngine\Executor\Write;
 
-use Ggs\JsonApiEngine\Executor\PushExecutor;
+use Ggs\JsonApiEngine\Executor\PushExecutorInterface;
 use Ggs\JsonApiEngine\Parser\Write\WriteOperation;
 
 /**
  * Корень записи: проверки по всему запросу, затем каждый корень дерева операций в одно дерево исполнителей. Проверка
  * родителя вложенного маршрута проходит один раз и до первой записи, а не на каждом корне. Сам не исполнитель уровня
- * ресурсов: сверху ему ничего не приходит. Строит `WriterBuilder::root()` по `WriteRootNode`.
+ * ресурсов: сверху ему ничего не приходит. Строит `WriterBuilder::getRoot()` по `WriteRootNode`.
  *
  * Поток: `route->link()` (проверка родителя, колонки связи; null — маршрут не вложенный) → `root->push(корень, link)`
  * по очереди → `list<ключи корня>`.
@@ -23,9 +23,9 @@ final readonly class WriteRootWriter
      * @param list<WriteOperation> $data корни дерева операций
      */
     public function __construct(
-        private PushExecutor $root,
+        private PushExecutorInterface $root,
         private array $data,
-        private ?RouteParentWriter $route,
+        private ?EntityRouteParentWriter $route,
     ) {}
 
     /**

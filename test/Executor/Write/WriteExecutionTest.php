@@ -4,10 +4,14 @@ declare(strict_types=1);
 
 namespace Ggs\JsonApiEngine\Test\Executor\Write;
 
+use Ggs\JsonApiEngine\Example\Container\ArrayContainer;
+use Ggs\JsonApiEngine\Example\Container\ExampleResources;
 use Ggs\JsonApiEngine\Example\Resource\CertificateResource;
 use Ggs\JsonApiEngine\Example\Resource\CertificateWithDetailResource;
 use Ggs\JsonApiEngine\Example\Resource\DomainResource;
-use Ggs\JsonApiEngine\Executor\Write\RouteParentWriter;
+use Ggs\JsonApiEngine\Executor\Write\KeepEntityWriter;
+use Ggs\JsonApiEngine\Executor\Write\EntityRouteParentWriter;
+use Ggs\JsonApiEngine\Executor\Write\WriteLinkedKeyWriter;
 use Ggs\JsonApiEngine\Executor\Write\WriteNotFoundException;
 use Ggs\JsonApiEngine\Executor\Write\WriterBuilder;
 use Ggs\JsonApiEngine\Parser\Write\WriteDocumentParser;
@@ -71,21 +75,21 @@ final class WriteExecutionTest extends TestCase
         );
         self::assertSame(
             [['nominal' => 2500, 'buyer_email' => 'new@t.test', 'recipient_name' => null]],
-            $this->rows(
+            $this->getRows(
                 'select c.nominal, d.buyer_email, d.recipient_name from certificates c
                  join certificate_details d on d.certificate_id = c.id where c.id = 1',
             ),
         );
         self::assertSame(
             [['delivery_channel' => 'SMS', 'external_provider_id' => null]],
-            $this->rows('select delivery_channel, external_provider_id from certificate_delivery_meta where certificate_id = 1'),
+            $this->getRows('select delivery_channel, external_provider_id from certificate_delivery_meta where certificate_id = 1'),
         );
         // домен 1 не назван — остался: в списке есть пометка meta.op, изменение частичное
         self::assertSame(
             [['domain_name' => 'green1.net', 'is_primary' => 1], ['domain_name' => 'cdn.green1.net', 'is_primary' => 1], ['domain_name' => 'www.green1.net', 'is_primary' => 0]],
-            $this->rows('select domain_name, is_primary from domains where certificate_id = 1 order by id'),
+            $this->getRows('select domain_name, is_primary from domains where certificate_id = 1 order by id'),
         );
-        self::assertSame([], $this->rows('select id from domains where id = 2'));
+        self::assertSame([], $this->getRows('select id from domains where id = 2'));
     }
 
     public function testUnchangedValuesAreFoundButNotRewritten(): void
@@ -106,10 +110,10 @@ final class WriteExecutionTest extends TestCase
         // все присланные значения NULL — вставлять нечего
         $keys = $this->patch(data: ['attributes' => ['recipient_name' => null]], id: $id);
         self::assertSame(['id' => (int) $id], $keys);
-        self::assertSame([], $this->rows($details));
+        self::assertSame([], $this->getRows($details));
 
         $this->patch(data: ['attributes' => ['buyer_email' => 'first@t.test', 'greeting_text' => 'Hello']], id: $id);
-        self::assertSame([['buyer_email' => 'first@t.test', 'greeting_text' => 'Hello']], $this->rows($details));
+        self::assertSame([['buyer_email' => 'first@t.test', 'greeting_text' => 'Hello']], $this->getRows($details));
     }
 
     public function testFullReplacementDeletesUnlistedChildren(): void
@@ -119,15 +123,15 @@ final class WriteExecutionTest extends TestCase
             ['type' => 'domain', 'id' => '3'],
         ]]]]);
 
-        self::assertSame([['id' => 1], ['id' => 3]], $this->rows('select id from domains where certificate_id = 1 order by id'));
+        self::assertSame([['id' => 1], ['id' => 3]], $this->getRows('select id from domains where certificate_id = 1 order by id'));
     }
 
     public function testReplacementByEmptyDeletesAllChildren(): void
     {
         $this->patch(data: ['relationships' => ['delivery' => ['data' => null], 'domains' => ['data' => []]]]);
 
-        self::assertSame([], $this->rows('select id from domains where certificate_id = 1'));
-        self::assertSame([], $this->rows('select certificate_id from certificate_delivery_meta where certificate_id = 1'));
+        self::assertSame([], $this->getRows('select id from domains where certificate_id = 1'));
+        self::assertSame([], $this->getRows('select certificate_id from certificate_delivery_meta where certificate_id = 1'));
     }
 
     public function testForeignChildIsNotFound(): void
@@ -142,7 +146,92 @@ final class WriteExecutionTest extends TestCase
             self::assertSame('404', $exception->toError()['status']);
         }
         // домен другого сертификата не тронут
-        self::assertCount(1, $this->rows('select id from domains where id = 4'));
+        self::assertCount(1, $this->getRows('select id from domains where id = 4'));
+    }
+
+    /**
+     * Ресурс, который только назван (`KeepOperation`), ищет своя ветвь `keep`: один SELECT главной таблицы, без
+     * поддерева таблиц изменения.
+     */
+    public function testKeptChildIsOnlyLookedUp(): void
+    {
+        $root = new WriteDocumentParser()->update(
+            document: ['data' => ['type' => 'certificate', 'id' => '1', 'relationships' => ['domains' => ['data' => [
+                ['type' => 'domain', 'id' => '1'],
+            ]]]]],
+            resource: CertificateWithDetailResource::class,
+            id: '1',
+        );
+        $plan = new WritePlanner()->plan(resource: CertificateWithDetailResource::class, roots: [$root]);
+        $builder = new WriterBuilder(pdo: $this->pdo, lock: false, container: new ArrayContainer(services: ExampleResources::getAll()));
+
+        $place = $builder->build(plan: $plan->input)->explain()['child'];
+        self::assertSame(
+            ['node' => KeepEntityWriter::class, 'resource' => DomainResource::class, 'table' => 'domains'],
+            $place['keep'],
+        );
+        self::assertArrayNotHasKey('update', $place);
+
+        $before = $this->getRows('select * from domains where id = 1');
+        $builder->getRoot(plan: $plan, data: [$root])->execute();
+        self::assertSame($before, $this->getRows('select * from domains where id = 1'));
+    }
+
+    public function testKeptForeignChildIsNotFound(): void
+    {
+        try {
+            // домен 4 принадлежит другому сертификату
+            $this->patch(data: ['relationships' => ['domains' => ['data' => [
+                ['type' => 'domain', 'id' => '4'],
+            ]]]]);
+            self::fail('WriteNotFoundException expected');
+        } catch (WriteNotFoundException $exception) {
+            self::assertSame(['type' => 'domain', 'id' => '4'], $exception->toError()['meta']);
+            self::assertSame('404', $exception->toError()['status']);
+        }
+    }
+
+    /**
+     * У доставки первичный ключ — колонка связи с сертификатом: доставка с чужим id под сертификатом 1 — 404 от
+     * сторожа ветви, без запроса; чужая строка не тронута.
+     */
+    public function testLinkedKeyOfAnotherParentIsNotFound(): void
+    {
+        $document = [
+            'data' => ['type' => 'certificate', 'id' => '1', 'relationships' => [
+                'delivery' => ['data' => ['type' => 'delivery', 'id' => '2']],
+            ]],
+            'included' => [['type' => 'delivery', 'id' => '2', 'attributes' => ['delivery_channel' => 'SMS']]],
+        ];
+        $root = new WriteDocumentParser()->update(document: $document, resource: CertificateWithDetailResource::class, id: '1');
+        $plan = new WritePlanner()->plan(resource: CertificateWithDetailResource::class, roots: [$root]);
+        $builder = new WriterBuilder(pdo: $this->pdo, lock: false, container: new ArrayContainer(services: ExampleResources::getAll()));
+
+        $branch = $builder->build(plan: $plan->input)->explain()['child']['update'];
+        self::assertSame(WriteLinkedKeyWriter::class, $branch['node']);
+        self::assertSame('certificate_id', $branch['key']);
+
+        $before = $this->getRows('select * from certificate_delivery_meta where certificate_id = 2');
+        try {
+            $builder->getRoot(plan: $plan, data: [$root])->execute();
+            self::fail('WriteNotFoundException expected');
+        } catch (WriteNotFoundException $exception) {
+            self::assertSame(['type' => 'delivery', 'id' => '2'], $exception->toError()['meta']);
+        }
+        self::assertSame($before, $this->getRows('select * from certificate_delivery_meta where certificate_id = 2'));
+    }
+
+    public function testLinkedKeyOfOwnParentIsUpdated(): void
+    {
+        $this->patch(
+            data: ['relationships' => ['delivery' => ['data' => ['type' => 'delivery', 'id' => '1']]]],
+            included: [['type' => 'delivery', 'id' => '1', 'attributes' => ['delivery_channel' => 'SMS']]],
+        );
+
+        self::assertSame(
+            [['delivery_channel' => 'SMS']],
+            $this->getRows('select delivery_channel from certificate_delivery_meta where certificate_id = 1'),
+        );
     }
 
     public function testPostInsertsTree(): void
@@ -169,19 +258,19 @@ final class WriteExecutionTest extends TestCase
         $id = $keys[0]['id'];
         self::assertSame(
             [['provider_id' => 2, 'code' => 'W-1', 'status' => 'ACTIVE']],
-            $this->rows("select provider_id, code, status from certificates where id = {$id}"),
+            $this->getRows("select provider_id, code, status from certificates where id = {$id}"),
         );
         self::assertSame(
             [['buyer_email' => 'b@t.test']],
-            $this->rows("select buyer_email from certificate_details where certificate_id = {$id}"),
+            $this->getRows("select buyer_email from certificate_details where certificate_id = {$id}"),
         );
         self::assertSame(
             [['delivery_channel' => 'EMAIL']],
-            $this->rows("select delivery_channel from certificate_delivery_meta where certificate_id = {$id}"),
+            $this->getRows("select delivery_channel from certificate_delivery_meta where certificate_id = {$id}"),
         );
         self::assertSame(
             [['domain_name' => 'w1.test'], ['domain_name' => 'w2.test']],
-            $this->rows("select domain_name from domains where certificate_id = {$id} order by id"),
+            $this->getRows("select domain_name from domains where certificate_id = {$id} order by id"),
         );
     }
 
@@ -198,24 +287,24 @@ final class WriteExecutionTest extends TestCase
             parent: CertificateResource::class,
             relationship: CertificateResource::DOMAINS,
         );
-        $builder = new WriterBuilder(pdo: $this->pdo, lock: false);
+        $builder = new WriterBuilder(pdo: $this->pdo, lock: false, container: new ArrayContainer(services: ExampleResources::getAll()));
 
-        $writer = $builder->root(plan: $plan, data: $roots, route_id: 3);
-        self::assertSame(RouteParentWriter::class, $writer->explain()['route']['node']);
+        $writer = $builder->getRoot(plan: $plan, data: $roots, route_id: 3);
+        self::assertSame(EntityRouteParentWriter::class, $writer->explain()['route']['node']);
         self::assertSame([3, 3], array_column($writer->execute(), 'certificate_id'));
         self::assertSame(
             [['certificate_id' => 3], ['certificate_id' => 3]],
-            $this->rows("select certificate_id from domains where domain_name in ('r1.test', 'r2.test') order by id"),
+            $this->getRows("select certificate_id from domains where domain_name in ('r1.test', 'r2.test') order by id"),
         );
 
         // тот же план, другого родителя нет: 404 до первой вставки
         try {
-            $builder->root(plan: $plan, data: $roots, route_id: 999)->execute();
+            $builder->getRoot(plan: $plan, data: $roots, route_id: 999)->execute();
             self::fail('WriteNotFoundException expected');
         } catch (WriteNotFoundException $exception) {
             self::assertSame(['type' => 'certificate', 'id' => '999'], $exception->toError()['meta']);
         }
-        self::assertSame([], $this->rows('select id from domains where certificate_id = 999'));
+        self::assertSame([], $this->getRows('select id from domains where certificate_id = 999'));
     }
 
     public function testDeleteRemovesRowAndDatabaseCascades(): void
@@ -224,9 +313,9 @@ final class WriteExecutionTest extends TestCase
         $keys = $this->execute(resource: CertificateWithDetailResource::class, roots: [$root]);
 
         self::assertSame([['id' => 1]], $keys);
-        self::assertSame([], $this->rows('select id from certificates where id = 1'));
-        self::assertSame([], $this->rows('select certificate_id from certificate_details where certificate_id = 1'));
-        self::assertSame([], $this->rows('select id from domains where certificate_id = 1'));
+        self::assertSame([], $this->getRows('select id from certificates where id = 1'));
+        self::assertSame([], $this->getRows('select certificate_id from certificate_details where certificate_id = 1'));
+        self::assertSame([], $this->getRows('select id from domains where certificate_id = 1'));
     }
 
     public function testDeleteOfMissingResourceIsNotFound(): void
@@ -262,13 +351,13 @@ final class WriteExecutionTest extends TestCase
     {
         $plan = new WritePlanner()->plan(resource: $resource, roots: $roots);
 
-        return new WriterBuilder(pdo: $this->pdo, lock: false)->root(plan: $plan, data: $roots)->execute();
+        return new WriterBuilder(pdo: $this->pdo, lock: false, container: new ArrayContainer(services: ExampleResources::getAll()))->getRoot(plan: $plan, data: $roots)->execute();
     }
 
     /**
      * @return list<array<string, mixed>>
      */
-    private function rows(string $sql): array
+    private function getRows(string $sql): array
     {
         /** @var list<array<string, mixed>> */
         return $this->pdo->query($sql)->fetchAll(PDO::FETCH_ASSOC);

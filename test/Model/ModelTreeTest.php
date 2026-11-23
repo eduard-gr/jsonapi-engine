@@ -18,7 +18,7 @@ final class ModelTreeTest extends TestCase
 {
     public function testErrorsCarryTreePath(): void
     {
-        $errors = implode("\n", ModelTree::build(Invalid\BadModel::class)->errors());
+        $errors = implode("\n", ModelTree::build(Invalid\BadModel::class)->getErrors());
 
         foreach ([
             'model root.left.left.left: column note must be PRIMARY or unique',
@@ -44,10 +44,10 @@ final class ModelTreeTest extends TestCase
     {
         $tree = ModelTree::of(CertificateModel::class);
 
-        self::assertSame([], $tree->errors());
-        self::assertContains('csr', $tree->columns());
-        self::assertNotContains('certificate_id', $tree->columns(), 'the right relation column equals the left one');
-        self::assertSame(0, $tree->columnTable('id'));
+        self::assertSame([], $tree->getErrors());
+        self::assertContains('csr', $tree->getColumns());
+        self::assertNotContains('certificate_id', $tree->getColumns(), 'the right relation column equals the left one');
+        self::assertSame(0, $tree->getColumnTable('id'));
         self::assertTrue($tree->isUnique('id'));
         self::assertFalse($tree->isUnique('csr'), 'unique only in the main table');
         self::assertSame(ModelTree::of(CertificateModel::class), $tree, 'parsed once per class');

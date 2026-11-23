@@ -5,33 +5,35 @@ declare(strict_types=1);
 namespace Ggs\JsonApiEngine\Test;
 
 use Ggs\JsonApiEngine\Document\ResourceRegistry;
+use Ggs\JsonApiEngine\Example\Container\ArrayContainer;
+use Ggs\JsonApiEngine\Example\Container\ExampleResources;
 use Ggs\JsonApiEngine\Example\Controller\CertificatesController;
 use Ggs\JsonApiEngine\Example\Resource\CertificateResource;
 use Ggs\JsonApiEngine\Example\Resource\DeliveryResource;
 use Ggs\JsonApiEngine\Example\Resource\DomainResource;
-use Ggs\JsonApiEngine\Executor\Select\HashJoinIterator;
-use Ggs\JsonApiEngine\Executor\Select\IteratorBuilder;
-use Ggs\JsonApiEngine\Executor\Select\ManualSerializeIterator;
-use Ggs\JsonApiEngine\Executor\Select\SerializeIterator;
+use Ggs\JsonApiEngine\Executor\Select\HashJoinReader;
+use Ggs\JsonApiEngine\Executor\Select\ReaderBuilder;
+use Ggs\JsonApiEngine\Executor\Select\SerializeReader;
 use Ggs\JsonApiEngine\Plan\Select\BuildSqlPass;
 use Ggs\JsonApiEngine\Plan\Select\HashJoinNode;
 use Ggs\JsonApiEngine\Plan\Select\HashNestJoinNode;
 use Ggs\JsonApiEngine\Plan\Select\JoinNode;
 use Ggs\JsonApiEngine\Plan\Select\ResourceNode;
-use Ggs\JsonApiEngine\Plan\Select\SharedRowJoinNode;
-use Ggs\JsonApiEngine\Plan\Select\SharedScanNode;
-use Ggs\JsonApiEngine\Plan\Select\SqlScanNode;
+use Ggs\JsonApiEngine\Plan\Select\EntitySharedJoinNode;
+use Ggs\JsonApiEngine\Plan\Select\EntityScanNodeDraft;
+use Ggs\JsonApiEngine\Plan\Select\EntityScanNode;
 use LogicException;
 use PHPUnit\Framework\TestCase;
+use Psr\Container\NotFoundExceptionInterface;
 
 require_once __DIR__ . '/../example/db/connection.php';
 
 /**
- * Запрос → план → `IteratorBuilder` → документ на SQLite базе `example/db`.
+ * Запрос → план → `ReaderBuilder` → документ на SQLite базе `example/db`.
  *
  * Для `GET /certificates?include=provider,detail,delivery,domains.logs` (дерево `example/document.php`) дерево
- * итераторов по плану совпадает по топологии с собранным руками (`DocumentTreeTest::tree()`), а документ —
- * с `Fixture/document.json`, включая порядок. Отдельно: ветка 1:N внутри строки (`HashJoinIterator`), фильтр,
+ * читателей по плану совпадает по топологии с собранным руками (`DocumentTreeTest::getTree()`), а документ —
+ * с `Fixture/document.json`, включая порядок. Отдельно: ветка 1:N внутри строки (`HashJoinReader`), фильтр,
  * повторное выполнение плана и ошибки сборки.
  */
 final class PlanTreeTest extends TestCase
@@ -40,7 +42,7 @@ final class PlanTreeTest extends TestCase
 
     public function testDocumentMatchesFixture(): void
     {
-        $document = (new CertificatesController(pdo: getPDO()))->get(query: self::EXAMPLE);
+        $document = (new CertificatesController(pdo: getPDO(), container: new ArrayContainer(services: ExampleResources::getAll())))->get(query: self::EXAMPLE);
 
         self::assertSame(
             json_decode((string) file_get_contents(__DIR__ . '/Fixture/document.json'), true),
@@ -50,32 +52,32 @@ final class PlanTreeTest extends TestCase
 
     public function testTopologyMatchesHandMadeTree(): void
     {
-        $plan = (new CertificatesController(pdo: getPDO()))->plan(query: self::EXAMPLE);
-        $built = (new IteratorBuilder(pdo: getPDO()))->build(plan: $plan, registry: new ResourceRegistry());
+        $plan = (new CertificatesController(pdo: getPDO(), container: new ArrayContainer(services: ExampleResources::getAll())))->plan(query: self::EXAMPLE);
+        $built = (new ReaderBuilder(pdo: getPDO(), container: new ArrayContainer(services: ExampleResources::getAll())))->build(plan: $plan, registry: new ResourceRegistry());
 
         self::assertSame(
-            self::topology(DocumentTreeTest::tree(getPDO(), new ResourceRegistry())->explain()),
-            self::topology($built->explain()),
+            self::getTopology(DocumentTreeTest::getTree(getPDO(), new ResourceRegistry())->explain()),
+            self::getTopology($built->explain()),
         );
     }
 
     /**
-     * План переиспользуется: каждое выполнение — новое дерево итераторов и новый реестр.
+     * План переиспользуется: каждое выполнение — новое дерево читателей и новый реестр.
      */
     public function testPlanRunsTwice(): void
     {
-        $plan = (new CertificatesController(pdo: getPDO()))->plan(query: self::EXAMPLE);
-        $builder = new IteratorBuilder(pdo: getPDO());
+        $plan = (new CertificatesController(pdo: getPDO(), container: new ArrayContainer(services: ExampleResources::getAll())))->plan(query: self::EXAMPLE);
+        $builder = new ReaderBuilder(pdo: getPDO(), container: new ArrayContainer(services: ExampleResources::getAll()));
 
         self::assertSame(
-            json_encode($builder->document(plan: $plan), \JSON_THROW_ON_ERROR),
-            json_encode($builder->document(plan: $plan), \JSON_THROW_ON_ERROR),
+            json_encode($builder->getDocument(plan: $plan), \JSON_THROW_ON_ERROR),
+            json_encode($builder->getDocument(plan: $plan), \JSON_THROW_ON_ERROR),
         );
     }
 
     public function testFilterReachesDocument(): void
     {
-        $document = self::decoded((new CertificatesController(pdo: getPDO()))->get(query: [
+        $document = self::getDecoded((new CertificatesController(pdo: getPDO(), container: new ArrayContainer(services: ExampleResources::getAll())))->get(query: [
             'include' => 'delivery',
             'filter' => ['status' => 'ACTIVE', 'delivery.is_sent' => 'true'],
         ]));
@@ -92,12 +94,12 @@ final class PlanTreeTest extends TestCase
     }
 
     /**
-     * Ветка 1-1 ресурса внутри строки: HashJoinNode → HashJoinIterator. У каждой доставки — домены её сертификата
+     * Ветка 1-1 ресурса внутри строки: HashJoinNode → HashJoinReader. У каждой доставки — домены её сертификата
      * (relation доставки — certificate_id), строка при этом не разъезжается: связи detail нет, delivery — у всех.
      */
     public function testHashJoinInsideRow(): void
     {
-        $plan = (new BuildSqlPass())(plan: new SharedScanNode(input: new SharedRowJoinNode(
+        $plan = (new BuildSqlPass())(plan: new EntityScanNodeDraft(input: new EntitySharedJoinNode(
             name: CertificateResource::DELIVERY,
             relation: ['id', 'certificate_id'],
             outer: new ResourceNode(resource: CertificateResource::class, fields: ['code']),
@@ -105,15 +107,15 @@ final class PlanTreeTest extends TestCase
                 name: 'domains',
                 relation: ['certificate_id', 'certificate_id'],
                 outer: new ResourceNode(resource: DeliveryResource::class, fields: ['is_sent']),
-                inner: new SharedScanNode(input: new ResourceNode(resource: DomainResource::class, fields: ['domain_name'])),
+                inner: new EntityScanNodeDraft(input: new ResourceNode(resource: DomainResource::class, fields: ['domain_name'])),
             ),
         )));
-        $builder = new IteratorBuilder(pdo: getPDO());
+        $builder = new ReaderBuilder(pdo: getPDO(), container: new ArrayContainer(services: ExampleResources::getAll()));
 
         $explain = $builder->build(plan: $plan, registry: new ResourceRegistry())->explain();
-        self::assertSame(HashJoinIterator::class, $explain['source']['inner']['node']);
+        self::assertSame(HashJoinReader::class, $explain['source']['inner']['node']);
 
-        $document = self::decoded($builder->document(plan: $plan));
+        $document = self::getDecoded($builder->getDocument(plan: $plan));
         self::assertCount(20, $document['data']);
 
         $domains = [];
@@ -133,8 +135,22 @@ final class PlanTreeTest extends TestCase
     public function testPlanWithoutSqlStepFails(): void
     {
         $this->expectException(LogicException::class);
-        (new IteratorBuilder(pdo: getPDO()))->build(
-            plan: new SharedScanNode(input: new ResourceNode(resource: CertificateResource::class)),
+        (new ReaderBuilder(pdo: getPDO(), container: new ArrayContainer(services: ExampleResources::getAll())))->build(
+            plan: new EntityScanNodeDraft(input: new ResourceNode(resource: CertificateResource::class)),
+            registry: new ResourceRegistry(),
+        );
+    }
+
+    /**
+     * Ресурс сборщик берёт из контейнера зависимостей: ресурса в контейнере нет — ошибка при сборке, до выполнения.
+     */
+    public function testResourceMissingInContainerFails(): void
+    {
+        $plan = (new CertificatesController(pdo: getPDO(), container: new ArrayContainer(services: [])))->plan(query: self::EXAMPLE);
+
+        $this->expectException(NotFoundExceptionInterface::class);
+        (new ReaderBuilder(pdo: getPDO(), container: new ArrayContainer(services: [])))->build(
+            plan: $plan,
             registry: new ResourceRegistry(),
         );
     }
@@ -142,7 +158,7 @@ final class PlanTreeTest extends TestCase
     public function testResourceOutsideQueryOwnerFails(): void
     {
         $this->expectException(LogicException::class);
-        (new IteratorBuilder(pdo: getPDO()))->build(
+        (new ReaderBuilder(pdo: getPDO(), container: new ArrayContainer(services: ExampleResources::getAll())))->build(
             plan: new ResourceNode(resource: CertificateResource::class),
             registry: new ResourceRegistry(),
         );
@@ -150,7 +166,7 @@ final class PlanTreeTest extends TestCase
 
     public function testNestJoinInsideRowFails(): void
     {
-        $plan = (new BuildSqlPass())(plan: new SharedScanNode(input: new SharedRowJoinNode(
+        $plan = (new BuildSqlPass())(plan: new EntityScanNodeDraft(input: new EntitySharedJoinNode(
             name: CertificateResource::DELIVERY,
             relation: ['id', 'certificate_id'],
             outer: new ResourceNode(resource: CertificateResource::class),
@@ -158,16 +174,16 @@ final class PlanTreeTest extends TestCase
                 name: 'domains',
                 relation: ['certificate_id', 'certificate_id'],
                 outer: new ResourceNode(resource: DeliveryResource::class),
-                inner: new SharedScanNode(input: new ResourceNode(resource: DomainResource::class)),
+                inner: new EntityScanNodeDraft(input: new ResourceNode(resource: DomainResource::class)),
             ),
         )));
-        self::assertInstanceOf(SqlScanNode::class, $plan);
-        self::assertInstanceOf(SharedRowJoinNode::class, $plan->input);
+        self::assertInstanceOf(EntityScanNode::class, $plan);
+        self::assertInstanceOf(EntitySharedJoinNode::class, $plan->input);
         self::assertInstanceOf(JoinNode::class, $plan->input->inner);
-        // Тот же план, но 1:N внутри строки — HashNestJoinNode (SharedScanPass так не оставляет)
+        // Тот же план, но 1:N внутри строки — HashNestJoinNode (EntityScanNodeDraftPass так не оставляет)
         $inner = $plan->input->inner;
-        // SqlScanNode неизменяем и без with…(): испорченную копию собираем конструктором
-        $broken = new SqlScanNode(
+        // EntityScanNode неизменяем и без with…(): испорченную копию собираем конструктором
+        $broken = new EntityScanNode(
             input: $plan->input->withInner(inner: new HashNestJoinNode(
                 name: $inner->name,
                 relation: $inner->relation,
@@ -181,31 +197,27 @@ final class PlanTreeTest extends TestCase
         );
 
         $this->expectException(LogicException::class);
-        (new IteratorBuilder(pdo: getPDO()))->build(plan: $broken, registry: new ResourceRegistry());
+        (new ReaderBuilder(pdo: getPDO(), container: new ArrayContainer(services: ExampleResources::getAll())))->build(plan: $broken, registry: new ResourceRegistry());
     }
 
     /**
-     * Топология из explain(): классы узлов, имена связей, ключи (в том числе ключ и строгость AscendingKeyIterator)
+     * Топология из explain(): классы узлов, имена связей, ключи (в том числе ключ проверки порядка; строгая она или нет, видно по классу узла)
      * и ресурсы — без SQL и карт колонок.
      *
      * @param array<string, mixed> $explain
      * @return array<string, mixed>
      */
-    private static function topology(array $explain): array
+    private static function getTopology(array $explain): array
     {
         $result = [];
-        foreach (['node', 'name', 'outer_key', 'inner_key', 'resource', 'key', 'strict'] as $key) {
+        foreach (['node', 'name', 'outer_key', 'inner_key', 'resource', 'key'] as $key) {
             if (isset($explain[$key])) {
                 $result[$key] = $explain[$key];
             }
         }
-        // Ручное дерево собирает ресурсы ManualSerializeIterator, план — SerializeIterator: место в дереве одно и то же
-        if (($result['node'] ?? null) === ManualSerializeIterator::class) {
-            $result['node'] = SerializeIterator::class;
-        }
         foreach (['data', 'source', 'outer', 'inner', 'preload'] as $key) {
             if (isset($explain[$key])) {
-                $result[$key] = self::topology($explain[$key]);
+                $result[$key] = self::getTopology($explain[$key]);
             }
         }
 
@@ -215,7 +227,7 @@ final class PlanTreeTest extends TestCase
     /**
      * @return array{data: list<array<string, mixed>>, included: list<array<string, mixed>>}
      */
-    private static function decoded(\JsonSerializable $document): array
+    private static function getDecoded(\JsonSerializable $document): array
     {
         return json_decode(json_encode($document, \JSON_THROW_ON_ERROR), true, flags: \JSON_THROW_ON_ERROR);
     }

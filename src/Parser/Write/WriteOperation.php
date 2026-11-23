@@ -28,7 +28,7 @@ abstract readonly class WriteOperation
      * не бывает (`KeepOperation`, `DeleteOperation`). Узлы связей плана проходят все операции места, поэтому
      * спрашивают так, а не по классу операции.
      */
-    public function relationship(string $name): ?RelationshipOperation
+    public function getRelationship(string $name): ?RelationshipOperation
     {
         return null;
     }

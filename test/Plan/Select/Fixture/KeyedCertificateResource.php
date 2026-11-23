@@ -36,8 +36,8 @@ final class KeyedCertificateResource extends Resource
         ],
     ];
 
-    public static function model(): Join
+    public static function getModel(): Join
     {
-        return CertificateModel::model();
+        return CertificateModel::getModel();
     }
 }

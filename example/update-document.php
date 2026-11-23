@@ -15,13 +15,13 @@
  *  - уровень ресурсов: `WriteRootWriter` → `WriteOperationWriter` с одной ветвью `update` (в документе других
  *    операций нет) → `UpdateResourceWriter` (операция → строка «колонка модели → значение» и ключ: id ресурса —
  *    колонка первичного ключа главной таблицы);
- *  - уровень таблиц (контракт `TableWriter`): `UpdateTableJoinWriter(relation, main, joined)` — сначала сторона
+ *  - уровень таблиц (контракт `EntityWriterInterface`): `UpdateEntityJoinWriter(relation, main, joined)` — сначала сторона
  *    с главной таблицей (её ключ известен из id ресурса), потом присоединённая по ключу, который вернула первая;
- *    `UpdateTableWriter` — `UPDATE … SET <присланные колонки> WHERE <ключ> = :key AND (<колонка> IS DISTINCT FROM …
+ *    `UpdateEntityWriter` — `UPDATE … SET <присланные колонки> WHERE <ключ> = :key AND (<колонка> IS DISTINCT FROM …
  *    OR …) RETURNING …`: неизменённые значения не перезаписываются; если ни одна колонка таблицы не прислана или
  *    все значения уже такие же — `SELECT` тех же колонок (ключи для присоединённых таблиц и проверка, что строка
- *    есть); `UpdateOptionalTableWriter` — правая сторона `LeftJoin`: без её колонок в строке пропускается, а если
- *    строки нет — вставляется (`InsertTableWriter`), как отсутствующая часть модели.
+ *    есть); `UpdateOptionalEntityWriter` — правая сторона `LeftJoin`: без её колонок в строке пропускается, а если
+ *    строки нет — вставляется (`InsertEntityWriter`), как отсутствующая часть модели.
  *
  * Порядок сторон отличается от вставки: там первым идёт родитель по ключу связи (тот, чей первичный ключ нужен
  * другому), здесь — сторона, ключ которой уже известен (главная таблица ресурса), независимо от направления
@@ -44,12 +44,13 @@ namespace Ggs\JsonApiEngine\Example\UpdateDocument;
 use Ggs\JsonApiEngine\Example\Entity\CertificateDetailsEntity;
 use Ggs\JsonApiEngine\Example\Entity\CertificatesEntity;
 use Ggs\JsonApiEngine\Example\Resource\CertificateWithDetailResource;
-use Ggs\JsonApiEngine\Executor\Insert\InsertTableWriter;
-use Ggs\JsonApiEngine\Executor\PushExecutor;
-use Ggs\JsonApiEngine\Executor\Update\UpdateOptionalTableWriter;
+use Ggs\JsonApiEngine\Executor\Insert\InsertEntityWriter;
+use Ggs\JsonApiEngine\Executor\PushExecutorInterface;
+use Ggs\JsonApiEngine\Executor\Update\UpdateOptionalEntityWriter;
 use Ggs\JsonApiEngine\Executor\Update\UpdateResourceWriter;
-use Ggs\JsonApiEngine\Executor\Update\UpdateTableJoinWriter;
-use Ggs\JsonApiEngine\Executor\Update\UpdateTableWriter;
+use Ggs\JsonApiEngine\Executor\Update\UpdateEntityJoinWriter;
+use Ggs\JsonApiEngine\Executor\Update\UpdateEntityWriter;
+use Ggs\JsonApiEngine\Executor\Write\ResourceDeserializer;
 use Ggs\JsonApiEngine\Executor\Write\WriteNotFoundException;
 use Ggs\JsonApiEngine\Executor\Write\WriteOperationWriter;
 use Ggs\JsonApiEngine\Executor\Write\WriteRootWriter;
@@ -83,7 +84,7 @@ function certificateRow(PDO $pdo, int $id): array|false
  *                                   транзакции, и изменяется он
  * @param array<string, mixed> $data члены ресурса документа: `attributes`, `relationships`
  */
-function scenario(PDO $pdo, PushExecutor $tree, string $title, ?int $id, array $data): void
+function scenario(PDO $pdo, PushExecutorInterface $tree, string $title, ?int $id, array $data): void
 {
     echo "######## {$title}\n";
 
@@ -136,11 +137,14 @@ $tree = new WriteOperationWriter(
     resource: CertificateWithDetailResource::class,
     add: null,
     update: new UpdateResourceWriter(
-        resource: CertificateWithDetailResource::class,
-        input: new UpdateTableJoinWriter(
+        resource: new CertificateWithDetailResource(),
+        deserializer: new ResourceDeserializer(
+            resource: new CertificateWithDetailResource(),
+        ),
+        input: new UpdateEntityJoinWriter(
             relation: [CertificatesEntity::ID, CertificateDetailsEntity::CERTIFICATE_ID],
             // Главная таблица: строка ищется по id ресурса; id нужен присоединённой, поэтому он в returning
-            main: new UpdateTableWriter(
+            main: new UpdateEntityWriter(
                 pdo: $pdo,
                 entity: CertificatesEntity::class,
                 columns: $certificate_columns,
@@ -148,14 +152,14 @@ $tree = new WriteOperationWriter(
                 returning: [CertificatesEntity::ID],
             ),
             // certificate_details — правая сторона LeftJoin: изменить, а если строки нет — вставить
-            joined: new UpdateOptionalTableWriter(
-                update: new UpdateTableWriter(
+            joined: new UpdateOptionalEntityWriter(
+                update: new UpdateEntityWriter(
                     pdo: $pdo,
                     entity: CertificateDetailsEntity::class,
                     columns: $detail_columns,
                     key: CertificateDetailsEntity::CERTIFICATE_ID,
                 ),
-                insert: new InsertTableWriter(
+                insert: new InsertEntityWriter(
                     pdo: $pdo,
                     entity: CertificateDetailsEntity::class,
                     columns: $detail_columns,
@@ -163,6 +167,7 @@ $tree = new WriteOperationWriter(
             ),
         ),
     ),
+    keep: null,
     remove: null,
 );
 

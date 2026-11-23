@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace Ggs\JsonApiEngine\Example\Entity;
 
-use Ggs\JsonApiEngine\Model\Entity;
+use Ggs\JsonApiEngine\Model\DatabaseEntitySource;
 
 /**
  * Таблица `certificates`: главная таблица.
@@ -12,7 +12,7 @@ use Ggs\JsonApiEngine\Model\Entity;
  * `nominal` — `DECIMAL(10, 2)`: в словаре типов нет десятичного, а `FLOAT` терял бы точность денежной суммы,
  * поэтому `STRING` — точное значение строкой, как pg-wrapper отдаёт `numeric`.
  */
-final class CertificatesEntity extends Entity
+final class CertificatesEntity extends DatabaseEntitySource
 {
     public const string TABLE = 'certificates';
 

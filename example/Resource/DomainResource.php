@@ -4,22 +4,21 @@ declare(strict_types=1);
 
 namespace Ggs\JsonApiEngine\Example\Resource;
 
-use Ggs\JsonApiEngine\Document\ResourceRecord;
 use Ggs\JsonApiEngine\Example\Entity\DomainLogsEntity;
 use Ggs\JsonApiEngine\Example\Entity\DomainsEntity;
 use Ggs\JsonApiEngine\Resource\OneToMany;
 use Ggs\JsonApiEngine\Resource;
-use Ggs\JsonApiEngine\Resource\Deletable;
-use Ggs\JsonApiEngine\Resource\Insertable;
-use Ggs\JsonApiEngine\Resource\Updatable;
+use Ggs\JsonApiEngine\Resource\DeletableInterface;
+use Ggs\JsonApiEngine\Resource\InsertableInterface;
+use Ggs\JsonApiEngine\Resource\UpdatableInterface;
 
 /**
  * `domain`: таблица `domains` (QUERY2). Связь `logs` (1:N).
  *
- * Можно создавать (`Insertable`): вставку см. `Executor\Insert\InsertResourceWriter`; изменять и удалять
- * (`Updatable`, `Deletable`).
+ * Можно создавать (`InsertableInterface`): вставку см. `Executor\Insert\InsertResourceWriter`; изменять и удалять
+ * (`UpdatableInterface`, `DeletableInterface`).
  */
-final class DomainResource extends Resource implements Insertable, Updatable, Deletable
+final class DomainResource extends Resource implements InsertableInterface, UpdatableInterface, DeletableInterface
 {
     public const string TYPE = 'domain';
 
@@ -36,10 +35,10 @@ final class DomainResource extends Resource implements Insertable, Updatable, De
         self::CREATED_AT => ['column' => DomainsEntity::CREATED_AT, 'type' => self::DATETIME],
     ];
 
-    public static function relationships(): array
+    public static function getRelationships(): array
     {
         return [
-            // QUERY3: MergeNestJoinIterator `logs`
+            // QUERY3: MergeNestJoinReader `logs`
             self::LOGS => new OneToMany(
                 resource: LogResource::class,
                 relation: [DomainsEntity::ID, DomainLogsEntity::DOMAIN_ID],
@@ -47,27 +46,8 @@ final class DomainResource extends Resource implements Insertable, Updatable, De
         ];
     }
 
-    public static function model(): string
+    public static function getModel(): string
     {
         return DomainsEntity::class;
-    }
-
-    /**
-     * Домен из строки QUERY2: идентификатор — алиас `domain_id`. Служебный ключ `certificate_id` — ключ соединения
-     * с сертификатом для HashNestJoinIterator, в JSON не выводится.
-     */
-    public static function serialize(array $tuple): ResourceRecord
-    {
-        return new ResourceRecord(
-            id: $tuple['domain_id'],
-            type: self::TYPE,
-            attributes: [
-                self::DOMAIN_NAME => $tuple['domain_name'],
-                self::IS_PRIMARY => (bool) $tuple['is_primary'],
-                self::CREATED_AT => $tuple['created_at'],
-            ],
-            relationships: [],
-            keys: ['certificate_id' => $tuple['certificate_id']],
-        );
     }
 }

@@ -7,14 +7,14 @@ namespace Ggs\JsonApiEngine\Parser\Write;
 /**
  * `id`: ресурс существует в базе. Значение — целое, проверенное при чтении документа (в документе это строка цифр).
  */
-final readonly class PersistentIdentity implements ResourceIdentity
+final readonly class PersistentIdentity implements ResourceIdentityInterface
 {
     public function __construct(
         public int $id,
     ) {}
 
     #[\Override]
-    public function key(): string
+    public function getKey(): string
     {
         return "id:{$this->id}";
     }

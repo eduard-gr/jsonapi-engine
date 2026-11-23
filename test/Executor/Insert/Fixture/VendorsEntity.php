@@ -4,12 +4,12 @@ declare(strict_types=1);
 
 namespace Ggs\JsonApiEngine\Test\Executor\Insert\Fixture;
 
-use Ggs\JsonApiEngine\Model\Entity;
+use Ggs\JsonApiEngine\Model\DatabaseEntitySource;
 
 /**
  * Таблица `vendors` для OptionalParentTest: родитель `vouchers` (на неё ссылается `vouchers.vendor_id`).
  */
-final class VendorsEntity extends Entity
+final class VendorsEntity extends DatabaseEntitySource
 {
     public const string TABLE = 'vendors';
 

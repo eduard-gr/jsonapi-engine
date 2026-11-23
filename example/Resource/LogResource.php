@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace Ggs\JsonApiEngine\Example\Resource;
 
-use Ggs\JsonApiEngine\Document\ResourceRecord;
 use Ggs\JsonApiEngine\Example\Entity\DomainLogsEntity;
 use Ggs\JsonApiEngine\Resource;
 
@@ -27,32 +26,13 @@ final class LogResource extends Resource
         self::CREATED_AT => ['column' => DomainLogsEntity::CREATED_AT, 'type' => self::DATETIME],
     ];
 
-    public static function relationships(): array
+    public static function getRelationships(): array
     {
         return [];
     }
 
-    public static function model(): string
+    public static function getModel(): string
     {
         return DomainLogsEntity::class;
-    }
-
-    /**
-     * Лог из строки QUERY3: идентификатор — алиас `log_id`. Служебный ключ `domain_id` — ключ соединения
-     * с доменом для MergeNestJoinIterator, в JSON не выводится.
-     */
-    public static function serialize(array $tuple): ResourceRecord
-    {
-        return new ResourceRecord(
-            id: $tuple['log_id'],
-            type: self::TYPE,
-            attributes: [
-                self::LOG_LEVEL => $tuple['log_level'],
-                self::MESSAGE => $tuple['message'],
-                self::CREATED_AT => $tuple['created_at'],
-            ],
-            relationships: [],
-            keys: ['domain_id' => $tuple['domain_id']],
-        );
     }
 }

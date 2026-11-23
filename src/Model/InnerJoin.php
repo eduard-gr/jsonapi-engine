@@ -12,7 +12,7 @@ use sad_spirit\pg_builder\enums\JoinType;
 final readonly class InnerJoin extends Join
 {
     #[\Override]
-    public function type(): JoinType
+    public function getType(): JoinType
     {
         return JoinType::INNER;
     }

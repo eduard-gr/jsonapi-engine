@@ -22,12 +22,12 @@
  *  2. PATCH сертификата без строки деталей (вставлен в транзакции): сначала только NULL — строка не вставляется, потом
  *     значения — вставляется;
  *  3. `POST /certificates` с деталями, доставкой и доменами: ответ `201 Created` + `Location` + `{data: {type, id}}`;
- *  4. `POST /certificates/1/domains` со списком из двух доменов: вложенный маршрут, `RouteParentNode` в плане;
+ *  4. `POST /certificates/1/domains` со списком из двух доменов: вложенный маршрут, `EntityRouteParentNode` в плане;
  *  5. тот же план с несуществующим родителем `POST /certificates/999/domains` — 404;
  *  6. `DELETE /certificates/1`: строки до и после, зависимое удалил каскад базы; ответ `204 No Content`;
  *  7. тот же план для `DELETE /certificates/999` — 404;
- *  8. `PATCH /certificates/1` с полной заменой списка `domains` (`WriteReplaceNode` под `WriteJoinNode`);
- *  9. замена пустым — `delivery: null`, `domains: []` (только `WriteReplaceNode`, узлов связи нет).
+ *  8. `PATCH /certificates/1` с полной заменой списка `domains` (`EntityReplaceNode` под `WriteJoinNode`);
+ *  9. замена пустым — `delivery: null`, `domains: []` (только `EntityReplaceNode`, узлов связи нет).
  *
  * Ответ на успешный PATCH — `204 No Content` без тела; ключи корня печатаются только для наглядности.
  */
@@ -36,6 +36,8 @@ declare(strict_types=1);
 
 namespace Ggs\JsonApiEngine\Example\PatchPrototype;
 
+use Ggs\JsonApiEngine\Example\Container\ArrayContainer;
+use Ggs\JsonApiEngine\Example\Container\ExampleResources;
 use Ggs\JsonApiEngine\Example\Resource\CertificateResource;
 use Ggs\JsonApiEngine\Example\Resource\CertificateWithDetailResource;
 use Ggs\JsonApiEngine\Example\Resource\DomainResource;
@@ -79,17 +81,17 @@ function operations(WriteOperation $operation, string $indent = ''): string
 {
     $output = $indent . shortClassName($operation::class) . ' ' . shortClassName($operation->resource);
     if ($operation instanceof KeepOperation || $operation instanceof DeleteOperation) {
-        return "{$output} {$operation->identity->key()}\n";
+        return "{$output} {$operation->identity->getKey()}\n";
     }
     if (!$operation instanceof InsertOperation && !$operation instanceof UpdateOperation) {
         throw new LogicException('Unknown operation ' . $operation::class);
     }
-    $output .= ' ' . ($operation->identity === null ? 'new' : $operation->identity->key());
+    $output .= ' ' . ($operation->identity === null ? 'new' : $operation->identity->getKey());
     $output .= $operation->attributes === [] ? '' : ' ' . json_encode($operation->attributes, JSON_UNESCAPED_UNICODE);
     $output .= "\n";
     $references = [];
     foreach ($operation->references as $name => $target) {
-        $references[] = "{$name} → " . ($target === null ? 'null' : $target->key());
+        $references[] = "{$name} → " . ($target === null ? 'null' : $target->getKey());
     }
     if ($references !== []) {
         $output .= "{$indent}    references: " . implode(', ', $references) . "\n";
@@ -216,6 +218,10 @@ function cascadeState(PDO $pdo, string $domain_ids): array
 $pdo = getPDO();
 // FOR KEY SHARE в проверках существования: в PostgreSQL true; SQLite примера такой конструкции не знает
 $lock = false;
+// Контейнер зависимостей (PSR-11) для сборщика: объекты ресурсов примера — сборщик берёт ресурс по имени класса
+$container = new ArrayContainer(
+    services: ExampleResources::getAll(),
+);
 
 // ---------------------------------------------------------------------------------------------------------------
 // 1. PATCH /certificates/1 над CertificateWithDetailResource (certificates + certificate_details): номинал
@@ -252,7 +258,7 @@ try {
     echo "######## operation tree\n", operations(operation: $certificate_root), "\n";
     $certificate_plan = new WritePlanner()->plan(resource: CertificateWithDetailResource::class, roots: [$certificate_root]);
     echo "######## plan\n", planTree($certificate_plan), "\n";
-    $certificate_writer = new WriterBuilder(pdo: $pdo, lock: $lock)->root(plan: $certificate_plan, data: [$certificate_root]);
+    $certificate_writer = new WriterBuilder(pdo: $pdo, lock: $lock, container: $container)->getRoot(plan: $certificate_plan, data: [$certificate_root]);
     echo "######## execution tree\n", executionTree($certificate_writer->explain()), "\n";
     echo "######## before\n", json(certificateState(pdo: $pdo)), "\n\n";
     echo "######## keys of the root\n", json($certificate_writer->execute()[0]), "\n\n";
@@ -279,7 +285,7 @@ try {
         $detail_root = new WriteDocumentParser()->update(document: $detail_document, resource: CertificateWithDetailResource::class, id: $detail_id);
         $detail_plan = new WritePlanner()->plan(resource: CertificateWithDetailResource::class, roots: [$detail_root]);
         echo "######## plan\n", planTree($detail_plan);
-        $detail_writer = new WriterBuilder(pdo: $pdo, lock: $lock)->root(plan: $detail_plan, data: [$detail_root]);
+        $detail_writer = new WriterBuilder(pdo: $pdo, lock: $lock, container: $container)->getRoot(plan: $detail_plan, data: [$detail_root]);
         echo "######## keys of the root\n", json($detail_writer->execute()[0]), "\n";
         echo "######## certificate_details after\n", json(detailState(pdo: $pdo, id: $detail_id)), "\n\n";
     }
@@ -324,10 +330,10 @@ try {
     echo implode('', array_map(static fn(WriteOperation $root): string => operations(operation: $root), $post_roots)), "\n";
     $post_plan = new WritePlanner()->plan(resource: CertificateWithDetailResource::class, roots: $post_roots);
     echo "######## plan\n", planTree($post_plan), "\n";
-    $post_writer = new WriterBuilder(pdo: $pdo, lock: $lock)->root(plan: $post_plan, data: $post_roots);
+    $post_writer = new WriterBuilder(pdo: $pdo, lock: $lock, container: $container)->getRoot(plan: $post_plan, data: $post_roots);
     $post_keys = $post_writer->execute();
-    $post_id = (string) $post_keys[0][CertificateWithDetailResource::primaryColumn()];
-    echo "######## response\n201 Created\nLocation: /certificates/{$post_id}\n", json(['data' => ['type' => CertificateWithDetailResource::type(), 'id' => $post_id]]), "\n";
+    $post_id = (string) $post_keys[0][CertificateWithDetailResource::getPrimaryKeyColumnName()];
+    echo "######## response\n201 Created\nLocation: /certificates/{$post_id}\n", json(['data' => ['type' => CertificateWithDetailResource::getType(), 'id' => $post_id]]), "\n";
 } catch (InvalidDocumentException|WriteNotFoundException $exception) {
     echo "######## response\n", json(['errors' => [$exception->toError()]]), "\n";
 } finally {
@@ -336,8 +342,8 @@ try {
 
 // ---------------------------------------------------------------------------------------------------------------
 // 4. POST /certificates/1/domains — несколько ресурсов одним запросом через вложенный маршрут: data — список, каждый
-//    элемент — корень. Маршрут вложенный — в плане RouteParentNode (родитель и колонки связи, без id); id = 1 получает
-//    сборщик: RouteParentWriter один раз проверяет, что сертификат есть, и даёт корням certificate_id = 1. Документ —
+//    элемент — корень. Маршрут вложенный — в плане EntityRouteParentNode (родитель и колонки связи, без id); id = 1 получает
+//    сборщик: EntityRouteParentWriter один раз проверяет, что сертификат есть, и даёт корням certificate_id = 1. Документ —
 //    из example/insert-route.php. Ответ — 201 без Location, data — идентификаторы в порядке запроса
 
 $route_document = [
@@ -360,11 +366,11 @@ try {
         relationship: CertificateResource::DOMAINS,
     );
     echo "######## plan\n", planTree($route_plan), "\n";
-    $route_writer = new WriterBuilder(pdo: $pdo, lock: $lock)->root(plan: $route_plan, data: $route_roots, route_id: 1);
+    $route_writer = new WriterBuilder(pdo: $pdo, lock: $lock, container: $container)->getRoot(plan: $route_plan, data: $route_roots, route_id: 1);
     echo "######## execution tree\n", executionTree($route_writer->explain()), "\n";
     $route_keys = $route_writer->execute();
     echo "######## response\n201 Created\n", json(['data' => array_map(
-        static fn(array $keys): array => ['type' => DomainResource::type(), 'id' => (string) $keys[DomainResource::primaryColumn()]],
+        static fn(array $keys): array => ['type' => DomainResource::getType(), 'id' => (string) $keys[DomainResource::getPrimaryKeyColumnName()]],
         $route_keys,
     )]), "\n";
 } catch (InvalidDocumentException|WriteNotFoundException $exception) {
@@ -375,12 +381,12 @@ try {
 
 // ---------------------------------------------------------------------------------------------------------------
 // 5. POST /certificates/999/domains — тот же план (он переиспользуемый, id маршрута — значение), сертификата 999 нет:
-//    RouteParentWriter отвечает 404 до первой вставки
+//    EntityRouteParentWriter отвечает 404 до первой вставки
 
 echo "\n######## 5. POST /certificates/999/domains (same plan, route id 999)\n";
 $pdo->beginTransaction();
 try {
-    new WriterBuilder(pdo: $pdo, lock: $lock)->root(plan: $route_plan, data: $route_roots, route_id: 999)->execute();
+    new WriterBuilder(pdo: $pdo, lock: $lock, container: $container)->getRoot(plan: $route_plan, data: $route_roots, route_id: 999)->execute();
 } catch (InvalidDocumentException|WriteNotFoundException $exception) {
     echo "######## response\n", json(['errors' => [$exception->toError()]]), "\n";
 } finally {
@@ -388,7 +394,7 @@ try {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// 6. DELETE /certificates/1 — тела нет: WriteDocumentParser::delete() проверяет Deletable и даёт корень remove; план и
+// 6. DELETE /certificates/1 — тела нет: WriteDocumentParser::delete() проверяет DeletableInterface и даёт корень remove; план и
 //    исполнители те же. Удаляется строка certificates, остальное — каскад базы: детали, доставка, домены, их логи и
 //    конфиги (у domain_configs ресурса нет — движок о ней не знает). Ответ — 204 No Content
 
@@ -402,7 +408,7 @@ try {
     echo "######## operation tree\n", operations(operation: $delete_root), "\n";
     $delete_plan = new WritePlanner()->plan(resource: CertificateWithDetailResource::class, roots: [$delete_root]);
     echo "######## plan\n", planTree($delete_plan), "\n";
-    $delete_writer = new WriterBuilder(pdo: $pdo, lock: $lock)->root(plan: $delete_plan, data: [$delete_root]);
+    $delete_writer = new WriterBuilder(pdo: $pdo, lock: $lock, container: $container)->getRoot(plan: $delete_plan, data: [$delete_root]);
     echo "######## execution tree\n", executionTree($delete_writer->explain()), "\n";
     echo "######## rows of certificate 1 before\n", json(cascadeState(pdo: $pdo, domain_ids: $domain_ids)), "\n\n";
     $delete_writer->execute();
@@ -421,7 +427,7 @@ echo "\n######## 7. DELETE /certificates/999 (same plan)\n";
 $pdo->beginTransaction();
 try {
     $missing_root = new WriteDocumentParser()->delete(resource: CertificateWithDetailResource::class, id: '999');
-    new WriterBuilder(pdo: $pdo, lock: $lock)->root(plan: $delete_plan, data: [$missing_root])->execute();
+    new WriterBuilder(pdo: $pdo, lock: $lock, container: $container)->getRoot(plan: $delete_plan, data: [$missing_root])->execute();
 } catch (InvalidDocumentException|WriteNotFoundException $exception) {
     echo "######## response\n", json(['errors' => [$exception->toError()]]), "\n";
 } finally {
@@ -430,7 +436,7 @@ try {
 
 // ---------------------------------------------------------------------------------------------------------------
 // 8. PATCH /certificates/1 — полная замена списка domains: ни у одного элемента нет meta.op, названные (1 и 3)
-//    остаются, остальные (2) удаляются. В плане WriteReplaceNode под WriteJoinNode той же связи; у места domains одна
+//    остаются, остальные (2) удаляются. В плане EntityReplaceNode под WriteJoinNode той же связи; у места domains одна
 //    ветвь update (её же исполняет keep)
 
 $replace_document = [
@@ -453,7 +459,7 @@ try {
     $replace_plan = new WritePlanner()->plan(resource: CertificateWithDetailResource::class, roots: [$replace_root]);
     echo "######## plan\n", planTree($replace_plan), "\n";
     echo "######## before\n", json(certificateState(pdo: $pdo)), "\n\n";
-    new WriterBuilder(pdo: $pdo, lock: $lock)->root(plan: $replace_plan, data: [$replace_root])->execute();
+    new WriterBuilder(pdo: $pdo, lock: $lock, container: $container)->getRoot(plan: $replace_plan, data: [$replace_root])->execute();
     echo "######## after (before rollback)\n", json(certificateState(pdo: $pdo)), "\n";
 } catch (InvalidDocumentException|WriteNotFoundException $exception) {
     echo "######## response\n", json(['errors' => [$exception->toError()]]), "\n";
@@ -463,7 +469,7 @@ try {
 
 // ---------------------------------------------------------------------------------------------------------------
 // 9. PATCH /certificates/1 — замена пустым: delivery: null (текущая доставка удаляется) и domains: [] (удаляются все
-//    домены). Детей нет, передавать нечего: в плане только WriteReplaceNode, узлов связи нет
+//    домены). Детей нет, передавать нечего: в плане только EntityReplaceNode, узлов связи нет
 
 $empty_document = [
     'data' => [
@@ -483,7 +489,7 @@ try {
     $empty_plan = new WritePlanner()->plan(resource: CertificateWithDetailResource::class, roots: [$empty_root]);
     echo "######## plan\n", planTree($empty_plan), "\n";
     echo "######## before\n", json(certificateState(pdo: $pdo)), "\n\n";
-    new WriterBuilder(pdo: $pdo, lock: $lock)->root(plan: $empty_plan, data: [$empty_root])->execute();
+    new WriterBuilder(pdo: $pdo, lock: $lock, container: $container)->getRoot(plan: $empty_plan, data: [$empty_root])->execute();
     echo "######## after (before rollback)\n", json(certificateState(pdo: $pdo)), "\n";
 } catch (InvalidDocumentException|WriteNotFoundException $exception) {
     echo "######## response\n", json(['errors' => [$exception->toError()]]), "\n";

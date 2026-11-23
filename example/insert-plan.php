@@ -13,7 +13,7 @@
  * Планировщик сам строит:
  *  - уровень ресурсов — цепочку связей `WriteJoinNode` в порядке объявления (`delivery`, `domains`), у каждого места
  *    `WriteOperationNode` с одной ветвью `add`;
- *  - уровень таблиц сертификата — `InsertTableJoinNode(parent: certificates, child: InsertOptionalTableNode(
+ *  - уровень таблиц сертификата — `InsertEntityJoinNode(parent: certificates, child: InsertOptionalEntityNode(
  *    certificate_details))`: детали — правая сторона `LeftJoin`, необязательная часть модели. Без атрибутов деталей
  *    строка `certificate_details` не вставилась бы, но тогда упала бы и `delivery`: `certificate_delivery_meta`
  *    ссылается на `certificate_details`.
@@ -22,6 +22,8 @@
 
 declare(strict_types=1);
 
+use Ggs\JsonApiEngine\Example\Container\ArrayContainer;
+use Ggs\JsonApiEngine\Example\Container\ExampleResources;
 use Ggs\JsonApiEngine\Example\Resource\CertificateWithDetailResource;
 use Ggs\JsonApiEngine\Executor\Write\WriterBuilder;
 use Ggs\JsonApiEngine\Parser\Write\WriteDocumentParser;
@@ -58,7 +60,7 @@ $pdo = getPDO();
 $roots = new WriteDocumentParser()->insert(document: DOCUMENT, resource: CertificateWithDetailResource::class);
 $plan = new WritePlanner()->plan(resource: CertificateWithDetailResource::class, roots: $roots);
 // lock — FOR KEY SHARE в проверках существования: в PostgreSQL true; SQLite примера такой конструкции не знает
-$insert = new WriterBuilder(pdo: $pdo, lock: false)->root(plan: $plan, data: $roots);
+$insert = new WriterBuilder(pdo: $pdo, lock: false, container: new ArrayContainer(services: ExampleResources::getAll()))->getRoot(plan: $plan, data: $roots);
 
 echo json_encode($insert->explain(), JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES), "\n\n";
 

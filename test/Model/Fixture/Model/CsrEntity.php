@@ -4,12 +4,12 @@ declare(strict_types=1);
 
 namespace Ggs\JsonApiEngine\Test\Model\Fixture\Model;
 
-use Ggs\JsonApiEngine\Model\Entity;
+use Ggs\JsonApiEngine\Model\DatabaseEntitySource;
 
 /**
  * CSR сертификата в отдельной таблице: первичный ключ — ссылка на сертификат.
  */
-final class CsrEntity extends Entity
+final class CsrEntity extends DatabaseEntitySource
 {
     public const string TABLE = 'certificates_csr';
 

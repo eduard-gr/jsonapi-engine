@@ -9,12 +9,12 @@ use sad_spirit\pg_builder\SqlBuilderWalker;
 use sad_spirit\pg_builder\Statement;
 
 /**
- * Выполнение запроса pg_builder для исполнителей записи: общий шаг `UpdateTableWriter`, `DeleteResourceWriter`,
- * `WriteReplaceWriter` и `RouteParentWriter`.
+ * Выполнение запроса pg_builder для исполнителей записи: общий шаг `UpdateEntityWriter`, `DeleteEntityWriter`,
+ * `EntityReplaceWriter` и `EntityRouteParentWriter`.
  *
  * Поток: запрос pg_builder + именованные параметры → текст SQL → `prepare()`, `bindValue()` с типом по PHP (как в
- * `SqlScanIterator`: `execute($array)` отправил бы `false` как `''`) → строки результата. Выполненный запрос с
- * параметрами и результатом пишется в `error_log()` (отладка, как у `InsertTableWriter`).
+ * `EntityScanReader`: `execute($array)` отправил бы `false` как `''`) → строки результата. Выполненный запрос с
+ * параметрами и результатом пишется в `error_log()` (отладка, как у `InsertEntityWriter`).
  *
  * Ошибки базы (внешний ключ, `NOT NULL`, уникальность) — исключения PDO как есть. TODO: `prepare()` на каждый вызов,
  * кеша подготовленных запросов нет.

@@ -13,10 +13,10 @@
  *  - уровень ресурсов — левый глубокий список `WriteJoinWriter` (родитель — владелец связи, `parent`; новые дети —
  *    `child`): сначала `delivery`, потом `domains`; место каждого ресурса — `WriteOperationWriter` с одной ветвью
  *    `add` (`InsertResourceWriter`): в документе вставки других операций нет;
- *  - уровень таблиц сертификата — `InsertTableJoinWriter`: родитель `certificates`, ребёнок `certificate_details`,
- *    обёрнутый в `InsertOptionalTableWriter` (правая сторона `LeftJoin`: без колонок деталей она пропускается).
- *    Для ресурсов из одной таблицы поддерево таблиц строит `WriterBuilder::insertTables()` по
- *    `InsertPlanner::tables()` из `model()`.
+ *  - уровень таблиц сертификата — `InsertEntityJoinWriter`: родитель `certificates`, ребёнок `certificate_details`,
+ *    обёрнутый в `InsertOptionalEntityWriter` (правая сторона `LeftJoin`: без колонок деталей она пропускается).
+ *    Для ресурсов из одной таблицы поддерево таблиц строит `WriterBuilder::getInsertEntities()` по
+ *    `InsertPlanner::getEntities()` из `getModel()`.
  * `delivery` вставляется после деталей: `certificate_delivery_meta.certificate_id` ссылается на `certificate_details`
  * (SQLite с `foreign_keys = ON` иначе отказывает). Вставка идёт в транзакции, которая в конце откатывается: база
  * не меняется.
@@ -24,15 +24,18 @@
 
 declare(strict_types=1);
 
+use Ggs\JsonApiEngine\Example\Container\ArrayContainer;
+use Ggs\JsonApiEngine\Example\Container\ExampleResources;
 use Ggs\JsonApiEngine\Example\Entity\CertificateDetailsEntity;
 use Ggs\JsonApiEngine\Example\Entity\CertificatesEntity;
 use Ggs\JsonApiEngine\Example\Resource\CertificateWithDetailResource;
 use Ggs\JsonApiEngine\Example\Resource\DeliveryResource;
 use Ggs\JsonApiEngine\Example\Resource\DomainResource;
-use Ggs\JsonApiEngine\Executor\Insert\InsertOptionalTableWriter;
+use Ggs\JsonApiEngine\Executor\Insert\InsertOptionalEntityWriter;
 use Ggs\JsonApiEngine\Executor\Insert\InsertResourceWriter;
-use Ggs\JsonApiEngine\Executor\Insert\InsertTableJoinWriter;
-use Ggs\JsonApiEngine\Executor\Insert\InsertTableWriter;
+use Ggs\JsonApiEngine\Executor\Insert\InsertEntityJoinWriter;
+use Ggs\JsonApiEngine\Executor\Insert\InsertEntityWriter;
+use Ggs\JsonApiEngine\Executor\Write\ResourceDeserializer;
 use Ggs\JsonApiEngine\Executor\Write\WriteJoinWriter;
 use Ggs\JsonApiEngine\Executor\Write\WriteOperationWriter;
 use Ggs\JsonApiEngine\Executor\Write\WriteRootWriter;
@@ -79,9 +82,9 @@ $pdo = getPDO();
 
 // Уровень таблиц сертификата: certificates — родитель, certificate_details — необязательный ребёнок (LeftJoin).
 // Колонки — колонки модели ресурса в каждой таблице; certificate_id деталей приходит колонкой связи от родителя
-$certificate_tables = new InsertTableJoinWriter(
+$certificate_tables = new InsertEntityJoinWriter(
     relation: [CertificatesEntity::ID, CertificateDetailsEntity::CERTIFICATE_ID],
-    parent: new InsertTableWriter(
+    parent: new InsertEntityWriter(
         pdo: $pdo,
         entity: CertificatesEntity::class,
         columns: [
@@ -94,8 +97,8 @@ $certificate_tables = new InsertTableJoinWriter(
             CertificatesEntity::CREATED_AT,
         ],
     ),
-    child: new InsertOptionalTableWriter(
-        input: new InsertTableWriter(
+    child: new InsertOptionalEntityWriter(
+        input: new InsertEntityWriter(
             pdo: $pdo,
             entity: CertificateDetailsEntity::class,
             columns: [
@@ -109,46 +112,61 @@ $certificate_tables = new InsertTableJoinWriter(
     ),
 );
 
-// Ресурсы из одной таблицы: поддерево таблиц — по model() ресурса
+// Ресурсы из одной таблицы: поддерево таблиц — по getModel() ресурса
 $builder = new WriterBuilder(
     pdo: $pdo,
     lock: false,
+    container: new ArrayContainer(
+        services: ExampleResources::getAll(),
+    ),
 );
 $planner = new InsertPlanner();
 
 $insert = new WriteRootWriter(
     root: new WriteJoinWriter(
         name: CertificateWithDetailResource::DOMAINS,
-        relation: CertificateWithDetailResource::relationship(CertificateWithDetailResource::DOMAINS)->relation,
+        relation: CertificateWithDetailResource::getRelationship(CertificateWithDetailResource::DOMAINS)->relation,
         parent: new WriteJoinWriter(
             name: CertificateWithDetailResource::DELIVERY,
-            relation: CertificateWithDetailResource::relationship(CertificateWithDetailResource::DELIVERY)->relation,
+            relation: CertificateWithDetailResource::getRelationship(CertificateWithDetailResource::DELIVERY)->relation,
             parent: new WriteOperationWriter(
                 resource: CertificateWithDetailResource::class,
                 add: new InsertResourceWriter(
-                    resource: CertificateWithDetailResource::class,
+                    resource: new CertificateWithDetailResource(),
+                    deserializer: new ResourceDeserializer(
+                        resource: new CertificateWithDetailResource(),
+                    ),
                     input: $certificate_tables,
                 ),
                 update: null,
+                keep: null,
                 remove: null,
             ),
             child: new WriteOperationWriter(
                 resource: DeliveryResource::class,
                 add: new InsertResourceWriter(
-                    resource: DeliveryResource::class,
-                    input: $builder->insertTables(plan: $planner->tables(resource: DeliveryResource::class)),
+                    resource: new DeliveryResource(),
+                    deserializer: new ResourceDeserializer(
+                        resource: new DeliveryResource(),
+                    ),
+                    input: $builder->getInsertEntities(plan: $planner->getEntities(resource: DeliveryResource::class)),
                 ),
                 update: null,
+                keep: null,
                 remove: null,
             ),
         ),
         child: new WriteOperationWriter(
             resource: DomainResource::class,
             add: new InsertResourceWriter(
-                resource: DomainResource::class,
-                input: $builder->insertTables(plan: $planner->tables(resource: DomainResource::class)),
+                resource: new DomainResource(),
+                deserializer: new ResourceDeserializer(
+                    resource: new DomainResource(),
+                ),
+                input: $builder->getInsertEntities(plan: $planner->getEntities(resource: DomainResource::class)),
             ),
             update: null,
+            keep: null,
             remove: null,
         ),
     ),

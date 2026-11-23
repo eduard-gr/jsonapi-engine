@@ -4,11 +4,9 @@ declare(strict_types=1);
 
 namespace Ggs\JsonApiEngine\Executor\Update;
 
-use Ggs\JsonApiEngine\Executor\PushExecutor;
-use Ggs\JsonApiEngine\Executor\TableWriter;
-use Ggs\JsonApiEngine\Executor\Write\ResourceRow;
-use Ggs\JsonApiEngine\Model\ModelTree;
-use Ggs\JsonApiEngine\Parser\Write\KeepOperation;
+use Ggs\JsonApiEngine\Executor\PushExecutorInterface;
+use Ggs\JsonApiEngine\Executor\EntityWriterInterface;
+use Ggs\JsonApiEngine\Executor\Write\ResourceDeserializer;
 use Ggs\JsonApiEngine\Parser\Write\UpdateOperation;
 use Ggs\JsonApiEngine\Parser\Write\WriteOperation;
 use Ggs\JsonApiEngine\Resource;
@@ -16,55 +14,50 @@ use LogicException;
 
 /**
  * Граница уровней при изменении: операция → строка «колонка модели → значение» → поддерево таблиц (`input`, из
- * `WriterBuilder` по плану `UpdatePlanner::tables()`). Пара к `InsertResourceWriter`. Исполняет `UpdateOperation` и
- * `KeepOperation`; другая операция — LogicException.
+ * `WriterBuilder` по плану `UpdatePlanner::getEntities()`). Пара к `InsertResourceWriter`. Исполняет `UpdateOperation`;
+ * другая операция — LogicException (ресурс, который только ищут, `KeepOperation`, — `KeepEntityWriter`).
  *
  * Поток: операция (`identity->id`, `attributes`, `references`) + `$link` → `input->push(строка, link + [pk => id])`
  * → ключи всех таблиц; пусто — строки главной таблицы нет (или она чужая: колонки связи от родителя — условие
- * принадлежности), наверху это 404. У `KeepOperation` строка пустая: ресурс только ищется.
+ * принадлежности), наверху это 404. Пустая строка (в документе нет ни атрибутов, ни связей по внешнему ключу) —
+ * ресурс только ищется, ключи всех таблиц возвращаются.
  *
  * В строку идут только присланные атрибуты; `null` — это NULL в колонку (присутствие ключа, а не значение, решает,
- * что колонку трогать). Колонка связи от родителя должна быть колонкой модели, иначе принадлежность не проверить —
- * LogicException. Если первичный ключ ресурса и есть колонка связи (`delivery.certificate_id`), id, не равный
- * родителю, — пусто (404) без запроса.
+ * что колонку трогать).
+ *
+ * Колонки связи узел не проверяет — это сделал план: `WritePlanner` один раз убедился, что колонка связи места есть
+ * в модели ресурса. Если первичный ключ ресурса и есть колонка связи (`delivery.certificate_id`), id операции
+ * подставляется на её место, и значение от родителя здесь теряется: сверяет их сторож `WriteLinkedKeyWriter`,
+ * которого план ставит над этим узлом. Дерево, собранное руками без сторожа, для такого ресурса изменит чужую
+ * строку молча.
+ *
+ * Ресурс — экземпляр из контейнера зависимостей (его даёт `WriterBuilder`; дерево, собранное руками, создаёт сам).
+ * Строку из операции строит `$deserializer`: `ResourceDeserializer` — по описанию ресурса, `ManualResourceDeserializer`
+ * — методом `deserialize()` ресурса (`Resource\DeserializeInterface`); какой из них, решает сборщик дерева.
  */
-final readonly class UpdateResourceWriter implements PushExecutor
+final readonly class UpdateResourceWriter implements PushExecutorInterface
 {
-    /**
-     * @param class-string<Resource> $resource
-     */
     public function __construct(
-        private string $resource,
-        private TableWriter $input,
+        private Resource $resource,
+        private ResourceDeserializer $deserializer,
+        private EntityWriterInterface $input,
     ) {}
 
     #[\Override]
     public function push(WriteOperation $operation, array $link = []): array
     {
-        if (!$operation instanceof UpdateOperation && !$operation instanceof KeepOperation) {
-            throw new LogicException("{$this->resource}: update needs UpdateOperation or KeepOperation");
+        if (!$operation instanceof UpdateOperation) {
+            throw new LogicException($this->resource::class . ': update needs UpdateOperation, got ' . $operation::class);
         }
-        $tree = ModelTree::of($this->resource);
-        foreach (array_keys($link) as $column) {
-            if (!$tree->hasColumn((string) $column)) {
-                throw new LogicException("{$this->resource}: link column {$column} is not a model column");
-            }
-        }
-
-        $primary = $this->resource::primaryColumn();
+        $primary = $this->resource::getPrimaryKeyColumnName();
         $id = $operation->identity->id;
-        // Первичный ключ ребёнка — сама колонка связи (`delivery.certificate_id`): id обязан совпасть с родителем
-        if (isset($link[$primary]) && (int) $link[$primary] !== $id) {
-            return [];
-        }
-        $row = [];
-        if ($operation instanceof UpdateOperation) {
-            $row = ResourceRow::columns(
-                resource: $this->resource,
-                attributes: $operation->attributes,
-                references: $operation->references,
-            );
-        }
+        $row = $this->deserializer->getRow(
+            attributes: $operation->attributes,
+            references: $operation->references,
+            is_insert: false,
+            id: $id,
+            link: $link,
+        );
 
         return $this->input->push($row, [...$link, $primary => $id]);
     }
@@ -74,7 +67,8 @@ final readonly class UpdateResourceWriter implements PushExecutor
     {
         return [
             'node' => static::class,
-            'resource' => $this->resource,
+            'resource' => $this->resource::class,
+            'deserializer' => $this->deserializer::class,
             'input' => $this->input->explain(),
         ];
     }

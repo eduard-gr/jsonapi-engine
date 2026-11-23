@@ -4,12 +4,12 @@ declare(strict_types=1);
 
 namespace Ggs\JsonApiEngine\Example\Entity;
 
-use Ggs\JsonApiEngine\Model\Entity;
+use Ggs\JsonApiEngine\Model\DatabaseEntitySource;
 
 /**
  * Таблица `providers`: справочник провайдеров, у сертификата один провайдер (N:1 от `certificates`).
  */
-final class ProvidersEntity extends Entity
+final class ProvidersEntity extends DatabaseEntitySource
 {
     public const string TABLE = 'providers';
 

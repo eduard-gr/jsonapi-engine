@@ -17,7 +17,7 @@ namespace Ggs\JsonApiEngine\Plan\Write;
 final readonly class WriteRootNode
 {
     public function __construct(
-        public WriteJoinNode|WriteReplaceNode|WriteOperationNode $input,
-        public ?RouteParentNode $route,
+        public WriteJoinNode|EntityReplaceNode|WriteOperationNode $input,
+        public ?EntityRouteParentNode $route,
     ) {}
 }

@@ -4,26 +4,26 @@ declare(strict_types=1);
 
 namespace Ggs\JsonApiEngine\Plan\Update;
 
-use Ggs\JsonApiEngine\Model\Entity;
+use Ggs\JsonApiEngine\Model\DatabaseEntitySource;
 use Ggs\JsonApiEngine\Model\Join;
 use Ggs\JsonApiEngine\Model\LeftJoin;
 use Ggs\JsonApiEngine\Model\ModelTree;
-use Ggs\JsonApiEngine\Plan\Insert\InsertTableNode;
+use Ggs\JsonApiEngine\Plan\Insert\InsertEntityNode;
 use Ggs\JsonApiEngine\Resource;
 use LogicException;
 
 /**
  * Планировщик изменения уровня таблиц: модель ресурса → поддерево таблиц изменения (неизменяемые узлы `Plan\Update`).
  * Пара к `InsertPlanner`: уровень ресурсов общий и строится `Plan\Write\WritePlanner`, он ставит результат
- * `tables()` под `UpdateResourceNode` в ветви `update` места. Исполнителей строит `Executor\Write\WriterBuilder`.
+ * `getEntities()` под `UpdateResourceNode` в ветви `update` места. Исполнителей строит `Executor\Write\WriterBuilder`.
  *
- * Поток: класс ресурса → `UpdateTableJoinNode|UpdateTableNode`.
+ * Поток: класс ресурса → `UpdateEntityJoinNode|UpdateEntityNode`.
  *
- * `tables()`: сначала сторона, ключ которой уже известен (левая, с главной таблицей; её ключ — id ресурса), потом
+ * `getEntities()`: сначала сторона, ключ которой уже известен (левая, с главной таблицей; её ключ — id ресурса), потом
  * правая — по ключу, который вернула левая, независимо от направления внешнего ключа (у вставки наоборот: первым
- * родитель по внешнему ключу). Соединение → `UpdateTableJoinNode(relation, main: левая, joined: правая)`; правая
- * сторона `LeftJoin` → `UpdateOptionalTableNode(UpdateTableNode, InsertTableNode)`: строки может не быть, тогда она
- * вставляется; таблица → `UpdateTableNode(key, columns, returning)`: `key` главной — первичный ключ ресурса, `key`
+ * родитель по внешнему ключу). Соединение → `UpdateEntityJoinNode(relation, main: левая, joined: правая)`; правая
+ * сторона `LeftJoin` → `UpdateOptionalEntityNode(UpdateEntityNode, InsertEntityNode)`: строки может не быть, тогда она
+ * вставляется; таблица → `UpdateEntityNode(key, columns, returning)`: `key` главной — первичный ключ ресурса, `key`
  * правой — `relation[1]`; `returning` — колонки `relation[0]` соединений, которые в ней лежат.
  *
  * Ограничения: `key` правой стороны — в её крайней левой таблице; необязательная правая сторона — одна таблица
@@ -32,30 +32,30 @@ use LogicException;
 final class UpdatePlanner
 {
     /**
-     * Поддерево таблиц изменения по `model()` ресурса.
+     * Поддерево таблиц изменения по `getModel()` ресурса.
      *
      * @param class-string<Resource> $resource
      */
-    public function tables(string $resource): UpdateTableJoinNode|UpdateTableNode
+    public function getEntities(string $resource): UpdateEntityJoinNode|UpdateEntityNode
     {
         $tree = ModelTree::of($resource);
         $columns = [];
-        foreach ($tree->columns() as $column) {
-            $columns[(int) $tree->columnTable($column)][] = $column;
+        foreach ($tree->getColumns() as $column) {
+            $columns[(int) $tree->getColumnTable($column)][] = $column;
         }
-        // model() объявляют наследники Resource, базовый класс его не знает
+        // getModel() объявляют наследники Resource, базовый класс его не знает
         /**
-         * @var Join|class-string<Entity> $model
+         * @var Join|class-string<DatabaseEntitySource> $model
          * @psalm-suppress UndefinedMethod
          */
-        $model = $resource::model();
+        $model = $resource::getModel();
         $returning = [];
         self::returning(model: $model, tree: $tree, returning: $returning);
         $leaf = 0;
 
-        return self::table(
+        return self::getEntityNode(
             model: $model,
-            key: $resource::primaryColumn(),
+            key: $resource::getPrimaryKeyColumnName(),
             columns: $columns,
             returning: $returning,
             leaf: $leaf,
@@ -63,25 +63,25 @@ final class UpdatePlanner
     }
 
     /**
-     * @param Join|class-string<Entity> $model
+     * @param Join|class-string<DatabaseEntitySource> $model
      * @param array<int, list<string>>  $columns   номер таблицы → её колонки модели
      * @param array<int, list<string>>  $returning номер таблицы → колонки для правых сторон
      * @param int                       $leaf      номер следующей таблицы слева направо
      */
-    private static function table(
+    private static function getEntityNode(
         Join|string $model,
         string $key,
         array $columns,
         array $returning,
         int &$leaf,
-    ): UpdateTableJoinNode|UpdateTableNode {
+    ): UpdateEntityJoinNode|UpdateEntityNode {
         if (is_string($model)) {
             if (!isset($model::COLUMNS[$key])) {
                 throw new LogicException("{$model}: key {$key} must be a column of the leftmost table of its side");
             }
             $number = $leaf++;
 
-            return new UpdateTableNode(
+            return new UpdateEntityNode(
                 entity: $model,
                 columns: $columns[$number] ?? [],
                 key: $key,
@@ -91,8 +91,8 @@ final class UpdatePlanner
 
         /** @var array{0: string, 1: string} $relation */
         $relation = $model->relation;
-        $main = self::table(model: $model->left, key: $key, columns: $columns, returning: $returning, leaf: $leaf);
-        $joined = self::table(
+        $main = self::getEntityNode(model: $model->left, key: $key, columns: $columns, returning: $returning, leaf: $leaf);
+        $joined = self::getEntityNode(
             model: $model->right,
             key: $relation[1],
             columns: $columns,
@@ -100,19 +100,19 @@ final class UpdatePlanner
             leaf: $leaf,
         );
         if ($model instanceof LeftJoin) {
-            if (!$joined instanceof UpdateTableNode) {
+            if (!$joined instanceof UpdateEntityNode) {
                 throw new LogicException('an optional side of several tables is not supported');
             }
-            $joined = new UpdateOptionalTableNode(
+            $joined = new UpdateOptionalEntityNode(
                 update: $joined,
-                insert: new InsertTableNode(
+                insert: new InsertEntityNode(
                     entity: $joined->entity,
                     columns: $joined->columns,
                 ),
             );
         }
 
-        return new UpdateTableJoinNode(
+        return new UpdateEntityJoinNode(
             relation: $relation,
             main: $main,
             joined: $joined,
@@ -122,7 +122,7 @@ final class UpdatePlanner
     /**
      * Колонка `relation[0]` каждого соединения → в `returning` таблицы, где она лежит.
      *
-     * @param Join|class-string<Entity> $model
+     * @param Join|class-string<DatabaseEntitySource> $model
      * @param array<int, list<string>>  $returning
      */
     private static function returning(Join|string $model, ModelTree $tree, array &$returning): void
@@ -131,7 +131,7 @@ final class UpdatePlanner
             return;
         }
         $column = (string) $model->relation[0];
-        $table = $tree->columnTable($column) ?? throw new LogicException("{$column} is not a model column");
+        $table = $tree->getColumnTable($column) ?? throw new LogicException("{$column} is not a model column");
         $returning[$table][] = $column;
         self::returning(model: $model->left, tree: $tree, returning: $returning);
         self::returning(model: $model->right, tree: $tree, returning: $returning);

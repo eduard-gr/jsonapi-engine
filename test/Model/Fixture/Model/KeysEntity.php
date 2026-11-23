@@ -4,12 +4,12 @@ declare(strict_types=1);
 
 namespace Ggs\JsonApiEngine\Test\Model\Fixture\Model;
 
-use Ggs\JsonApiEngine\Model\Entity;
+use Ggs\JsonApiEngine\Model\DatabaseEntitySource;
 
 /**
  * Ключ сертификата с алгоритмом из справочника `key_algorithms`.
  */
-final class KeysEntity extends Entity
+final class KeysEntity extends DatabaseEntitySource
 {
     public const string TABLE = 'certificate_keys';
 

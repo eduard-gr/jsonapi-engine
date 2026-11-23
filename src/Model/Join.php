@@ -15,8 +15,8 @@ use sad_spirit\pg_builder\enums\JoinType;
 abstract readonly class Join
 {
     /**
-     * @param Join|class-string<Entity>  $left
-     * @param Join|class-string<Entity>  $right
+     * @param Join|class-string<DatabaseEntitySource>  $left
+     * @param Join|class-string<DatabaseEntitySource>  $right
      * @param list<string>              $relation `[колонка левого поддерева, колонка правого поддерева]`
      */
     public function __construct(
@@ -26,7 +26,7 @@ abstract readonly class Join
     ) {}
 
     /**
-     * Вид соединения в pg_builder `JoinExpression` (`ModelTree::from()`).
+     * Вид соединения в pg_builder `JoinExpression` (`ModelTree::getFrom()`).
      */
-    abstract public function type(): JoinType;
+    abstract public function getType(): JoinType;
 }

@@ -15,8 +15,8 @@ use Ggs\JsonApiEngine\Resource;
  * Этап 1: разбирает параметры запроса JSON:API по корневому ресурсу endpoint'а и строит дерево запроса.
  *
  * Что можно, описывает только сам ресурс: всё, что в нём объявлено, клиенту доступно.
- *  - `include` — любая связь из `relationships()` ресурса-родителя, на любую глубину;
- *  - `fields` — публичные атрибуты ресурса (`publicAttributes()`);
+ *  - `include` — любая связь из `getRelationships()` ресурса-родителя, на любую глубину;
+ *  - `fields` — публичные атрибуты ресурса (`getPublicAttributes()`);
  *  - `filter` — атрибуты, у которых ресурс объявил `filter`, и только эти операторы;
  *  - `sort` — атрибуты, у которых ресурс объявил `sort`.
  * Схемы endpoint'а, которая сужала бы это, пока нет (решение пользователя: сначала всё на ресурсах, ограничения —
@@ -80,12 +80,12 @@ final class QueryParser
             foreach (explode('.', $path) as $name) {
                 $current = $current === '' ? $name : "{$current}.{$name}";
                 // связь описывает ресурс родителя; подключить можно любую его связь
-                $relationship = $node['resource']::relationship($name);
+                $relationship = $node['resource']::getRelationship($name);
                 if ($relationship === null) {
                     throw new InvalidQueryException("Relationship {$current} can not be included", 'include');
                 }
                 if ($cycle === null && isset($on_path[$relationship->resource])) {
-                    $cycle = "Include path {$current} contains a cycle: {$relationship->resource::type()} is already on the path";
+                    $cycle = "Include path {$current} contains a cycle: {$relationship->resource::getType()} is already on the path";
                 }
                 $on_path[$relationship->resource] = true;
                 if (!isset($node['includes'][$name])) {
@@ -137,7 +137,7 @@ final class QueryParser
     {
         return [
             'resource' => $resource,
-            'fields' => $resource::publicAttributes(),
+            'fields' => $resource::getPublicAttributes(),
             'filters' => [],
             'sort' => [],
             'includes' => [],
@@ -191,11 +191,11 @@ final class QueryParser
 
             $found = false;
             $this->walk($tree, '', function (array &$node) use ($type, $names, $parameter, &$found): void {
-                if ($node['resource']::type() !== (string) $type) {
+                if ($node['resource']::getType() !== (string) $type) {
                     return;
                 }
                 $found = true;
-                $allowed = $node['resource']::publicAttributes();
+                $allowed = $node['resource']::getPublicAttributes();
                 foreach ($names as $name) {
                     if (!\in_array($name, $allowed, true)) {
                         throw new InvalidQueryException("Field {$name} is not available for {$type}", $parameter);
@@ -229,7 +229,7 @@ final class QueryParser
 
             $resource = $resources[$path]
                 ?? throw new InvalidQueryException("Resource {$path} is not included", $parameter);
-            $operators = $resource::hasAttribute($name) ? $resource::filterOperators($name) : [];
+            $operators = $resource::hasAttribute($name) ? $resource::getFilterOperators($name) : [];
             if ($operators === []) {
                 throw new InvalidQueryException("Unknown filter {$name}", $parameter);
             }
@@ -242,7 +242,7 @@ final class QueryParser
                 );
             }
 
-            $type = $resource::attributeType($name);
+            $type = $resource::getAttributeType($name);
 
             $node = &self::at($tree, $path);
             foreach ($conditions as $operator => $operand) {
@@ -290,7 +290,7 @@ final class QueryParser
 
             $resource = $resources[$path]
                 ?? throw new InvalidQueryException("Resource {$path} is not included", 'sort');
-            if (!$resource::hasAttribute($attribute) || !$resource::sortable($attribute)) {
+            if (!$resource::hasAttribute($attribute) || !$resource::isSortable($attribute)) {
                 throw new InvalidQueryException("Sorting by {$name} is not allowed", 'sort');
             }
             if (isset($seen[$name])) {

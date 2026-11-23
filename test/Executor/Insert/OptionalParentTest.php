@@ -4,12 +4,13 @@ declare(strict_types=1);
 
 namespace Ggs\JsonApiEngine\Test\Executor\Insert;
 
+use Ggs\JsonApiEngine\Example\Container\ArrayContainer;
 use Ggs\JsonApiEngine\Executor\Write\WriterBuilder;
 use Ggs\JsonApiEngine\Parser\Write\WriteDocumentParser;
-use Ggs\JsonApiEngine\Plan\Insert\InsertOptionalTableNode;
+use Ggs\JsonApiEngine\Plan\Insert\InsertOptionalEntityNode;
 use Ggs\JsonApiEngine\Plan\Insert\InsertPlanner;
-use Ggs\JsonApiEngine\Plan\Insert\InsertTableJoinNode;
-use Ggs\JsonApiEngine\Plan\Insert\InsertTableNode;
+use Ggs\JsonApiEngine\Plan\Insert\InsertEntityJoinNode;
+use Ggs\JsonApiEngine\Plan\Insert\InsertEntityNode;
 use Ggs\JsonApiEngine\Plan\Write\WritePlanner;
 use Ggs\JsonApiEngine\Test\Executor\Insert\Fixture\VoucherWithVendorResource;
 use PDO;
@@ -41,15 +42,15 @@ final class OptionalParentTest extends TestCase
 
     public function testOptionalRightSideBecomesParent(): void
     {
-        $tables = new InsertPlanner()->tables(resource: VoucherWithVendorResource::class);
+        $tables = new InsertPlanner()->getEntities(resource: VoucherWithVendorResource::class);
 
-        self::assertInstanceOf(InsertTableJoinNode::class, $tables);
+        self::assertInstanceOf(InsertEntityJoinNode::class, $tables);
         self::assertSame(['id', 'vendor_id'], $tables->relation);
         // vendors — правая сторона LeftJoin, но на неё ссылается vouchers.vendor_id: она родитель и вставляется первой
-        self::assertInstanceOf(InsertOptionalTableNode::class, $tables->parent);
-        self::assertInstanceOf(InsertTableNode::class, $tables->parent->input);
+        self::assertInstanceOf(InsertOptionalEntityNode::class, $tables->parent);
+        self::assertInstanceOf(InsertEntityNode::class, $tables->parent->input);
         self::assertSame('vendors', $tables->parent->input->entity::TABLE);
-        self::assertInstanceOf(InsertTableNode::class, $tables->child);
+        self::assertInstanceOf(InsertEntityNode::class, $tables->child);
         self::assertSame('vouchers', $tables->child->entity::TABLE);
     }
 
@@ -63,7 +64,7 @@ final class OptionalParentTest extends TestCase
         // Первый ваучер: продавец вставлен первым, его ключ ушёл ваучеру в vendor_id
         self::assertSame(
             [['id' => $keys[0]['vendor_id'], 'title' => 'Acme']],
-            $this->rows('select id, title from vendors'),
+            $this->getRows('select id, title from vendors'),
         );
         // Второй: атрибутов продавца нет — vendors пропущена, vendor_id ваучера остался NULL
         self::assertArrayNotHasKey('vendor_id', $keys[1]);
@@ -72,7 +73,7 @@ final class OptionalParentTest extends TestCase
                 ['code' => 'V-1', 'vendor_id' => $keys[0]['vendor_id']],
                 ['code' => 'V-2', 'vendor_id' => null],
             ],
-            $this->rows('select code, vendor_id from vouchers order by id'),
+            $this->getRows('select code, vendor_id from vouchers order by id'),
         );
     }
 
@@ -81,19 +82,19 @@ final class OptionalParentTest extends TestCase
      */
     private function insert(array $document): array
     {
-        // InsertTableWriter пишет каждый INSERT в error_log(): PHPUnit перехватывает его и не печатает
+        // InsertEntityWriter пишет каждый INSERT в error_log(): PHPUnit перехватывает его и не печатает
         $this->expectErrorLog();
 
         $roots = new WriteDocumentParser()->insert(document: $document, resource: VoucherWithVendorResource::class);
         $plan = new WritePlanner()->plan(resource: VoucherWithVendorResource::class, roots: $roots);
 
-        return new WriterBuilder(pdo: $this->pdo, lock: false)->root(plan: $plan, data: $roots)->execute();
+        return new WriterBuilder(pdo: $this->pdo, lock: false, container: new ArrayContainer(services: [new VoucherWithVendorResource()]))->getRoot(plan: $plan, data: $roots)->execute();
     }
 
     /**
      * @return list<array<string, mixed>>
      */
-    private function rows(string $sql): array
+    private function getRows(string $sql): array
     {
         /** @var list<array<string, mixed>> */
         return $this->pdo->query($sql)->fetchAll(PDO::FETCH_ASSOC);

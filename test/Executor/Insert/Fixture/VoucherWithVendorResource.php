@@ -6,15 +6,15 @@ namespace Ggs\JsonApiEngine\Test\Executor\Insert\Fixture;
 
 use Ggs\JsonApiEngine\Model\LeftJoin;
 use Ggs\JsonApiEngine\Resource;
-use Ggs\JsonApiEngine\Resource\Insertable;
+use Ggs\JsonApiEngine\Resource\InsertableInterface;
 
 /**
  * Ресурс для OptionalParentTest, где необязательная сторона модели — родитель: `LeftJoin(vouchers, vendors,
  * [vendor_id, id])`. `vouchers.vendor_id` ссылается на `vendors`, поэтому `vendors` (правая сторона `LeftJoin`,
- * обёрнута в `InsertOptionalTableNode`) вставляется первой, а её ключ уходит ваучеру колонкой связи. Без атрибутов
+ * обёрнута в `InsertOptionalEntityNode`) вставляется первой, а её ключ уходит ваучеру колонкой связи. Без атрибутов
  * продавца `vendors` пропускается, и `vendor_id` остаётся NULL.
  */
-final class VoucherWithVendorResource extends Resource implements Insertable
+final class VoucherWithVendorResource extends Resource implements InsertableInterface
 {
     public const string TYPE = 'voucher';
 
@@ -29,12 +29,12 @@ final class VoucherWithVendorResource extends Resource implements Insertable
     ];
 
     #[\Override]
-    public static function relationships(): array
+    public static function getRelationships(): array
     {
         return [];
     }
 
-    public static function model(): LeftJoin
+    public static function getModel(): LeftJoin
     {
         return new LeftJoin(
             left: VouchersEntity::class,

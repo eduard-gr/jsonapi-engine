@@ -4,17 +4,16 @@ declare(strict_types=1);
 
 namespace Ggs\JsonApiEngine\Example\Resource;
 
-use Ggs\JsonApiEngine\Document\ResourceRecord;
 use Ggs\JsonApiEngine\Example\Entity\CertificateDetailsEntity;
 use Ggs\JsonApiEngine\Resource;
-use Ggs\JsonApiEngine\Resource\Insertable;
+use Ggs\JsonApiEngine\Resource\InsertableInterface;
 
 /**
  * `detail`: таблица `certificate_details`, идентификатор — её первичный ключ `certificate_id`.
  *
- * Можно создавать (`Insertable`): вставку см. `Executor\Insert\InsertResourceWriter`.
+ * Можно создавать (`InsertableInterface`): вставку см. `Executor\Insert\InsertResourceWriter`.
  */
-final class DetailResource extends Resource implements Insertable
+final class DetailResource extends Resource implements InsertableInterface
 {
     public const string TYPE = 'detail';
 
@@ -54,32 +53,13 @@ final class DetailResource extends Resource implements Insertable
         ],
     ];
 
-    public static function relationships(): array
+    public static function getRelationships(): array
     {
         return [];
     }
 
-    public static function model(): string
+    public static function getModel(): string
     {
         return CertificateDetailsEntity::class;
-    }
-
-    /**
-     * Детали из строки QUERY1: идентификатор — алиас `detail_id` (`certificate_details.certificate_id`).
-     */
-    public static function serialize(array $tuple): ResourceRecord
-    {
-        return new ResourceRecord(
-            id: $tuple['detail_id'],
-            type: self::TYPE,
-            attributes: [
-                self::BUYER_EMAIL => $tuple['buyer_email'],
-                self::RECIPIENT_NAME => $tuple['recipient_name'],
-                self::RECIPIENT_EMAIL => $tuple['recipient_email'],
-                self::GREETING_TEXT => $tuple['greeting_text'],
-                self::DESIGN_TEMPLATE_ID => $tuple['design_template_id'],
-            ],
-            relationships: [],
-        );
     }
 }

@@ -4,9 +4,9 @@ declare(strict_types=1);
 
 namespace Ggs\JsonApiEngine\Test\Model\Fixture\Model;
 
-use Ggs\JsonApiEngine\Model\Entity;
+use Ggs\JsonApiEngine\Model\DatabaseEntitySource;
 
-final class OrdersEntity extends Entity
+final class OrdersEntity extends DatabaseEntitySource
 {
     public const string TABLE = 'orders';
 

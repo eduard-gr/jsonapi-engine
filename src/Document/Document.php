@@ -12,7 +12,7 @@ use Ds\Set;
  * Получает в конструкторе поток корня дерева и реестр ресурсов того же выполнения
  * и собирает документ при сериализации (jsonSerialize()):
  *  - data — все ресурсы потока по порядку;
- *  - included — обход связей в ширину, начиная с data: по ключам related() каждого ресурса
+ *  - included — обход связей в ширину, начиная с data: по ключам getRelated() каждого ресурса
  *    ресурсы ищутся в реестре, и найденные добавляются в included и в очередь обхода.
  *
  * В included попадает только то, до чего можно дойти по связям от data. Ресурсы, которые
@@ -25,17 +25,17 @@ use Ds\Set;
  * например, связь provider, записанная сериализатором из внешнего ключа, когда провайдеры
  * не загружаются), ссылка остаётся в relationships, а в included ничего не добавляется.
  *
- * Реестр должен быть тем же, что получили RegisterIterator дерева. С другим реестром ошибки
+ * Реестр должен быть тем же, что получили RegisterReader дерева. С другим реестром ошибки
  * не будет: find() ничего не найдёт, и included молча окажется пустым.
  *
  * data на повторы не проверяется: каждый ресурс потока уходит в data. Корень дерева — узел
- * соединения — отдаёт каждый главный ресурс один раз (HashNestJoinIterator и MergeNestJoinIterator
+ * соединения — отдаёт каждый главный ресурс один раз (HashNestJoinReader и MergeNestJoinReader
  * проверяют уникальность ключа главного).
  *
  * Порядок included — порядок обхода в ширину: сначала все ресурсы, на которые ссылается data,
  * затем те, на которые ссылаются они, и так далее. JSON:API порядок included не задаёт.
  *
- * Поток читается целиком до начала обхода связей: на это опирается PreloadIterator, который
+ * Поток читается целиком до начала обхода связей: на это опирается PreloadReader, который
  * загружает справочник в реестр после последнего главного ресурса.
  *
  * Документ ленивый: создание ничего не выполняет, все узлы дерева (а значит, и SQL-запросы)
@@ -51,7 +51,7 @@ final readonly class Document implements \JsonSerializable
     /**
      * @param iterable<ResourceRecord> $flow Поток главных ресурсов от корня дерева
      * @param ResourceRegistry $registry Реестр того же выполнения — тот же экземпляр,
-     *        что получили все RegisterIterator дерева
+     *        что получили все RegisterReader дерева
      */
     public function __construct(
         private iterable $flow,
@@ -63,7 +63,7 @@ final readonly class Document implements \JsonSerializable
      *
      * Именно этот проход запускает выполнение всех узлов дерева. included собирается
      * после него: связи ресурсов полны только тогда, когда дерево выполнено целиком,
-     * а справочники PreloadIterator попадают в реестр только в самом конце потока.
+     * а справочники PreloadReader попадают в реестр только в самом конце потока.
      * Поэтому поток всегда читается до конца, без раннего выхода.
      */
     #[\Override]
@@ -78,7 +78,7 @@ final readonly class Document implements \JsonSerializable
         foreach ($this->flow as $record) {
             $data[] = $record;
             // Ресурс из data не должен попасть ещё и в included
-            $seen->add($record->key());
+            $seen->add($record->getRegistryKey());
         }
 
         $included = [];
@@ -87,7 +87,7 @@ final readonly class Document implements \JsonSerializable
         $queue = $data;
 
         for ($position = 0; $position < count($queue); $position++) {
-            foreach ($queue[$position]->related() as $key) {
+            foreach ($queue[$position]->getRelated() as $key) {
                 if ($seen->contains($key)) {
                     continue;
                 }

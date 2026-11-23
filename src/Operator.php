@@ -16,7 +16,7 @@ enum Operator: string
     case Lte = 'lte';
     case Gte = 'gte';
     /**
-     * Список значений через запятую. TODO: в SQL плана пока не строится (SharedScanNode::withSelect() бросает
+     * Список значений через запятую. TODO: в SQL плана пока не строится (EntityScanNodeDraft::withSelect() бросает
      * LogicException): через PDO массив одним параметром не передать.
      */
     case In = 'in';

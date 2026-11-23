@@ -8,9 +8,13 @@ use Ggs\JsonApiEngine\Resource;
 
 /**
  * Узел плана изменения: граница уровней — ресурс и поддерево таблиц его модели (`input`, из
- * `UpdatePlanner::tables()`). Исполнитель — `Executor\Update\UpdateResourceWriter` (операция → строка «колонка
+ * `UpdatePlanner::getEntities()`). Исполнитель — `Executor\Update\UpdateResourceWriter` (операция → строка «колонка
  * модели → значение» → поддерево таблиц). Ветвь `update` места (`Plan\Write\WriteOperationNode`): исполняет
- * `UpdateOperation` и `KeepOperation`.
+ * `UpdateOperation`; ресурс, который только ищут (`KeepOperation`), — отдельная ветвь `keep`
+ * (`Plan\Write\KeepEntityNode`).
+ *
+ * У ресурса над чужим источником (`Model\ForeignDataSource`) вход — `UpdateForeignDataNode`: строка уходит в метод
+ * `update()` источника (`Executor\Update\UpdateForeignDataWriter`).
  *
  * Неизменяемый, без состояния.
  */
@@ -21,6 +25,6 @@ final readonly class UpdateResourceNode
      */
     public function __construct(
         public string $resource,
-        public UpdateTableJoinNode|UpdateTableNode $input,
+        public UpdateEntityJoinNode|UpdateEntityNode|UpdateForeignDataNode $input,
     ) {}
 }

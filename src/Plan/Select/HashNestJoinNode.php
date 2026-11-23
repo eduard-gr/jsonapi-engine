@@ -9,7 +9,7 @@ namespace Ggs\JsonApiEngine\Plan\Select;
  * по outer, порядок сторон не важен.
  *
  * Блокирующий: outer читается целиком до первого результата. Поэтому внутри строки стоять не может —
- * там SharedScanPass превращает его в HashJoinNode. Если обе стороны можно упорядочить по ключам,
+ * там EntityScanNodeDraftPass превращает его в HashJoinNode. Если обе стороны можно упорядочить по ключам,
  * HashToMergeRule превращает его в MergeNestJoinNode.
  */
 final class HashNestJoinNode extends JoinNode {}

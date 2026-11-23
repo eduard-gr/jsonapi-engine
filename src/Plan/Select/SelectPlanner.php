@@ -11,7 +11,8 @@ use Ggs\JsonApiEngine\Parser\QueryParser;
  * Планировщик select: дерево запроса (QueryParser) → дерево узлов плана → шаги преобразования → SQL.
  *
  * Поток: вход — дерево запроса (TreeResource), проверенное парсером → выход — дерево после каждого шага
- * (название шага => корень дерева); последнее ('sql') — план, где каждый владелец запроса — SqlScanNode с Select.
+ * (название шага => корень дерева: nodes, separate, lift, order, close, merge, sql); последнее ('sql') — план, где
+ * каждый владелец запроса — EntityScanNode с Select, а каждый ресурс чужого источника — ForeignDataScanNode.
  *
  * Принципы:
  *  1. Иммутабельные узлы + функциональный стиль. Свойства узлов readonly, «изменить» узел — значит
@@ -19,17 +20,22 @@ use Ggs\JsonApiEngine\Parser\QueryParser;
  *     каждого шага сохраняется и его можно показать (SelectPlanPrinter).
  *  2. Модель итераторов «Вулкан»: у каждого узла фиксированное число входов, и оно видно по классу:
  *       - ResourceNode   — 0 входов, таблица ресурса;
- *       - SharedScanNode — 1 вход: верх строки (SharedRowJoinNode или ResourceNode); владелец SQL-запроса;
- *         на шаге sql его заменяет SqlScanNode — тот же вход и собранный запрос;
- *       - JoinNode       — 2 входа, outer и inner (SharedRowJoinNode, PreloadNode,
- *                          HashNestJoinNode, HashJoinNode, MergeNestJoinNode).
+ *       - EntityScanNodeDraft — 1 вход: верх строки (EntitySharedJoinNode или ResourceNode); владелец SQL-запроса;
+ *         на шаге sql его заменяет EntityScanNode — тот же вход и собранный запрос;
+ *       - ForeignDataScanNode — 1 вход: ResourceNode над чужим источником (Model\ForeignDataSource); SQL у него
+ *         нет, читает код источника;
+ *       - JoinNode       — 2 входа, outer и inner (EntitySharedJoinNode, PreloadNode,
+ *                          HashNestJoinNode, HashJoinNode, MergeNestJoinNode, HashOneJoinNode).
  *  3. Ветка остаётся у своего ресурса. Ветка 1-1 ресурса (logs у delivery) не поднимается над строкой:
  *     её outer — поток самого ресурса внутри строки, поэтому ключ берётся и связь пишется именно ему.
  *     Внутри строки outer нельзя читать наперёд, и 1:N там становится HashJoinNode (хеш по inner).
- *  4. У каждого SQL-запроса ровно один владелец — SharedScanNode, даже если в запросе один ресурс
+ *  4. У каждого SQL-запроса ровно один владелец — EntityScanNodeDraft, даже если в запросе один ресурс
  *     (provider, domain, log). ResourceNode — всегда только таблица: порядок потока (order), запрос (select)
  *     и всё, что собирается в SQL, живёт у владельца. Запрос владелец собирает сам из своего поддерева
- *     (SharedScanNode::withSelect()).
+ *     (EntityScanNodeDraft::withSelect()).
+ *  5. Вид источника ресурса решает план, а не сборщик. Ресурс над чужим источником — отдельный лист
+ *     ForeignDataScanNode: в общую строку он не входит (шаг separate делает его 1-1 связи HashOneJoinNode),
+ *     цепочка предков на нём обрывается (шаг sql), порядок для слияния он даёт только свой (шаг merge).
  *
  * Вызовы своего кода — с именованными аргументами, кроме функций с переменным числом аргументов
  * (sprintf, array_diff): у них аргументы позиционные. Вызовы pg_builder — позиционные, чтобы имена
@@ -52,7 +58,7 @@ final class SelectPlanner
 
     /**
      * @param TreeResource $tree дерево запроса от QueryParser
-     * @return array<string, ResourceNode|SharedScanNode|SqlScanNode|JoinNode> название шага => дерево после него
+     * @return array<string, ResourceNode|EntityScanNodeDraft|EntityScanNode|ForeignDataScanNode|JoinNode> название шага => дерево после него
      *                                                               ('nodes' — дерево сразу после fromTree())
      */
     public function plan(array $tree): array
@@ -71,26 +77,30 @@ final class SelectPlanner
     }
 
     /**
-     * Шаги по порядку: имя шага => Pass. Порядок важен — каждый шаг рассчитан на результат предыдущих.
+     * Шаги по порядку: имя шага => PassInterface. Порядок важен — каждый шаг рассчитан на результат предыдущих.
      *
-     * @return Generator<string, Pass>
+     * @return Generator<string, PassInterface>
      */
     private function getSteps(): Generator
     {
+        // связь 1-1 с чужим источником выходит из общей строки: EntitySharedJoinNode → HashOneJoinNode
+        yield 'separate' => new SeparateForeignDataRule();
+
         // ветки владельца строки выходят из её outer наверх; ветки 1-1 ресурсов остаются у своего ресурса
-        // внутри строки и в SharedScanPass становятся HashJoinNode
+        // внутри строки и в EntityScanNodeDraftPass становятся HashJoinNode
         yield 'lift' => new LiftBranchFromOuterRule();
 
         // PreloadNode под nest join
         yield 'order' => new PreloadBelowNestJoinRule();
 
-        // Владелец SharedScanNode над каждым запросом; HashNestJoinNode внутри строки → HashJoinNode
-        yield 'close' => new SharedScanPass();
+        // Владелец EntityScanNodeDraft над каждым запросом, ForeignDataScanNode над ресурсом чужого источника;
+        // HashNestJoinNode внутри строки → HashJoinNode
+        yield 'close' => new EntityScanNodeDraftPass();
 
         // Hash → Merge, где обе стороны можно упорядочить по ключу; после close — владельцы строк уже видны
         yield 'merge' => new HashToMergeRule();
 
-        // Select у каждого владельца запроса
+        // Select у каждого владельца запроса; ключи соединений у ForeignDataScanNode
         yield 'sql' => new BuildSqlPass();
     }
 
@@ -99,7 +109,7 @@ final class SelectPlanner
      * дальше все шаги работают только с узлами.
      *
      * Ресурс становится ResourceNode с полями, фильтрами и сортировкой из дерева. Каждый include становится
-     * соединением класса по виду связи: ONE_TO_ONE — SharedRowJoinNode, MANY_TO_ONE — PreloadNode,
+     * соединением класса по виду связи: ONE_TO_ONE — EntitySharedJoinNode, MANY_TO_ONE — PreloadNode,
      * ONE_TO_MANY — HashNestJoinNode. Include навешиваются в порядке объявления: каждый следующий
      * становится новым корнем, а всё построенное до него — его outer. inner — связанный ресурс,
      * построенный этим же методом рекурсивно.
@@ -135,9 +145,9 @@ final class SelectPlanner
             $this->requireKeys(node: $include, keys: self::TREE_INCLUDE_KEYS, where: "include '{$name}'");
 
             // Класс соединения по виду связи. HashJoinNode и MergeNestJoinNode здесь не создаются:
-            // их выбирают SharedScanPass и HashToMergeRule по месту узла в дереве
+            // их выбирают EntityScanNodeDraftPass и HashToMergeRule по месту узла в дереве
             $class = match ($include['type']) {
-                QueryParser::ONE_TO_ONE => SharedRowJoinNode::class,
+                QueryParser::ONE_TO_ONE => EntitySharedJoinNode::class,
                 QueryParser::MANY_TO_ONE => PreloadNode::class,
                 QueryParser::ONE_TO_MANY => HashNestJoinNode::class,
                 default => throw new \LogicException(

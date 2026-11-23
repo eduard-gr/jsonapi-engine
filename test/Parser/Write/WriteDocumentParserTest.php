@@ -152,7 +152,7 @@ final class WriteDocumentParserTest extends TestCase
                 resource: CertificateWithDetailResource::class,
                 id: '1',
                 document: ['data' => ['type' => 'certificate', 'id' => '1']],
-            )->relationship(name: 'domains'),
+            )->getRelationship(name: 'domains'),
         );
     }
 
@@ -166,7 +166,7 @@ final class WriteDocumentParserTest extends TestCase
 
         self::assertEquals(new RelationshipOperation(replace: false, children: [
             new KeepOperation(resource: DeliveryResource::class, identity: new PersistentIdentity(id: 1)),
-        ]), $root->relationship(name: 'delivery'));
+        ]), $root->getRelationship(name: 'delivery'));
     }
 
     public function testDelete(): void
@@ -198,7 +198,7 @@ final class WriteDocumentParserTest extends TestCase
     /**
      * @param 'insert'|'update' $method `update` — `PATCH /certificates/1`
      */
-    #[DataProvider('invalidDocuments')]
+    #[DataProvider('getInvalidDocuments')]
     public function testRejectsInvalidDocument(
         string $method,
         string $resource,
@@ -220,7 +220,7 @@ final class WriteDocumentParserTest extends TestCase
     /**
      * @return array<string, array{string, class-string, array, string, string}>
      */
-    public static function invalidDocuments(): array
+    public static function getInvalidDocuments(): array
     {
         $certificate = CertificateWithDetailResource::class;
         $patch = static fn(array $data, array $included = []): array => [
@@ -241,7 +241,7 @@ final class WriteDocumentParserTest extends TestCase
             'PATCH: data is a list' => [
                 'update', $certificate, ['data' => [['type' => 'certificate', 'id' => '1']]], '400', '/data',
             ],
-            'PATCH: resource is not Updatable' => [
+            'PATCH: resource is not UpdatableInterface' => [
                 'update', ProviderResource::class, ['data' => ['type' => 'provider', 'id' => '1']], '403', '/data',
             ],
             'unknown attribute' => [
@@ -327,7 +327,7 @@ final class WriteDocumentParserTest extends TestCase
             'POST: type differs from the route' => [
                 'insert', $certificate, ['data' => ['type' => 'domain']], '409', '/data/type',
             ],
-            'POST: resource is not Insertable' => [
+            'POST: resource is not InsertableInterface' => [
                 'insert', ProviderResource::class, ['data' => ['type' => 'provider']], '403', '/data',
             ],
             'POST: existing child of a new resource' => [

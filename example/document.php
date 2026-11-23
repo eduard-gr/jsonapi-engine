@@ -1,7 +1,7 @@
 <?php
 
 /**
- * Пример: дерево итераторов исполнителя, собранное руками, и документ JSON:API по SQLite базе example/db.
+ * Пример: дерево читателей исполнителя, собранное руками, и документ JSON:API по SQLite базе example/db.
  *
  *     php example/document.php
  *     php example/db/seed.php [количество сертификатов]   # пересоздать базу
@@ -17,102 +17,113 @@ use Ggs\JsonApiEngine\Example\Resource\DetailResource;
 use Ggs\JsonApiEngine\Example\Resource\DomainResource;
 use Ggs\JsonApiEngine\Example\Resource\LogResource;
 use Ggs\JsonApiEngine\Example\Resource\ProviderResource;
-use Ggs\JsonApiEngine\Executor\Select\AscendingKeyIterator;
-use Ggs\JsonApiEngine\Executor\Select\HashNestJoinIterator;
-use Ggs\JsonApiEngine\Executor\Select\ManualSerializeIterator;
-use Ggs\JsonApiEngine\Executor\Select\MergeNestJoinIterator;
-use Ggs\JsonApiEngine\Executor\Select\PreloadIterator;
-use Ggs\JsonApiEngine\Executor\Select\RegisterIterator;
-use Ggs\JsonApiEngine\Executor\Select\SharedDataIterator;
-use Ggs\JsonApiEngine\Executor\Select\SharedRowJoinIterator;
-use Ggs\JsonApiEngine\Executor\Select\SharedScanIterator;
-use Ggs\JsonApiEngine\Executor\Select\SqlScanIterator;
+use Ggs\JsonApiEngine\Executor\Select\AscendingKeyReader;
+use Ggs\JsonApiEngine\Executor\Select\HashNestJoinReader;
+use Ggs\JsonApiEngine\Executor\Select\SerializeReader;
+use Ggs\JsonApiEngine\Executor\Select\ManualSerializeReader;
+use Ggs\JsonApiEngine\Executor\Select\MergeNestJoinReader;
+use Ggs\JsonApiEngine\Executor\Select\PreloadReader;
+use Ggs\JsonApiEngine\Executor\Select\RegisterReader;
+use Ggs\JsonApiEngine\Executor\Select\EntitySharedWindowReader;
+use Ggs\JsonApiEngine\Executor\Select\EntitySharedJoinReader;
+use Ggs\JsonApiEngine\Executor\Select\EntitySharedAdvanceReader;
+use Ggs\JsonApiEngine\Executor\Select\EntityScanReader;
+use Ggs\JsonApiEngine\Executor\Select\UniqueAscendingKeyReader;
 
 require __DIR__ . '/../vendor/autoload.php';
 require_once __DIR__ . '/db/connection.php';
 
 $pdo = getPDO();
 
-// Реестр ресурсов этого выполнения: один на всё дерево. Его получают все ManualSerializeIterator
+// Реестр ресурсов этого выполнения: один на всё дерево. Его получают все RegisterReader
 // (каждый ресурс существует в одном экземпляре) и Document (по нему собирается included)
 $registry = new ResourceRegistry();
 
-$data = new SharedDataIterator(
-    source: new SqlScanIterator(
+$data = new EntitySharedWindowReader(
+    source: new EntityScanReader(
         pdo: $pdo,
         sql: QUERY1)
 );
 
-// Сертификат, детали и доставка из одной строки QUERY1: каждый ресурс собирает свой serialize()
-$certificates = new SharedScanIterator(
+// Сертификат, детали и доставка из одной строки QUERY1: каждый ресурс собирает свой SerializeReader по описанию
+// (сертификат реализует SerializeInterface — у него ManualSerializeReader)
+// ресурса; где в строке лежат его колонки, говорит запись колонок (QUERY1_CERTIFICATE и другие в db/connection.php —
+// по плану её даёт EntityScanNode::columns, здесь она написана руками под алиасы запроса)
+$certificates = new EntitySharedAdvanceReader(
     data: $data,
-    source: new SharedRowJoinIterator(
-        outer:new SharedRowJoinIterator(
-            outer: new RegisterIterator(
-                source: new ManualSerializeIterator( // Использование $data
+    source: new EntitySharedJoinReader(
+        outer:new EntitySharedJoinReader(
+            outer: new RegisterReader(
+                source: new ManualSerializeReader( // Использование $data
                     source: $data,
-                    resource: CertificateResource::class,
+                    resource: new CertificateResource(),
+                    columns: QUERY1_CERTIFICATE,
                 ),
                 registry: $registry,
             ),
-            inner: new RegisterIterator(
-                source: new ManualSerializeIterator( // Тот же самый $data!
+            inner: new RegisterReader(
+                source: new SerializeReader( // Тот же самый $data!
                     source: $data,
-                    resource: DetailResource::class,
+                    resource: new DetailResource(),
+                    columns: QUERY1_DETAIL,
                 ),
                 registry: $registry,
             ),
             name: 'detail'),
-        inner: new RegisterIterator(
-            source: new ManualSerializeIterator( // Тот же самый $data! Без доставки (LEFT JOIN) — null
+        inner: new RegisterReader(
+            source: new SerializeReader( // Тот же самый $data! Без доставки (LEFT JOIN) — null
                 source: $data,
-                resource: DeliveryResource::class,
+                resource: new DeliveryResource(),
+                columns: QUERY1_DELIVERY,
             ),
             registry: $registry,
         ),
         name: 'delivery'));
 
 
-// Справочник провайдеров: PreloadIterator вычитывает его целиком, и каждый провайдер
+// Справочник провайдеров: PreloadReader вычитывает его целиком, и каждый провайдер
 // регистрируется в реестре
-$flow4 = new RegisterIterator(
-    source: new ManualSerializeIterator(
-        source: new SqlScanIterator(
+$flow4 = new RegisterReader(
+    source: new SerializeReader(
+        source: new EntityScanReader(
             pdo: $pdo,
             sql: QUERY4),
-        resource: ProviderResource::class,
+        resource: new ProviderResource(),
+        columns: QUERY4_PROVIDER,
     ),
     registry: $registry,
 );
 
-// Сертификаты с провайдером: связь provider уже записана CertificateResource::serialize() из provider_id,
+// Сертификаты с провайдером: связь provider уже записана SerializeReader сертификата из provider_id,
 // узел только загружает провайдеров в реестр — так они попадут в included (include=provider).
 // Провайдеры читаются после последнего сертификата, до обхода связей в Document.
 // Провайдер один в реестре, и Document добавит его в included один раз
-$flow1 = new PreloadIterator(
+$flow1 = new PreloadReader(
     source: $certificates,
     preload: $flow4);
 
 
-// Домены: служебный ключ certificate_id — ключ соединения с сертификатом для HashNestJoinIterator
-$flow2 = new RegisterIterator(
-    source: new ManualSerializeIterator(
-        source: new SqlScanIterator(
+// Домены: служебный ключ certificate_id — ключ соединения с сертификатом для HashNestJoinReader
+$flow2 = new RegisterReader(
+    source: new SerializeReader(
+        source: new EntityScanReader(
             pdo: $pdo,
             sql: QUERY2),
-        resource: DomainResource::class,
+        resource: new DomainResource(),
+        columns: QUERY2_DOMAIN,
     ),
     registry: $registry,
 );
 
 
-// Логи: служебный ключ domain_id — ключ соединения с доменом для MergeNestJoinIterator
-$flow3 = new RegisterIterator(
-    source: new ManualSerializeIterator(
-        source: new SqlScanIterator(
+// Логи: служебный ключ domain_id — ключ соединения с доменом для MergeNestJoinReader
+$flow3 = new RegisterReader(
+    source: new SerializeReader(
+        source: new EntityScanReader(
             pdo: $pdo,
             sql: QUERY3),
-        resource: LogResource::class,
+        resource: new LogResource(),
+        columns: QUERY3_LOG,
     ),
     registry: $registry,
 );
@@ -120,27 +131,26 @@ $flow3 = new RegisterIterator(
 
 // Домены с логами: доменам записывается связь logs, наружу идут домены. Логи попадут в included,
 // потому что Document дойдёт до них по связям сертификат → домен → лог.
-// MergeNestJoinIterator: QUERY2 и QUERY3 отсортированы по domain id. Порядок доменов по id
+// MergeNestJoinReader: QUERY2 и QUERY3 отсортированы по domain id. Порядок доменов по id
 // не подходит для соединения с сертификатами по certificate_id, поэтому внешнее
-// соединение остаётся HashNestJoinIterator — ему порядок не важен.
-// Порядок ключей слиянию проверяет AscendingKeyIterator на каждом входе: домены — строго по id, логи — по domain_id
-$domains = new MergeNestJoinIterator(
-    outer: new AscendingKeyIterator(
+// соединение остаётся HashNestJoinReader — ему порядок не важен.
+// Порядок ключей слиянию проверяют узлы на входах: домены — строго по id (UniqueAscendingKeyReader), логи —
+// по domain_id с повторами (AscendingKeyReader)
+$domains = new MergeNestJoinReader(
+    outer: new UniqueAscendingKeyReader(
         source: $flow2,
         key: 'id',
-        strict: true,
     ),
-    inner: new AscendingKeyIterator(
+    inner: new AscendingKeyReader(
         source: $flow3,
         key: 'domain_id',
-        strict: false,
     ),
     outer_key: 'id',
     inner_key: 'domain_id',
     name: 'logs');
 
 
-$flow = new HashNestJoinIterator(
+$flow = new HashNestJoinReader(
     outer: $flow1,
     inner: $domains,
     outer_key: 'id',

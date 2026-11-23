@@ -26,6 +26,7 @@
         "php": ">=8.5",
         "ext-ds": "^2.0",
         "ext-pdo": "*",
-        "sad_spirit/pg_builder": "^3.3"
+        "sad_spirit/pg_builder": "^3.3",
+        "psr/container": "^2.0"
     }
 }

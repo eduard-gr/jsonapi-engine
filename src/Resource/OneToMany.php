@@ -15,9 +15,9 @@ namespace Ggs\JsonApiEngine\Resource;
  *
  * `JOIN` в запросе владельца размножил бы его строки, поэтому ресурс читается отдельным SQL-запросом, а строки
  * ресурса привязываются к владельцам по ключу (пустой список — `data: []`) узлом соединения:
- *  - `HashNestJoinIterator` — порядок потоков не важен; блокирующий: сначала строит таблицу владельцев;
- *  - `MergeNestJoinIterator` — оба потока отсортированы по ключу, потоковый.
- * В примере `certificate.domains` — `HashNestJoinIterator` (`QUERY2`), `domain.logs` — `MergeNestJoinIterator`
+ *  - `HashNestJoinReader` — порядок потоков не важен; блокирующий: сначала строит таблицу владельцев;
+ *  - `MergeNestJoinReader` — оба потока отсортированы по ключу, потоковый.
+ * В примере `certificate.domains` — `HashNestJoinReader` (`QUERY2`), `domain.logs` — `MergeNestJoinReader`
  * (`QUERY2` и `QUERY3` отсортированы по id домена) (`example/document.php`).
  */
 final readonly class OneToMany extends Relationship

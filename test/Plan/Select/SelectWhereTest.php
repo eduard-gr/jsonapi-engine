@@ -6,14 +6,14 @@ namespace Ggs\JsonApiEngine\Test\Plan\Select;
 
 use Ggs\JsonApiEngine\Example\Resource\CertificateResource;
 use Ggs\JsonApiEngine\Example\Resource\DeliveryResource;
-use Ggs\JsonApiEngine\Executor\Select\SqlScanIterator;
+use Ggs\JsonApiEngine\Executor\Select\EntityScanReader;
 use Ggs\JsonApiEngine\Parser\QueryParser;
 use Ggs\JsonApiEngine\Plan\Select\JoinNode;
 use Ggs\JsonApiEngine\Plan\Select\ResourceNode;
 use Ggs\JsonApiEngine\Plan\Select\SelectPlanner;
-use Ggs\JsonApiEngine\Plan\Select\SharedRowJoinNode;
-use Ggs\JsonApiEngine\Plan\Select\SharedScanNode;
-use Ggs\JsonApiEngine\Plan\Select\SqlScanNode;
+use Ggs\JsonApiEngine\Plan\Select\EntitySharedJoinNode;
+use Ggs\JsonApiEngine\Plan\Select\EntityScanNodeDraft;
+use Ggs\JsonApiEngine\Plan\Select\EntityScanNode;
 use Ggs\JsonApiEngine\Test\Plan\Select\Fixture\KeyedCertificateResource;
 use PHPUnit\Framework\TestCase;
 use sad_spirit\pg_builder\SqlBuilderWalker;
@@ -29,7 +29,7 @@ final class SelectWhereTest extends TestCase
 {
     public function testOwnerAndOneToOneFilters(): void
     {
-        $owner = self::owner(query: [
+        $owner = self::getOwner(query: [
             'include' => 'delivery',
             'fields' => ['certificate' => 'code', 'delivery' => 'is_sent'],
             'filter' => ['status' => 'ACTIVE', 'created_at' => ['gte' => '2026-03-01'], 'delivery.is_sent' => 'false'],
@@ -41,7 +41,7 @@ final class SelectWhereTest extends TestCase
             . ' where t0.status = :t0_status_0 and t0.created_at >= :t0_created_at_1'
             . ' and ( t1.certificate_id is null or t1.is_sent = :t1_is_sent_2 )'
             . ' order by t0.id',
-            self::sql(owner: $owner),
+            self::getSql(owner: $owner),
         );
         self::assertSame(
             ['t0_status_0' => 'ACTIVE', 't0_created_at_1' => '2026-03-01 00:00:00.000000' . date('P', strtotime('2026-03-01')), 't1_is_sent_2' => false],
@@ -54,34 +54,34 @@ final class SelectWhereTest extends TestCase
             . " where c.status = 'ACTIVE' and c.created_at >= '2026-03-01' and (d.certificate_id is null or d.is_sent = 0)",
         )->fetchColumn();
         self::assertGreaterThan(0, $expected);
-        self::assertCount($expected, self::rows(owner: $owner));
+        self::assertCount($expected, self::getRows(owner: $owner));
     }
 
     public function testFilterOfOneToOneWithoutOwnerFilters(): void
     {
-        $owner = self::owner(query: ['include' => 'delivery', 'filter' => ['delivery.is_sent' => 'true']]);
+        $owner = self::getOwner(query: ['include' => 'delivery', 'filter' => ['delivery.is_sent' => 'true']]);
 
-        self::assertStringContainsString(' where ( t1.certificate_id is null or t1.is_sent = :t1_is_sent_0 ) order by', self::sql(owner: $owner));
+        self::assertStringContainsString(' where ( t1.certificate_id is null or t1.is_sent = :t1_is_sent_0 ) order by', self::getSql(owner: $owner));
         self::assertSame(['t1_is_sent_0' => true], $owner->parameters);
-        self::assertNotSame([], self::rows(owner: $owner));
+        self::assertNotSame([], self::getRows(owner: $owner));
     }
 
     public function testTwoConditionsOnOneColumnHaveDistinctParameters(): void
     {
-        $owner = self::owner(query: ['filter' => ['created_at' => ['gte' => '2026-01-01', 'lt' => '2026-04-01']]]);
+        $owner = self::getOwner(query: ['filter' => ['created_at' => ['gte' => '2026-01-01', 'lt' => '2026-04-01']]]);
 
         self::assertStringContainsString(
             ' where t0.created_at >= :t0_created_at_0 and t0.created_at < :t0_created_at_1 order by',
-            self::sql(owner: $owner),
+            self::getSql(owner: $owner),
         );
         self::assertSame(['t0_created_at_0', 't0_created_at_1'], array_keys($owner->parameters));
     }
 
     public function testWithoutFiltersNoWhere(): void
     {
-        $owner = self::owner(query: []);
+        $owner = self::getOwner(query: []);
 
-        self::assertStringNotContainsString(' where ', self::sql(owner: $owner));
+        self::assertStringNotContainsString(' where ', self::getSql(owner: $owner));
         self::assertSame([], $owner->parameters);
     }
 
@@ -91,13 +91,13 @@ final class SelectWhereTest extends TestCase
      */
     public function testFilterAndSortColumnsKeepModelTables(): void
     {
-        $owner = (new SharedScanNode(input: new ResourceNode(
+        $owner = (new EntityScanNodeDraft(input: new ResourceNode(
             resource: KeyedCertificateResource::class,
             fields: ['status'],
             filters: [['attribute' => 'key_algorithm', 'operator' => 'eq', 'value' => 'RSA']],
             sort: [['attribute' => 'key_size', 'descending' => true, 'position' => 0]],
         )))->withSelect();
-        $sql = self::sql(owner: $owner);
+        $sql = self::getSql(owner: $owner);
 
         self::assertStringStartsWith('select t0.id as t0_id, t0.status as t0_status from ', $sql);
         self::assertStringContainsString('certificate_keys as t0_2', $sql);
@@ -110,7 +110,7 @@ final class SelectWhereTest extends TestCase
 
     public function testInOperatorIsNotSupportedYet(): void
     {
-        $node = new SharedScanNode(input: new ResourceNode(
+        $node = new EntityScanNodeDraft(input: new ResourceNode(
             resource: KeyedCertificateResource::class,
             filters: [['attribute' => 'key_algorithm', 'operator' => 'in', 'value' => ['RSA', 'EC']]],
         ));
@@ -124,15 +124,15 @@ final class SelectWhereTest extends TestCase
      *
      * @param array<string, mixed> $query
      */
-    private static function owner(array $query): SqlScanNode
+    private static function getOwner(array $query): EntityScanNode
     {
         $tree = (new QueryParser())->parse(resource: CertificateResource::class, query: $query);
         $node = (new SelectPlanner())->plan(tree: $tree)['sql'];
-        while ($node instanceof JoinNode && !$node instanceof SharedRowJoinNode) {
+        while ($node instanceof JoinNode && !$node instanceof EntitySharedJoinNode) {
             $node = $node->outer;
         }
-        self::assertInstanceOf(SqlScanNode::class, $node);
-        self::assertSame(CertificateResource::class, $node->rowOwner()->resource);
+        self::assertInstanceOf(EntityScanNode::class, $node);
+        self::assertSame(CertificateResource::class, $node->getRootResourceNode()->resource);
 
         return $node;
     }
@@ -140,14 +140,14 @@ final class SelectWhereTest extends TestCase
     /**
      * @return list<array<string, mixed>>
      */
-    private static function rows(SqlScanNode $owner): array
+    private static function getRows(EntityScanNode $owner): array
     {
-        $scan = new SqlScanIterator(pdo: getPDO(), sql: $owner->select->dispatch(new SqlBuilderWalker()), parameters: $owner->parameters);
+        $scan = new EntityScanReader(pdo: getPDO(), sql: $owner->select->dispatch(new SqlBuilderWalker()), parameters: $owner->parameters);
 
         return iterator_to_array($scan, false);
     }
 
-    private static function sql(SqlScanNode $owner): string
+    private static function getSql(EntityScanNode $owner): string
     {
 
         return (string) preg_replace('/\s+/', ' ', $owner->select->dispatch(new SqlBuilderWalker()));

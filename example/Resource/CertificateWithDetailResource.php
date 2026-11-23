@@ -8,9 +8,9 @@ use Ggs\JsonApiEngine\Example\Entity\CertificateDetailsEntity;
 use Ggs\JsonApiEngine\Example\Entity\CertificatesEntity;
 use Ggs\JsonApiEngine\Model\LeftJoin;
 use Ggs\JsonApiEngine\Resource;
-use Ggs\JsonApiEngine\Resource\Deletable;
-use Ggs\JsonApiEngine\Resource\Insertable;
-use Ggs\JsonApiEngine\Resource\Updatable;
+use Ggs\JsonApiEngine\Resource\DeletableInterface;
+use Ggs\JsonApiEngine\Resource\InsertableInterface;
+use Ggs\JsonApiEngine\Resource\UpdatableInterface;
 
 /**
  * `certificate` из двух таблиц: `LeftJoin(certificates, certificate_details, [id, certificate_id])`; атрибуты деталей
@@ -18,14 +18,14 @@ use Ggs\JsonApiEngine\Resource\Updatable;
  * без `detail` (детали внутри модели).
  *
  * Пример ресурса из нескольких таблиц для вставки (`example/insert-plan.php`, `example/insert-document.php`): модель
- * разворачивается в `InsertTableJoinWriter(parent: certificates, child: InsertOptionalTableWriter(certificate_details))`
- * (планировщиком или руками), строка деталей не вставляется, если ни одной её колонки не прислали. Для SELECT
- * (`serialize()` по `QUERY1`) не предназначен.
+ * разворачивается в `InsertEntityJoinWriter(parent: certificates, child: InsertOptionalEntityWriter(certificate_details))`
+ * (планировщиком или руками), строка деталей не вставляется, если ни одной её колонки не прислали. В деревьях
+ * SELECT примера не используется.
  *
- * Можно создавать (`Insertable`), изменять и удалять (`Updatable`, `Deletable`): сценарии записи —
+ * Можно создавать (`InsertableInterface`), изменять и удалять (`UpdatableInterface`, `DeletableInterface`): сценарии записи —
  * example/patch-document.php.
  */
-final class CertificateWithDetailResource extends Resource implements Insertable, Updatable, Deletable
+final class CertificateWithDetailResource extends Resource implements InsertableInterface, UpdatableInterface, DeletableInterface
 {
     public const string TYPE = CertificateResource::TYPE;
 
@@ -70,15 +70,15 @@ final class CertificateWithDetailResource extends Resource implements Insertable
     ];
 
     #[\Override]
-    public static function relationships(): array
+    public static function getRelationships(): array
     {
-        $relationships = CertificateResource::relationships();
+        $relationships = CertificateResource::getRelationships();
         unset($relationships[CertificateResource::DETAIL]);
 
         return $relationships;
     }
 
-    public static function model(): LeftJoin
+    public static function getModel(): LeftJoin
     {
         return new LeftJoin(
             left: CertificatesEntity::class,

@@ -16,6 +16,8 @@
 
 declare(strict_types=1);
 
+use Ggs\JsonApiEngine\Example\Container\ArrayContainer;
+use Ggs\JsonApiEngine\Example\Container\ExampleResources;
 use Ggs\JsonApiEngine\Example\Controller\CertificatesController;
 use Ggs\JsonApiEngine\Parser\InvalidQueryException;
 use Ggs\JsonApiEngine\Parser\ResourceNotFoundException;
@@ -38,7 +40,7 @@ if ($path !== '/certificates') {
     exit(1);
 }
 
-$controller = new CertificatesController(pdo: getPDO());
+$controller = new CertificatesController(pdo: getPDO(), container: new ArrayContainer(services: ExampleResources::getAll()));
 try {
     if ($document) {
         echo json_encode($controller->get(query: $query), JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR), "\n";
@@ -54,5 +56,5 @@ try {
 }
 
 echo "GET {$url}\n\n";
-echo SelectPlanPrinter::tree(node: $plan), "\n";
-echo SelectPlanPrinter::queries(node: $plan);
+echo SelectPlanPrinter::getTree(node: $plan), "\n";
+echo SelectPlanPrinter::getQueries(node: $plan);

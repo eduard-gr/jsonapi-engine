@@ -13,7 +13,7 @@ use sad_spirit\pg_builder\enums\JoinType;
 final readonly class LeftJoin extends Join
 {
     #[\Override]
-    public function type(): JoinType
+    public function getType(): JoinType
     {
         return JoinType::LEFT;
     }
