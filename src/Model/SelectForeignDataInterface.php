@@ -36,7 +36,10 @@ interface SelectForeignDataInterface
      *
      * @param list<string>                                                  $columns    колонки, которые нужны движку;
      *                                                                                  лишние в строке не мешают
-     * @param list<array{column: string, operator: Operator, value: mixed}> $conditions условия клиента, все через И
+     * @param list<array{column: string, operator: Operator, value: mixed}> $conditions условия клиента, все через И;
+     *                                                                                  `Operator::Ne` обязан находить и
+     *                                                                                  строки с пустым значением (как
+     *                                                                                  `IS DISTINCT FROM` у сущностей)
      * @param list<array{column: string, descending: bool}>                 $order      сортировка клиента; пусто —
      *                                                                                  ориентация из
      *                                                                                  `getReadOrientation()`

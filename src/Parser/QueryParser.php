@@ -17,7 +17,8 @@ use Ggs\JsonApiEngine\Resource;
  * Что можно, описывает только сам ресурс: всё, что в нём объявлено, клиенту доступно.
  *  - `include` — любая связь из `getRelationships()` ресурса-родителя, на любую глубину;
  *  - `fields` — публичные атрибуты ресурса (`getPublicAttributes()`);
- *  - `filter` — атрибуты, у которых ресурс объявил `filter`, и только эти операторы;
+ *  - `filter` — атрибуты, у которых ресурс объявил `filter`, и только эти операторы; оператор `in` временно
+ *    отключён: даже объявленный в ресурсе, он отклоняется (400), потому что план не строит для него условие;
  *  - `sort` — атрибуты, у которых ресурс объявил `sort`.
  * Схемы endpoint'а, которая сужала бы это, пока нет (решение пользователя: сначала всё на ресурсах, ограничения —
  * потом).
@@ -250,6 +251,11 @@ final class QueryParser
                 $allowed = Operator::tryFrom($operator);
                 if ($allowed === null || !\in_array($allowed, $operators, true)) {
                     throw new InvalidQueryException("Operator {$operator} is not allowed for filter {$name}", $parameter);
+                }
+                // Оператор in временно отключён: условие для него план пока не строит, поэтому запрос отклоняется
+                // здесь, ошибкой клиенту, а не LogicException при построении SQL
+                if ($allowed === Operator::In) {
+                    throw new InvalidQueryException("Operator in is not supported yet for filter {$name}", $parameter);
                 }
                 $node['filters'][] = [
                     'attribute' => $name,

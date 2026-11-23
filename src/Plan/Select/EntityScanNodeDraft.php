@@ -14,6 +14,7 @@ use sad_spirit\pg_builder\enums\OrderByDirection;
 use sad_spirit\pg_builder\nodes\ColumnReference;
 use sad_spirit\pg_builder\nodes\CommonTableExpression;
 use sad_spirit\pg_builder\nodes\expressions\InExpression;
+use sad_spirit\pg_builder\nodes\expressions\IsDistinctFromExpression;
 use sad_spirit\pg_builder\nodes\expressions\IsExpression;
 use sad_spirit\pg_builder\nodes\expressions\LogicalExpression;
 use sad_spirit\pg_builder\nodes\expressions\NamedParameter;
@@ -128,11 +129,12 @@ final class EntityScanNodeDraft
      *  - фильтры 1-1 ресурса (он в строке через LEFT JOIN) — одной группой (t1.pk IS NULL OR (усл. AND …)):
      *    строка без этого ресурса остаётся, а строка, где ресурс есть, но не прошёл фильтр, выпадает;
      *  - колонка — Resource::getFilterColumn() (у связи по внешнему ключу — колонка ключа), выражение —
-     *    ModelTree::getExpression(); операторы eq, ne, lt, gt, lte, gte — =, <>, <, >, <=, >=;
+     *    ModelTree::getExpression(); операторы eq, lt, gt, lte, gte — =, <, >, <=, >=; ne — IS DISTINCT FROM (а не <>:
+     *    строка с NULL в колонке тоже считается «не равной» значению и остаётся);
      *  - значение — именованный параметр :<алиас>_<колонка>_<номер> (номер — по порядку в запросе, поэтому
      *    два условия на одну колонку не совпадают); значения — в parameters, уже скаляры: date — 'Y-m-d',
      *    datetime — 'Y-m-d H:i:s.uP'.
-     * TODO: оператор in (Operator::In) — LogicException; ne и NULL: t.c <> :v не находит строки с NULL в t.c.
+     * TODO: оператор in (Operator::In) — LogicException (от парсера не приходит: он отклоняет in сам, 400).
      *
      * Каждый вызов строит новые объекты pg_builder: узел pg_builder принадлежит одному дереву.
      * Запросы веток внутри строки (их inner) сюда не входят — у них свои владельцы.
@@ -395,8 +397,8 @@ final class EntityScanNodeDraft
             $column = $class::getFilterColumn($filter['attribute']);
             $sql = match (Operator::from($filter['operator'])) {
                 Operator::Eq => '=',
-                // TODO: NULL в колонке — строка не найдена (t.c <> :v); решить, нужен ли IS DISTINCT FROM
-                Operator::Ne => '<>',
+                // «не равно» — IS DISTINCT FROM, не <>: строка с NULL в колонке тоже «не равна» значению
+                Operator::Ne => null,
                 Operator::Lt => '<',
                 Operator::Gt => '>',
                 Operator::Lte => '<=',
@@ -406,7 +408,9 @@ final class EntityScanNodeDraft
             };
             $name = "{$prefix}{$alias}_{$column}_" . \count($parameters);
             $parameters[$name] = self::getParameter(value: $filter['value'], type: $class::getAttributeType($filter['attribute']));
-            $terms[] = new OperatorExpression($sql, $tree->getExpression($column, $alias), new NamedParameter($name));
+            $terms[] = $sql === null
+                ? new IsDistinctFromExpression($tree->getExpression($column, $alias), new NamedParameter($name))
+                : new OperatorExpression($sql, $tree->getExpression($column, $alias), new NamedParameter($name));
         }
 
         return match (\count($terms)) {

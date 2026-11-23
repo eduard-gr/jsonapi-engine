@@ -6,6 +6,7 @@ namespace Ggs\JsonApiEngine\Test\Plan\Select;
 
 use Ggs\JsonApiEngine\Example\Resource\CertificateResource;
 use Ggs\JsonApiEngine\Example\Resource\DeliveryResource;
+use Ggs\JsonApiEngine\Example\Resource\ProviderResource;
 use Ggs\JsonApiEngine\Executor\Select\EntityScanReader;
 use Ggs\JsonApiEngine\Parser\QueryParser;
 use Ggs\JsonApiEngine\Plan\Select\JoinNode;
@@ -23,7 +24,7 @@ require_once __DIR__ . '/../../../example/db/connection.php';
 /**
  * WHERE запросов плана (шаг sql): фильтры владельца строки — через AND, фильтры 1-1 ресурса — группой
  * (pk IS NULL OR …), значения — именованные параметры; колонки фильтров и сортировки держат свои таблицы модели
- * в FROM, но не выводятся. Запросы выполняются на SQLite примера.
+ * в FROM, но не выводятся; «не равно» — IS DISTINCT FROM (строки с NULL остаются). Запросы выполняются на SQLite примера.
  */
 final class SelectWhereTest extends TestCase
 {
@@ -106,6 +107,27 @@ final class SelectWhereTest extends TestCase
         // колонки модели key_algorithm и key_size — в таблицах "name" и size
         self::assertStringEndsWith(' where t0_3."name" = :t0_key_algorithm_0 order by t0_2.size desc, t0.id', $sql);
         self::assertSame(['t0_key_algorithm_0' => 'RSA'], $owner->parameters);
+    }
+
+    public function testNotEqualKeepsRowsWithNull(): void
+    {
+        $owner = new EntityScanNodeDraft(input: new ResourceNode(
+            resource: ProviderResource::class,
+            fields: [ProviderResource::WEBSITE],
+            filters: [['attribute' => ProviderResource::WEBSITE, 'operator' => 'ne', 'value' => 'https://giftcard-pro.example.com']],
+        ))->withSelect();
+
+        self::assertStringEndsWith(' where t0.website is distinct from :t0_website_0 order by t0.id', self::getSql(owner: $owner));
+
+        // Все провайдеры, кроме названного, — и тот, у кого сайта нет (NULL): с <> он бы пропал
+        $pdo = getPDO();
+        $total = (int) $pdo->query('select count(*) from providers')->fetchColumn();
+        $without_website = (int) $pdo->query('select count(*) from providers where website is null')->fetchColumn();
+        self::assertGreaterThan(0, $without_website);
+        $websites = array_column(self::getRows(owner: $owner), 't0_website');
+        self::assertCount($total - 1, $websites);
+        self::assertContains(null, $websites);
+        self::assertNotContains('https://giftcard-pro.example.com', $websites);
     }
 
     public function testInOperatorIsNotSupportedYet(): void

@@ -244,26 +244,24 @@ abstract class Resource implements MetadataInterface
     }
 
     /**
-     * Операторы, которыми можно фильтровать атрибут (`filter` атрибута или связи по внешнему ключу); пусто —
-     * фильтровать нельзя. Парсер разрешает клиенту ровно этот список.
+     * Операторы, которыми можно фильтровать атрибут (`filter` атрибута); пусто — фильтровать нельзя. Парсер
+     * разрешает клиенту ровно этот список. По связи фильтровать нельзя: связь описывает только отношение ресурсов
+     * (`Resource\Relationship`), своего фильтра у неё нет — и у связи по внешнему ключу тоже, хотя в `fields` она
+     * называется наравне с атрибутом.
      *
      * @return list<Operator>
      */
     public static function getFilterOperators(string $name): array
     {
-        return isset(static::ATTRIBUTES[$name])
-            ? static::ATTRIBUTES[$name]['filter'] ?? []
-            : static::getForeignRelationship($name)->filter ?? [];
+        return static::ATTRIBUTES[$name]['filter'] ?? [];
     }
 
     /**
-     * Можно ли сортировать по атрибуту (`sort` атрибута или связи по внешнему ключу).
+     * Можно ли сортировать по атрибуту (`sort` атрибута). По связи сортировать нельзя (см. `getFilterOperators()`).
      */
     public static function isSortable(string $name): bool
     {
-        return isset(static::ATTRIBUTES[$name])
-            ? static::ATTRIBUTES[$name]['sort'] ?? false
-            : static::getForeignRelationship($name)->sort ?? false;
+        return static::ATTRIBUTES[$name]['sort'] ?? false;
     }
 
     /**
@@ -432,7 +430,7 @@ abstract class Resource implements MetadataInterface
     }
 
     /**
-     * Проверяет `filter` и `sort` атрибута или связи по внешнему ключу.
+     * Проверяет `filter` и `sort` атрибута.
      *
      * @return list<string>
      */
@@ -507,17 +505,6 @@ abstract class Resource implements MetadataInterface
             if ($relationship instanceof OneToOne && !self::isUniqueColumn($target, $target_column)) {
                 $errors[] = "{$location}: column {$target_column} must be the primary key or a unique column of {$target}"
                     . ' (OneToOne)';
-            }
-            if ($relationship instanceof OneToOne && ($relationship->filter !== [] || $relationship->sort)) {
-                if (!self::isForeignKey($relationship)) {
-                    $errors[] = "{$location}: only a foreign-key relationship can be filtered or sorted";
-                }
-                array_push($errors, ...self::getSearchErrors(
-                    $location,
-                    $relationship->filter === [] ? null : $relationship->filter,
-                    null,
-                    false,
-                ));
             }
         }
 
