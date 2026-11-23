@@ -64,6 +64,10 @@ final readonly class EntityRouteParentWriter
             new ColumnReference($entity::getColumn($primary)),
             new NamedParameter('id'),
         ));
+        // Постоянные колонки сущности (`FIXED`): строка другого вида из той же таблицы не найдётся
+        foreach (ModelTree::getFixedValueExpressions(entity: $entity) as $condition) {
+            $select->where->and($condition);
+        }
         if ($this->lock) {
             $select->locking[] = new LockingElement(LockingStrength::KEY_SHARE);
         }

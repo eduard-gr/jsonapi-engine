@@ -14,7 +14,9 @@ namespace Ggs\JsonApiEngine\Model;
  *
  * Наследник объявляет только константы: по строковой константе на каждую колонку (значение — имя колонки) и
  * `COLUMNS` — карту `имя колонки => описание` с ключами `type`, `constraint`, `references`, `unique`, `nullable`,
- * `mode`. Имя колонки — это колонка модели данных (`Resource::getModel()`).
+ * `mode`. Имя колонки — это колонка модели данных (`Resource::getModel()`). `mode` — битовая маска режимов
+ * (`MetadataInterface::READ`, `WRITE`, `FIXED`; без ключа — `READ | WRITE`); `FIXED` допустим только у
+ * `DatabaseEntitySource`.
  *
  * Описанию верят: с настоящими данными его никто не сверяет. `validate()` проверяет только согласованность самих
  * констант. Тихий отказ: если данные разошлись с описанием, ошибки не будет — неверный тип даст неверное приведение
@@ -96,8 +98,13 @@ abstract class DataSource implements MetadataInterface
             } elseif (!\in_array($description['type'], self::TYPES, true)) {
                 $errors[] = "{$location}: unknown type {$description['type']}";
             }
-            if (isset($description['mode']) && !\in_array($description['mode'], [self::READ, self::READ_WRITE], true)) {
-                $errors[] = "{$location}: unknown mode {$description['mode']}";
+            if (\array_key_exists('mode', $description)) {
+                $mode = $description['mode'];
+                if (!\is_int($mode) || $mode <= 0 || ($mode & ~self::MODES) !== 0) {
+                    $errors[] = "{$location}: mode must be a mask of READ, WRITE and FIXED";
+                } elseif (($mode & self::FIXED) !== 0 && !is_subclass_of(static::class, DatabaseEntitySource::class)) {
+                    $errors[] = "{$location}: FIXED is supported only by " . DatabaseEntitySource::class;
+                }
             }
             foreach (['nullable', 'unique'] as $flag) {
                 if (isset($description[$flag]) && !\is_bool($description[$flag])) {

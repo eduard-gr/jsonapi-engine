@@ -395,7 +395,7 @@ final class WriteDocumentParser
                     detail: "unknown attribute {$name} of {$class::getType()}",
                 );
             }
-            $read_only = ($class::ATTRIBUTES[$name]['mode'] ?? null) === Resource::READ;
+            $read_only = (($class::ATTRIBUTES[$name]['mode'] ?? Resource::READ_WRITE) & Resource::WRITE) === 0;
             if ($name === $class::getPrimaryAttribute() || $read_only) {
                 throw new InvalidDocumentException(
                     status: '400',

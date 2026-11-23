@@ -9,43 +9,46 @@ declare(strict_types=1);
  * пакетов — 1021), а атрибуты лежат в JSON-колонке `pbucom_data`.
  *
  * Здесь то же самое:
- *  - профиль — обычный ресурс над таблицей (`UserProfilesEntity`, SQL строит движок);
- *  - каждый компонент — ресурс над классом-источником (`DataSource` из прототипа `source-document.php`): источник сам
- *    знает свою константу (`UserMapSource::COMPONENT_ID = 70`), сам читает и пишет общую таблицу `user_components` и
- *    сам разбирает JSON на колонки. Движок константы не видит — как и библиотека Trackpoint;
- *  - связь профиля с компонентом — 1:1 по владению (`OneToOne`), id компонента — id профиля.
+ *  - профиль — обычный ресурс над таблицей (`UserProfilesEntity`);
+ *  - каждый компонент — ресурс над своей сущностью общей таблицы `user_components`. Вид компонента — постоянная
+ *    колонка сущности (`component_id` с `'mode' => self::READ | self::FIXED` и `'value' => 70`): константу объявляет
+ *    описание, а в каждый запрос её подставляет движок — условием при чтении, изменении и удалении, значением при
+ *    вставке. Писать SQL руками для этого не нужно;
+ *  - атрибуты компонента лежат в JSON-колонке `data`: их раскладывает и собирает сам ресурс методами `serialize()` и
+ *    `deserialize()` (`SerializeInterface`, `DeserializeInterface`);
+ *  - связь профиля с компонентом — 1:1 по владению (`OneToOne`), id компонента — id профиля. Профиль и все его
+ *    компоненты читаются одним SQL-запросом: три `LEFT JOIN` одной таблицы, каждый со своим видом.
  *
  * Соответствие Trackpoint → пример: `pbup_id` → `user_profiles.id` / `user_components.user_profile_id`,
  * `pbcom_id` → `component_id`, `pbucom_data` → `data`; плоский кортеж из четырёх интерфейсов → `data` + `included`;
- * условие `pbup_id = …`, которое получал каждый интерфейс, → аргумент маршрута (его получает каждый источник).
+ * условие `pbup_id = …`, которое получал каждый интерфейс, → условие профиля (`filter[id]`, добавляет контроллер),
+ * компоненты привязаны к нему соединением.
  *
  * Отличия от Trackpoint:
  *  - PATCH не перечитывает ресурс (ответ `204`): интерфейс без изменённых атрибутов там выполнял SELECT, здесь профиль
  *    без атрибутов только проверяется на существование, а не названные в документе компоненты не трогаются вовсе;
- *  - изменение компонента дополняет JSON присланными ключами (там JSON заменялся целиком);
- *  - источники работают через то же подключение, что и движок, поэтому участвуют в его транзакции;
- *  - удаление профиля убирает компоненты каскадом базы (`ON DELETE CASCADE`), источники при этом не вызываются.
+ *  - удаление профиля убирает компоненты каскадом базы (`ON DELETE CASCADE`).
+ * Изменение компонента заменяет JSON целиком — как в Trackpoint: ключи, которых нет в документе, пропадают.
  *
- * Чего библиотека не повторяет — см. сценарий 9 и ответ к примеру: режимов «только запись» (`pbup_password`) и
- * «только при вставке» (`pbup_login`) у атрибута нет, поэтому пароля в ресурсе нет, а логин изменяем.
+ * Раньше компоненты были чужими источниками (`ForeignDataSource`), которые сами писали SQL со своей константой;
+ * пример чужих источников — `example/source-document.php`.
  *
- * База — SQLite в памяти, создаётся здесь же. Всё в одном файле, `src/` не менялся.
+ * Чего библиотека не повторяет — см. сценарий 10: режимов «только запись» (`pbup_password`) и «только при вставке»
+ * (`pbup_login`) у атрибута нет, поэтому пароля в ресурсе нет, а логин изменяем.
  *
- * Запуск: php example/user-profile.php 2>sql.log   (SQL движка и SQL источников — в stderr)
+ * База — SQLite в памяти, создаётся здесь же. Всё в одном файле.
+ *
+ * Запуск: php example/user-profile.php 2>sql.log   (SQL записи — в stderr)
  */
 
 namespace Ggs\JsonApiEngine\Example\UserProfile;
 
+use Ggs\JsonApiEngine\Document\ResourceRecord;
 use Ggs\JsonApiEngine\Example\Container\ArrayContainer;
 use Ggs\JsonApiEngine\Executor\Write\WriteNotFoundException;
 use Ggs\JsonApiEngine\Executor\Select\ReaderBuilder;
 use Ggs\JsonApiEngine\Executor\Write\WriterBuilder;
 use Ggs\JsonApiEngine\Model\DatabaseEntitySource;
-use Ggs\JsonApiEngine\Model\DeleteForeignDataInterface;
-use Ggs\JsonApiEngine\Model\ForeignDataSource;
-use Ggs\JsonApiEngine\Model\InsertForeignDataInterface;
-use Ggs\JsonApiEngine\Model\UpdateForeignDataInterface;
-use Ggs\JsonApiEngine\Model\SelectForeignDataInterface;
 use Ggs\JsonApiEngine\Operator;
 use Ggs\JsonApiEngine\Parser\InvalidDocumentException;
 use Ggs\JsonApiEngine\Parser\QueryParser;
@@ -56,8 +59,10 @@ use Ggs\JsonApiEngine\Plan\Select\SelectPlanner;
 use Ggs\JsonApiEngine\Plan\Write\WritePlanner;
 use Ggs\JsonApiEngine\Resource;
 use Ggs\JsonApiEngine\Resource\DeletableInterface;
+use Ggs\JsonApiEngine\Resource\DeserializeInterface;
 use Ggs\JsonApiEngine\Resource\InsertableInterface;
 use Ggs\JsonApiEngine\Resource\OneToOne;
+use Ggs\JsonApiEngine\Resource\SerializeInterface;
 use Ggs\JsonApiEngine\Resource\UpdatableInterface;
 use LogicException;
 use PDO;
@@ -67,10 +72,9 @@ use function Ggs\JsonApiEngine\Example\SourceDocument\compactJson;
 use function Ggs\JsonApiEngine\Example\SourceDocument\executionTree;
 use function Ggs\JsonApiEngine\Example\SourceDocument\json;
 use function Ggs\JsonApiEngine\Example\SourceDocument\queries;
-use function Ggs\JsonApiEngine\Example\SourceDocument\shortClassName;
 use function Ggs\JsonApiEngine\Example\SourceDocument\stateChanges;
 
-// Классы и функции прототипа источников; его сценарии при подключении не запускаются
+// Функции печати из примера чужих источников; его сценарии при подключении не запускаются
 require __DIR__ . '/source-document.php';
 
 // =====================================================================================================================
@@ -104,232 +108,64 @@ final class UserProfilesEntity extends DatabaseEntitySource
 }
 
 // =====================================================================================================================
-// Источники компонентов
+// Сущности компонентов
 // =====================================================================================================================
 
 /**
- * Компонент пользователя: одна строка общей таблицы `user_components` на пару (пользователь, вид компонента).
- * Пара к `UserComponentRepository` + `User…QueryInterface` из Trackpoint.
- *
- * Наследник объявляет вид компонента (`COMPONENT_ID`) и свои колонки (`COLUMNS`): первичный ключ `user_profile_id` и
- * ключи JSON из `data`. Константу знает только источник: он подставляет её в каждый свой запрос (условие при чтении,
- * изменении и удалении, значение при вставке); движок и ресурс работают с колонками источника, как с таблицей
- * «компонент этого вида».
- *
- * Поток: `select()` — строки `user_components` своего вида → «user_profile_id + ключи JSON» (нет ключа — значение из
- * `DEFAULTS` или null), всегда по возрастанию `user_profile_id` (`getReadOrientation()`); аргумент маршрута
- * `user_profile_id` — условие равенства. `insert()` — колонки документа → JSON, `user_profile_id` — колонка связи от
- * родителя или аргумент маршрута. `update()` — присланные колонки дополняют JSON; пустая строка — только проверка, что
- * компонент есть. `delete()` — удаление строки.
- *
- * Условий клиента по ключам JSON источник не умеет (ресурсы примера их и не объявляют): непустые условия или порядок
- * не по ключу — `LogicException`. Каждый запрос пишется в `error_log()` (stderr), как SQL движка.
- */
-abstract class UserComponentSource extends ForeignDataSource implements
-    SelectForeignDataInterface,
-    InsertForeignDataInterface,
-    UpdateForeignDataInterface,
-    DeleteForeignDataInterface
-{
-    /** вид компонента (`pbcom_id`); наследник переопределяет */
-    public const int COMPONENT_ID = 0;
-
-    /** @var array<string, mixed> значения ключей JSON, которых в `data` нет; наследник переопределяет */
-    protected const array DEFAULTS = [];
-
-    public function __construct(
-        private readonly PDO $pdo,
-    ) {}
-
-    #[\Override]
-    public static function getReadOrientation(): array
-    {
-        return [static::getPrimaryKeyColumnName()];
-    }
-
-    #[\Override]
-    public function select(array $columns, array $conditions, array $order, array $arguments): iterable
-    {
-        $primary = static::getPrimaryKeyColumnName();
-        if ($conditions !== []) {
-            throw new LogicException(static::class . ': conditions on component data are not supported');
-        }
-        foreach ($order as $entry) {
-            if ($entry['column'] !== $primary || $entry['descending']) {
-                throw new LogicException(static::class . ": only ascending order by {$primary} is supported");
-            }
-        }
-        $sql = 'select user_profile_id, data from user_components where component_id = :component_id';
-        $parameters = ['component_id' => static::COMPONENT_ID];
-        if (isset($arguments[$primary])) {
-            $sql .= ' and user_profile_id = :user_profile_id';
-            $parameters['user_profile_id'] = (int) $arguments[$primary];
-        }
-        foreach ($this->run(sql: "{$sql} order by user_profile_id", parameters: $parameters) as $tuple) {
-            yield [$primary => (int) $tuple['user_profile_id'], ...$this->decode(data: (string) $tuple['data'])];
-        }
-    }
-
-    #[\Override]
-    public function insert(array $row, array $arguments): array
-    {
-        $primary = static::getPrimaryKeyColumnName();
-        $user_profile_id = $row[$primary] ?? $arguments[$primary]
-            ?? throw new LogicException(static::class . ": {$primary} is required");
-        unset($row[$primary]);
-        $this->run(
-            sql: 'insert into user_components (user_profile_id, component_id, data)'
-                . ' values (:user_profile_id, :component_id, :data)',
-            parameters: [
-                'user_profile_id' => (int) $user_profile_id,
-                'component_id' => static::COMPONENT_ID,
-                'data' => compactJson($row),
-            ],
-        );
-
-        return [$primary => (int) $user_profile_id];
-    }
-
-    #[\Override]
-    public function update(array $key, array $row, array $arguments): array
-    {
-        $primary = static::getPrimaryKeyColumnName();
-        $user_profile_id = (int) $key[$primary];
-        if (isset($arguments[$primary]) && (int) $arguments[$primary] !== $user_profile_id) {
-            return [];
-        }
-        $identity = ['user_profile_id' => $user_profile_id, 'component_id' => static::COMPONENT_ID];
-        $current = $this->run(
-            sql: 'select data from user_components'
-                . ' where component_id = :component_id and user_profile_id = :user_profile_id',
-            parameters: $identity,
-        );
-        if ($current === []) {
-            return [];
-        }
-        if ($row !== []) {
-            $this->run(
-                sql: 'update user_components set data = :data'
-                    . ' where component_id = :component_id and user_profile_id = :user_profile_id',
-                parameters: [
-                    ...$identity,
-                    'data' => compactJson([...self::getJson(data: (string) $current[0]['data']), ...$row]),
-                ],
-            );
-        }
-
-        return [$primary => $user_profile_id];
-    }
-
-    #[\Override]
-    public function delete(array $key, array $arguments): array
-    {
-        $primary = static::getPrimaryKeyColumnName();
-        $deleted = $this->run(
-            sql: 'delete from user_components'
-                . ' where component_id = :component_id and user_profile_id = :user_profile_id'
-                . ' returning user_profile_id',
-            parameters: ['user_profile_id' => (int) $key[$primary], 'component_id' => static::COMPONENT_ID],
-        );
-
-        return $deleted === [] ? [] : [$primary => (int) $deleted[0]['user_profile_id']];
-    }
-
-    /**
-     * JSON компонента → колонки источника: только объявленные, без значения — из `DEFAULTS`, иначе null.
-     *
-     * @return array<string, mixed>
-     */
-    private function decode(string $data): array
-    {
-        $columns = array_diff_key(static::COLUMNS, [static::getPrimaryKeyColumnName() => true]);
-
-        return [
-            ...array_fill_keys(array_keys($columns), null),
-            ...static::DEFAULTS,
-            ...array_intersect_key(self::getJson(data: $data), $columns),
-        ];
-    }
-
-    /**
-     * @return array<string, mixed>
-     */
-    private static function getJson(string $data): array
-    {
-        $decoded = json_decode($data, true);
-
-        return is_array($decoded) ? $decoded : [];
-    }
-
-    /**
-     * @param array<string, int|string> $parameters
-     * @return list<array<string, mixed>>
-     */
-    private function run(string $sql, array $parameters): array
-    {
-        error_log(shortClassName(class: static::class) . ": {$sql}   " . compactJson($parameters));
-        $statement = $this->pdo->prepare($sql);
-        foreach ($parameters as $name => $value) {
-            $statement->bindValue($name, $value, is_int($value) ? PDO::PARAM_INT : PDO::PARAM_STR);
-        }
-        $statement->execute();
-
-        return $statement->fetchAll(PDO::FETCH_ASSOC);
-    }
-}
-
-/**
  * Настройки карты пользователя, компонент 70 (Trackpoint: `UserMapQueryInterface`).
+ *
+ * Компонент — одна строка общей таблицы `user_components` на пару (пользователь, вид компонента); пара к
+ * `UserComponentRepository` + `User…QueryInterface` из Trackpoint. Вид компонента сущность объявляет постоянной
+ * колонкой: `component_id` с `'mode' => self::READ | self::FIXED` и своим `value`. Такая сущность — не вся таблица,
+ * а её строки этого вида, и константу в запросы подставляет движок: условием при чтении (подзапрос на месте
+ * таблицы), изменении и удалении, значением при вставке. `user_profile_id` уникален только среди строк своего
+ * вида — поэтому он первичный ключ сущности. У трёх видов — три сущности над одной таблицей.
  */
-final class UserMapSource extends UserComponentSource
+final class UserMapEntity extends DatabaseEntitySource
 {
-    public const int COMPONENT_ID = 70;
+    public const string TABLE = 'user_components';
     public const string USER_PROFILE_ID = 'user_profile_id';
-    public const string MAP = 'map';
+    public const string COMPONENT_ID = 'component_id';
+    public const string DATA = 'data';
 
     public const array COLUMNS = [
         self::USER_PROFILE_ID => ['type' => self::INT, 'constraint' => self::PRIMARY],
-        self::MAP => ['type' => self::STRING, 'nullable' => true],
+        self::COMPONENT_ID => ['type' => self::INT, 'mode' => self::READ | self::FIXED, 'value' => 70],
+        self::DATA => ['type' => self::STRING],
     ];
 }
 
 /**
- * Настройки трекинга, компонент 1200 (Trackpoint: `UserTrackingQueryInterface`). Флаг, которого нет в JSON, — true.
+ * Настройки трекинга, компонент 1200 (Trackpoint: `UserTrackingQueryInterface`).
  */
-final class UserTrackingSource extends UserComponentSource
+final class UserTrackingEntity extends DatabaseEntitySource
 {
-    public const int COMPONENT_ID = 1200;
+    public const string TABLE = 'user_components';
     public const string USER_PROFILE_ID = 'user_profile_id';
-    public const string MARKER_TAIL = 'marker_tail';
-    public const string CLUSTERED_MARKER = 'clustered_marker';
-    public const string FIT_LAYER = 'fit_layer';
+    public const string COMPONENT_ID = 'component_id';
+    public const string DATA = 'data';
 
     public const array COLUMNS = [
         self::USER_PROFILE_ID => ['type' => self::INT, 'constraint' => self::PRIMARY],
-        self::MARKER_TAIL => ['type' => self::BOOL],
-        self::CLUSTERED_MARKER => ['type' => self::BOOL],
-        self::FIT_LAYER => ['type' => self::BOOL],
-    ];
-
-    protected const array DEFAULTS = [
-        self::MARKER_TAIL => true,
-        self::CLUSTERED_MARKER => true,
-        self::FIT_LAYER => true,
+        self::COMPONENT_ID => ['type' => self::INT, 'mode' => self::READ | self::FIXED, 'value' => 1200],
+        self::DATA => ['type' => self::STRING],
     ];
 }
 
 /**
  * Обзор пакетов, компонент 1021 (Trackpoint: `UserPackageOverviewQueryInterface`).
  */
-final class UserPackageOverviewSource extends UserComponentSource
+final class UserPackageOverviewEntity extends DatabaseEntitySource
 {
-    public const int COMPONENT_ID = 1021;
+    public const string TABLE = 'user_components';
     public const string USER_PROFILE_ID = 'user_profile_id';
-    public const string MODE = 'mode';
+    public const string COMPONENT_ID = 'component_id';
+    public const string DATA = 'data';
 
     public const array COLUMNS = [
         self::USER_PROFILE_ID => ['type' => self::INT, 'constraint' => self::PRIMARY],
-        self::MODE => ['type' => self::STRING, 'nullable' => true],
+        self::COMPONENT_ID => ['type' => self::INT, 'mode' => self::READ | self::FIXED, 'value' => 1021],
+        self::DATA => ['type' => self::STRING],
     ];
 }
 
@@ -338,35 +174,95 @@ final class UserPackageOverviewSource extends UserComponentSource
 // =====================================================================================================================
 
 /**
- * `user-map`: ресурс над источником `UserMapSource`, id — id профиля.
+ * Ресурс компонента: id — id профиля, атрибуты — ключи JSON из колонки `data`. Наследник объявляет `TYPE`,
+ * `ATTRIBUTES` (каждый атрибут — составной над колонкой `data`) и сущность своего вида.
+ *
+ * По описанию такой атрибут не собрать и не записать, поэтому ресурс делает это сам:
+ *  - `serialize()` (`SerializeInterface`) раскладывает JSON по запрошенным атрибутам; ключа нет — значение из
+ *    `DEFAULTS` наследника или null;
+ *  - `deserialize()` (`DeserializeInterface`) собирает присланные атрибуты в JSON. При изменении колонка `data`
+ *    заменяется целиком (как в Trackpoint): ключи, которых нет в документе, из JSON пропадают и читаются
+ *    значением по умолчанию. Атрибутов в документе нет — колонка не трогается.
+ * Фильтровать и сортировать по ключам JSON нельзя: это не колонки.
  */
-final class UserMapResource extends Resource implements InsertableInterface, UpdatableInterface, DeletableInterface
+abstract class UserComponentResource extends Resource implements
+    InsertableInterface,
+    UpdatableInterface,
+    DeletableInterface,
+    SerializeInterface,
+    DeserializeInterface
+{
+    /** @var array<string, mixed> значения атрибутов, которых нет в JSON; наследник переопределяет */
+    protected const array DEFAULTS = [];
+
+    /**
+     * Сущность компонента — одна из трёх над таблицей `user_components`; у всех одни и те же имена колонок.
+     *
+     * @return class-string<UserMapEntity|UserTrackingEntity|UserPackageOverviewEntity>
+     */
+    abstract public static function getModel(): string;
+
+    #[\Override]
+    public function serialize(array $tuple, array $fields): ResourceRecord
+    {
+        $entity = static::getModel();
+        $decoded = json_decode((string) $tuple[$entity::DATA], true);
+        $data = is_array($decoded) ? $decoded : [];
+        $attributes = [];
+        foreach ($fields as $name) {
+            $attributes[$name] = $data[$name] ?? static::DEFAULTS[$name] ?? null;
+        }
+
+        return new ResourceRecord(
+            id: (int) $tuple[$entity::USER_PROFILE_ID],
+            type: static::TYPE,
+            attributes: $attributes,
+            relationships: [],
+        );
+    }
+
+    #[\Override]
+    public function deserialize(array $attributes, array $references, bool $is_insert, ?int $id, array $link): array
+    {
+        // Изменение без атрибутов — компонент только ищется; у нового компонента JSON есть всегда (колонка NOT NULL)
+        if ($attributes === [] && !$is_insert) {
+            return [];
+        }
+
+        return [static::getModel()::DATA => compactJson($attributes === [] ? new \stdClass() : $attributes)];
+    }
+}
+
+/**
+ * `user-map`: настройки карты, id — id профиля. Он же — условие для корня `/user-profiles/{id}/map` (`filter[id]`).
+ */
+final class UserMapResource extends UserComponentResource
 {
     public const string TYPE = 'user-map';
     public const string ID = 'id';
     public const string MAP = 'map';
 
     public const array ATTRIBUTES = [
-        self::ID => ['column' => UserMapSource::USER_PROFILE_ID, 'type' => self::INT, 'constraint' => self::PRIMARY],
-        self::MAP => ['column' => UserMapSource::MAP, 'type' => self::STRING, 'nullable' => true],
+        self::ID => [
+            'column' => UserMapEntity::USER_PROFILE_ID,
+            'type' => self::INT,
+            'constraint' => self::PRIMARY,
+            'filter' => [Operator::Eq],
+        ],
+        self::MAP => ['columns' => [UserMapEntity::DATA], 'type' => self::STRING, 'nullable' => true],
     ];
 
     #[\Override]
-    public static function getRelationships(): array
-    {
-        return [];
-    }
-
     public static function getModel(): string
     {
-        return UserMapSource::class;
+        return UserMapEntity::class;
     }
 }
 
 /**
- * `user-tracking`: ресурс над источником `UserTrackingSource`, id — id профиля.
+ * `user-tracking`: настройки трекинга, id — id профиля. Флаг, которого нет в JSON, — true.
  */
-final class UserTrackingResource extends Resource implements InsertableInterface, UpdatableInterface, DeletableInterface
+final class UserTrackingResource extends UserComponentResource
 {
     public const string TYPE = 'user-tracking';
     public const string ID = 'id';
@@ -375,32 +271,29 @@ final class UserTrackingResource extends Resource implements InsertableInterface
     public const string FIT_LAYER = 'fit_layer';
 
     public const array ATTRIBUTES = [
-        self::ID => [
-            'column' => UserTrackingSource::USER_PROFILE_ID,
-            'type' => self::INT,
-            'constraint' => self::PRIMARY,
-        ],
-        self::MARKER_TAIL => ['column' => UserTrackingSource::MARKER_TAIL, 'type' => self::BOOL],
-        self::CLUSTERED_MARKER => ['column' => UserTrackingSource::CLUSTERED_MARKER, 'type' => self::BOOL],
-        self::FIT_LAYER => ['column' => UserTrackingSource::FIT_LAYER, 'type' => self::BOOL],
+        self::ID => ['column' => UserTrackingEntity::USER_PROFILE_ID, 'type' => self::INT, 'constraint' => self::PRIMARY],
+        self::MARKER_TAIL => ['columns' => [UserTrackingEntity::DATA], 'type' => self::BOOL],
+        self::CLUSTERED_MARKER => ['columns' => [UserTrackingEntity::DATA], 'type' => self::BOOL],
+        self::FIT_LAYER => ['columns' => [UserTrackingEntity::DATA], 'type' => self::BOOL],
+    ];
+
+    protected const array DEFAULTS = [
+        self::MARKER_TAIL => true,
+        self::CLUSTERED_MARKER => true,
+        self::FIT_LAYER => true,
     ];
 
     #[\Override]
-    public static function getRelationships(): array
-    {
-        return [];
-    }
-
     public static function getModel(): string
     {
-        return UserTrackingSource::class;
+        return UserTrackingEntity::class;
     }
 }
 
 /**
- * `user-package-overview`: ресурс над источником `UserPackageOverviewSource`, id — id профиля.
+ * `user-package-overview`: обзор пакетов, id — id профиля.
  */
-final class UserPackageOverviewResource extends Resource implements InsertableInterface, UpdatableInterface, DeletableInterface
+final class UserPackageOverviewResource extends UserComponentResource
 {
     public const string TYPE = 'user-package-overview';
     public const string ID = 'id';
@@ -408,28 +301,23 @@ final class UserPackageOverviewResource extends Resource implements InsertableIn
 
     public const array ATTRIBUTES = [
         self::ID => [
-            'column' => UserPackageOverviewSource::USER_PROFILE_ID,
+            'column' => UserPackageOverviewEntity::USER_PROFILE_ID,
             'type' => self::INT,
             'constraint' => self::PRIMARY,
         ],
-        self::MODE => ['column' => UserPackageOverviewSource::MODE, 'type' => self::STRING, 'nullable' => true],
+        self::MODE => ['columns' => [UserPackageOverviewEntity::DATA], 'type' => self::STRING, 'nullable' => true],
     ];
 
     #[\Override]
-    public static function getRelationships(): array
-    {
-        return [];
-    }
-
     public static function getModel(): string
     {
-        return UserPackageOverviewSource::class;
+        return UserPackageOverviewEntity::class;
     }
 }
 
 /**
- * `user-profile`: таблица `user_profiles` и три компонента по владению (1:1, каждый — свой источник). Порядок
- * объявления связей — порядок записи компонентов.
+ * `user-profile`: таблица `user_profiles` и три компонента по владению (1:1, каждый — своя сущность общей таблицы).
+ * Порядок объявления связей — порядок записи компонентов.
  */
 final class UserProfileResource extends Resource implements InsertableInterface, UpdatableInterface, DeletableInterface
 {
@@ -464,15 +352,15 @@ final class UserProfileResource extends Resource implements InsertableInterface,
         return [
             self::MAP => new OneToOne(
                 resource: UserMapResource::class,
-                relation: [UserProfilesEntity::ID, UserMapSource::USER_PROFILE_ID],
+                relation: [UserProfilesEntity::ID, UserMapEntity::USER_PROFILE_ID],
             ),
             self::TRACKING => new OneToOne(
                 resource: UserTrackingResource::class,
-                relation: [UserProfilesEntity::ID, UserTrackingSource::USER_PROFILE_ID],
+                relation: [UserProfilesEntity::ID, UserTrackingEntity::USER_PROFILE_ID],
             ),
             self::PACKAGE_OVERVIEW => new OneToOne(
                 resource: UserPackageOverviewResource::class,
-                relation: [UserProfilesEntity::ID, UserPackageOverviewSource::USER_PROFILE_ID],
+                relation: [UserProfilesEntity::ID, UserPackageOverviewEntity::USER_PROFILE_ID],
             ),
         ];
     }
@@ -533,23 +421,13 @@ function database(): PDO
 }
 
 /**
- * Контейнер зависимостей (PSR-11) с объектами источников компонентов (зависимость каждого — подключение) и
- * объектами ресурсов: сборщики берут из него и те, и другие по имени класса. В приложении их создаёт и связывает
- * его собственный контейнер.
+ * Контейнер зависимостей (PSR-11) с объектами ресурсов: сборщики берут их по имени класса. В приложении их создаёт
+ * и связывает его собственный контейнер.
  */
-function container(PDO $pdo): ContainerInterface
+function container(): ContainerInterface
 {
     return new ArrayContainer(
         services: [
-            new UserMapSource(
-                pdo: $pdo,
-            ),
-            new UserTrackingSource(
-                pdo: $pdo,
-            ),
-            new UserPackageOverviewSource(
-                pdo: $pdo,
-            ),
             new UserProfileResource(),
             new UserMapResource(),
             new UserTrackingResource(),
@@ -559,16 +437,15 @@ function container(PDO $pdo): ContainerInterface
 }
 
 /**
- * Сценарий выборки: URL → дерево запроса → план → документ; запросы источников — в stderr.
+ * Сценарий выборки: URL → дерево запроса → план → документ.
  *
  * @param class-string<Resource> $resource корневой ресурс
  * @param array<string, mixed>   $query    параметры запроса, которые контроллер добавил из маршрута (`filter[id]`)
- * @param array<string, mixed>   $arguments аргументы маршрута для источников
  */
-function select(PDO $pdo, string $title, string $resource, string $url, array $query = [], array $arguments = []): void
+function select(PDO $pdo, string $title, string $resource, string $url, array $query = []): void
 {
     parse_str((string) parse_url($url, PHP_URL_QUERY), $client_query);
-    echo "\n######## {$title}\nGET {$url}", $arguments === [] ? '' : '   arguments: ' . compactJson($arguments), "\n\n";
+    echo "\n######## {$title}\nGET {$url}\n\n";
 
     $tree = new QueryParser()->parse(resource: $resource, query: array_replace_recursive($client_query, $query));
     $plan = new SelectPlanner()->plan(tree: $tree)['sql'];
@@ -576,9 +453,9 @@ function select(PDO $pdo, string $title, string $resource, string $url, array $q
 
     $builder = new ReaderBuilder(
         pdo: $pdo,
-        container: container(pdo: $pdo),
+        container: container(),
     );
-    $document = json($builder->getDocument(plan: $plan, arguments: $arguments));
+    $document = json($builder->getDocument(plan: $plan));
     echo "#### document\n{$document}\n";
 }
 
@@ -599,13 +476,12 @@ function state(PDO $pdo): array
 }
 
 /**
- * Сценарий записи: дерево операций → план → дерево исполнителей → состояние таблиц; запросы источников — в stderr.
- * Всё в одной транзакции — источники пишут через то же подключение; в конце откат.
+ * Сценарий записи: дерево операций → план → дерево исполнителей → состояние таблиц; SQL — в stderr.
+ * Всё в одной транзакции, в конце откат.
  *
  * @param list<WriteOperation> $roots корни дерева операций (от `WriteDocumentParser`)
- * @param array<string, mixed> $arguments аргументы маршрута для источников
  */
-function write(PDO $pdo, string $title, array $roots, array $arguments = []): void
+function write(PDO $pdo, string $title, array $roots): void
 {
     echo "\n######## {$title}\n\n";
     $before = state(pdo: $pdo);
@@ -615,9 +491,9 @@ function write(PDO $pdo, string $title, array $roots, array $arguments = []): vo
         $builder = new WriterBuilder(
             pdo: $pdo,
             lock: false,
-            container: container(pdo: $pdo),
+            container: container(),
         );
-        $writer = $builder->getRoot(plan: $plan, data: $roots, arguments: $arguments);
+        $writer = $builder->getRoot(plan: $plan, data: $roots);
         echo "#### execution tree\n", executionTree(explain: $writer->explain()), "\n#### keys\n";
         foreach ($writer->execute() as $keys) {
             echo '  ', compactJson($keys), "\n";
@@ -641,14 +517,14 @@ function write(PDO $pdo, string $title, array $roots, array $arguments = []): vo
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Описания проходят обычные проверки. UserProfileResource не проверяется: validate() ресурса с OneToOne сейчас падает
-// (известная ошибка OneToOne::$filter в src/Resource.php)
+// Описания проходят обычные проверки
 
 $descriptions = [
     UserProfilesEntity::class,
-    UserMapSource::class,
-    UserTrackingSource::class,
-    UserPackageOverviewSource::class,
+    UserMapEntity::class,
+    UserTrackingEntity::class,
+    UserPackageOverviewEntity::class,
+    UserProfileResource::class,
     UserMapResource::class,
     UserTrackingResource::class,
     UserPackageOverviewResource::class,
@@ -662,41 +538,40 @@ $pdo = database();
 // ---------------------------------------------------------------------------------------------------------------------
 // Выборка (Trackpoint: DQL::SELECT)
 
-// 1. Один профиль со всеми компонентами. id из маршрута: профилю — условием (filter[id], добавляет контроллер),
-//    источникам — аргументом маршрута, каждый подставляет его рядом со своей константой. У профиля 2 в JSON трекинга
-//    один флаг — остальные из DEFAULTS; обзора пакетов нет — `package_overview: null`
+// 1. Один профиль со всеми компонентами — один SQL-запрос: три LEFT JOIN таблицы user_components, каждый со своим
+//    видом (подзапрос с component_id на месте таблицы). id из маршрута — условие профиля (filter[id], добавляет
+//    контроллер); компоненты привязаны соединением. У профиля 2 в JSON трекинга один флаг — остальные из DEFAULTS;
+//    обзора пакетов нет — `package_overview: null`
 select(
     pdo: $pdo,
     title: '1. one profile with its components',
     resource: UserProfileResource::class,
     url: '/user-profiles/2?include=map,tracking,package_overview',
     query: ['filter' => ['id' => '2']],
-    arguments: ['user_profile_id' => 2],
 );
 
-// 2. Список: аргумента маршрута нет, ключей родителей источник не получает — читает все компоненты своего вида;
-//    лишнее (карта неактивного профиля 4) отбрасывает свободное соединение
+// 2. Список: тот же один запрос. Карта неактивного профиля 4 в ответ не попадает — её профиль не прошёл фильтр
 select(
     pdo: $pdo,
-    title: '2. list of profiles, components read whole',
+    title: '2. list of profiles with their components',
     resource: UserProfileResource::class,
     url: '/user-profiles?include=map,tracking&filter[active]=true&fields[user-profile]=login',
 );
 
-// 3. Компонент — корень: один источник, без таблицы профиля
+// 3. Компонент — корень: таблица профиля в запрос не входит, id из маршрута — условие компонента (filter[id])
 select(
     pdo: $pdo,
     title: '3. component as the root',
     resource: UserMapResource::class,
     url: '/user-profiles/1/map',
-    arguments: ['user_profile_id' => 1],
+    query: ['filter' => ['id' => '1']],
 );
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Запись
 
-// 4. POST (Trackpoint: DQL::INSERT): профиль — INSERT движка (stderr), его новый id приходит каждому источнику
-//    колонкой связи; источник добавляет свою константу
+// 4. POST (Trackpoint: DQL::INSERT): профиль и компоненты — INSERT движка (stderr). Новый id профиля приходит каждому
+//    компоненту колонкой связи; вид компонента (component_id) в каждый INSERT добавляет движок по описанию сущности
 write(
     pdo: $pdo,
     title: '4. POST /user-profiles with three components',
@@ -721,8 +596,8 @@ write(
     ),
 );
 
-// 5. PATCH (Trackpoint: DQL::UPDATE с данными для двух интерфейсов): профиль — UPDATE движка, карта — update()
-//    источника; трекинг в документе не назван и не трогается
+// 5. PATCH (Trackpoint: DQL::UPDATE с данными для двух интерфейсов): профиль и карта — по UPDATE движка, у карты
+//    с условием component_id = 70; трекинг в документе не назван и не трогается
 write(
     pdo: $pdo,
     title: '5. PATCH /user-profiles/2: profile attributes and the map',
@@ -741,11 +616,11 @@ write(
             id: '2',
         ),
     ],
-    arguments: ['user_profile_id' => 2],
 );
 
 // 6. PATCH только компонента (Trackpoint: интерфейс без данных выполнял SELECT вместо UPDATE): профиль без атрибутов
-//    только проверяется на существование; JSON трекинга дополняется присланным флагом
+//    только проверяется на существование; JSON трекинга заменяется целиком — флаг fit_layer, которого нет в
+//    документе, из JSON пропадает и дальше читается значением по умолчанию
 write(
     pdo: $pdo,
     title: '6. PATCH /user-profiles/2: one tracking flag only',
@@ -763,10 +638,10 @@ write(
             id: '2',
         ),
     ],
-    arguments: ['user_profile_id' => 2],
 );
 
-// 7. PATCH компонента, которого нет: у профиля 3 нет карты — источник возвращает пусто, движок отвечает 404
+// 7. PATCH компонента, которого нет: у профиля 3 нет карты — UPDATE и SELECT с component_id = 70 ничего не находят,
+//    движок отвечает 404
 write(
     pdo: $pdo,
     title: '7. PATCH /user-profiles/3: the map does not exist',
@@ -784,23 +659,20 @@ write(
             id: '3',
         ),
     ],
-    arguments: ['user_profile_id' => 3],
 );
 
-// 8. DELETE (Trackpoint: DQL::DELETE по каждому интерфейсу): удаляется строка профиля, компоненты — каскадом базы,
-//    источники не вызываются
+// 8. DELETE (Trackpoint: DQL::DELETE по каждому интерфейсу): удаляется строка профиля, компоненты — каскадом базы
 write(
     pdo: $pdo,
     title: '8. DELETE /user-profiles/1',
     roots: [new WriteDocumentParser()->delete(resource: UserProfileResource::class, id: '1')],
-    arguments: ['user_profile_id' => 1],
 );
 
-// 9. Чего нет: замена (`{lid}`) и удаление (`null`) компонента в PATCH. Обе — «полная замена связи», её исполнитель
-//    (`EntityReplaceWriter`) пишет DELETE сам и про источник не знает; прототип источников её отклоняет
+// 9. Удаление компонента в PATCH (`null`) — «полная замена связи»: `EntityReplaceWriter` удаляет строку с условием
+//    component_id = 1200, карта того же профиля в той же таблице остаётся. С чужими источниками это было невозможно
 write(
     pdo: $pdo,
-    title: '9. PATCH /user-profiles/2: remove the tracking component (not supported)',
+    title: '9. PATCH /user-profiles/2: remove the tracking component',
     roots: [
         new WriteDocumentParser()->update(
             document: [
@@ -814,7 +686,6 @@ write(
             id: '2',
         ),
     ],
-    arguments: ['user_profile_id' => 2],
 );
 
 // 10. Атрибут только для чтения: `id` в атрибутах — парсер отклоняет документ до плана. Режима «только запись» (пароль)

@@ -22,8 +22,24 @@ interface MetadataInterface
     public const string PRIMARY = 'primary';
     public const string FOREIGN = 'foreign';
 
-    public const string READ = 'read';
-    public const string READ_WRITE = 'read_write';
+    /**
+     * Режим колонки или атрибута — битовая маска (`'mode' => self::READ | self::WRITE`), чтобы режимы можно было
+     * сочетать и добавлять новые. Без ключа `mode` — `READ | WRITE`.
+     *  - `READ` — значение отдаётся клиенту;
+     *  - `WRITE` — клиент может прислать значение при вставке и изменении;
+     *  - `FIXED` — постоянная колонка сущности (`DatabaseEntitySource`): значение задано в описании ключом `value`,
+     *    движок сам подставляет его условием при чтении, изменении и удалении и значением при вставке. С `WRITE`
+     *    не сочетается; у атрибута ресурса и у чужого источника не объявляется.
+     */
+    public const int READ = 1;
+    public const int WRITE = 2;
+    public const int FIXED = 4;
+
+    /** `READ | WRITE` — режим по умолчанию */
+    public const int READ_WRITE = self::READ | self::WRITE;
+
+    /** все известные биты режима колонки */
+    public const int MODES = self::READ | self::WRITE | self::FIXED;
 
     public const array TYPES = [self::INT, self::FLOAT, self::STRING, self::BOOL, self::DATE, self::DATETIME];
 }

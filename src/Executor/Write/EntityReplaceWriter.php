@@ -77,6 +77,10 @@ final readonly class EntityReplaceWriter implements PushExecutorInterface
             new NamedParameter('parent_key'),
         ));
         $parameters = ['parent_key' => (int) $parent_key];
+        // Постоянные колонки сущности (`FIXED`): строка другого вида из той же таблицы не удалится
+        foreach (ModelTree::getFixedValueExpressions(entity: $entity) as $condition) {
+            $delete->where->and($condition);
+        }
         if ($listed !== []) {
             $delete->where->and(new InExpression(
                 new ColumnReference($entity::getColumn($primary)),

@@ -6,6 +6,7 @@ namespace Ggs\JsonApiEngine\Executor\Update;
 
 use Ggs\JsonApiEngine\Executor\EntityWriterInterface;
 use Ggs\JsonApiEngine\Executor\Write\StatementRunner;
+use Ggs\JsonApiEngine\Model\ModelTree;
 use Ggs\JsonApiEngine\Model\DatabaseEntitySource;
 use LogicException;
 use PDO;
@@ -132,6 +133,10 @@ final readonly class UpdateEntityWriter implements EntityWriterInterface
             new ColumnReference($entity::getColumn($this->key)),
             new NamedParameter('key'),
         ));
+        // Постоянные колонки сущности (`FIXED`): строка другого вида из той же таблицы не найдётся
+        foreach (ModelTree::getFixedValueExpressions(entity: $entity) as $condition) {
+            $statement->where->and($condition);
+        }
         $parameters = [];
         foreach ($conditions as $column => $value) {
             $statement->where->and(new OperatorExpression(

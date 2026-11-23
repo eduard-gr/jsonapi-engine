@@ -5,12 +5,17 @@ declare(strict_types=1);
 namespace Ggs\JsonApiEngine\Model;
 
 use sad_spirit\pg_builder\nodes\ColumnReference;
+use sad_spirit\pg_builder\nodes\expressions\Constant;
 use sad_spirit\pg_builder\nodes\expressions\OperatorExpression;
 use sad_spirit\pg_builder\nodes\Identifier;
 use sad_spirit\pg_builder\nodes\QualifiedName;
 use sad_spirit\pg_builder\nodes\range\FromElement;
 use sad_spirit\pg_builder\nodes\range\JoinExpression;
+use sad_spirit\pg_builder\nodes\lists\TargetList;
 use sad_spirit\pg_builder\nodes\range\RelationReference;
+use sad_spirit\pg_builder\nodes\range\Subselect;
+use sad_spirit\pg_builder\nodes\Star;
+use sad_spirit\pg_builder\Select;
 
 /**
  * Разобранная модель данных: таблицы, колонки модели и соединения с найденными таблицами `relation`.
@@ -195,6 +200,41 @@ final class ModelTree
     }
 
     /**
+     * Условия постоянных колонок сущности: `<колонка таблицы> = <значение литералом>` на каждую колонку с
+     * `'mode' => FIXED` (`DatabaseEntitySource::getFixedValues()`); пусто — постоянных колонок нет. Каждый вызов —
+     * новые узлы. Их добавляют в `WHERE` подзапрос чтения (`getFrom()`) и исполнители записи.
+     *
+     * @param class-string<DatabaseEntitySource> $entity
+     * @return list<OperatorExpression>
+     */
+    public static function getFixedValueExpressions(string $entity): array
+    {
+        $expressions = [];
+        foreach ($entity::getFixedValues() as $column => $value) {
+            $expressions[] = new OperatorExpression(
+                '=',
+                new ColumnReference($entity::getColumn($column)),
+                Constant::createFromPHPValue($value),
+            );
+        }
+
+        return $expressions;
+    }
+
+    /**
+     * Постоянная ли это колонка модели (`'mode' => FIXED` у её сущности): клиент её не пишет, связь на неё не опирается.
+     */
+    public function isFixedColumn(string $column): bool
+    {
+        if (!isset($this->columns[$column])) {
+            return false;
+        }
+        $entity = $this->entities[$this->columns[$column][0]];
+
+        return is_subclass_of($entity, DatabaseEntitySource::class) && isset($entity::getFixedValues()[$column]);
+    }
+
+    /**
      * Читается ли модель из чужого источника (`ForeignDataSource`): тогда SQL у неё нет, данные отдаёт код источника.
      * У модели с ошибками — false.
      */
@@ -231,7 +271,8 @@ final class ModelTree
     }
 
     /**
-     * Поддерево модели в узлы pg_builder: лист — `RelationReference` с алиасом, соединение — `JoinExpression`
+     * Поддерево модели в узлы pg_builder: лист — `RelationReference` с алиасом (у сущности с постоянными колонками —
+     * подзапрос `(select * from <таблица> where <колонка> = <значение>)` с тем же алиасом), соединение — `JoinExpression`
      * с `ON <правая колонка relation> = <левая колонка relation>`.
      *
      * @param array<string, mixed> $node
@@ -246,9 +287,24 @@ final class ModelTree
             }
             // TABLE может быть со схемой (`schema.table`): каждая часть — отдельный идентификатор
             $table = new RelationReference(new QualifiedName(...explode('.', $entity::TABLE)));
-            $table->setAlias(new Identifier(self::getAlias($alias, $node['leaf'])));
+            $conditions = self::getFixedValueExpressions(entity: $entity);
+            if ($conditions === []) {
+                $table->setAlias(new Identifier(self::getAlias($alias, $node['leaf'])));
 
-            return $table;
+                return $table;
+            }
+
+            // Сущность с постоянными колонками — не вся таблица, а её строки с этими значениями: подзапрос на месте
+            // таблицы. Так условие действует везде, где стоит таблица: в JOIN (а не в WHERE запроса) и в теле CTE
+            $select = new Select(new TargetList([new Star()]));
+            $select->from[] = $table;
+            foreach ($conditions as $condition) {
+                $select->where->and($condition);
+            }
+            $subselect = new Subselect($select);
+            $subselect->setAlias(new Identifier(self::getAlias($alias, $node['leaf'])));
+
+            return $subselect;
         }
 
         /** @var Join $join */

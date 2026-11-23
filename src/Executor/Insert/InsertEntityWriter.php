@@ -63,6 +63,8 @@ final readonly class InsertEntityWriter implements EntityWriterInterface
         $values = [
             ...array_intersect_key($row, array_flip($this->columns)),
             ...array_intersect_key($link, $entity::COLUMNS),
+            // Постоянные колонки сущности (`FIXED`): значение из описания, клиент его не присылает
+            ...$entity::getFixedValues(),
         ];
         $primary = $entity::getPrimaryKeyColumnName();
 

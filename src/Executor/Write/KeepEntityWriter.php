@@ -68,6 +68,10 @@ final readonly class KeepEntityWriter implements PushExecutorInterface
             new NamedParameter('key_id'),
         ));
         $parameters = ['key_id' => $operation->identity->id];
+        // Постоянные колонки сущности (`FIXED`): строка другого вида из той же таблицы не найдётся
+        foreach (ModelTree::getFixedValueExpressions(entity: $entity) as $condition) {
+            $statement->where->and($condition);
+        }
         // Колонки связи от родителя — условие принадлежности: чужой ребёнок не найдётся
         foreach ($link as $column => $value) {
             $statement->where->and(new OperatorExpression(

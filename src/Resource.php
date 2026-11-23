@@ -365,8 +365,19 @@ abstract class Resource implements MetadataInterface
             if (isset($attribute['type']) && !\in_array($attribute['type'], self::TYPES, true)) {
                 $errors[] = "{$location}: unknown type {$attribute['type']}";
             }
-            if (isset($attribute['mode']) && !\in_array($attribute['mode'], [self::READ, self::READ_WRITE], true)) {
-                $errors[] = "{$location}: unknown mode {$attribute['mode']}";
+            // Режим атрибута — маска READ и WRITE; FIXED бывает только у колонки сущности. Атрибут без READ
+            // (только запись) пока не поддержан: его всё равно отдали бы клиенту
+            $mode = $attribute['mode'] ?? self::READ_WRITE;
+            if (!\is_int($mode) || $mode <= 0 || ($mode & ~self::READ_WRITE) !== 0) {
+                $errors[] = "{$location}: mode must be a mask of READ and WRITE";
+                $mode = self::READ_WRITE;
+            } elseif (($mode & self::READ) === 0) {
+                $errors[] = "{$location}: an attribute without READ is not supported yet";
+            }
+            // Постоянную колонку сущности (FIXED) пишет движок, клиент её не меняет
+            if (($mode & self::WRITE) !== 0 && isset($attribute['column']) && \is_string($attribute['column'])
+                    && (self::getModelTree()?->isFixedColumn($attribute['column']) ?? false)) {
+                $errors[] = "{$location}: column {$attribute['column']} is FIXED, declare 'mode' => self::READ";
             }
             if (isset($attribute['nullable']) && !\is_bool($attribute['nullable'])) {
                 $errors[] = "{$location}: nullable must be bool";
@@ -393,7 +404,7 @@ abstract class Resource implements MetadataInterface
             if ($composite && !$class->implementsInterface(SerializeInterface::class)) {
                 $errors[] = "{$location}: composite attribute requires " . SerializeInterface::class;
             }
-            if ($composite && ($attribute['mode'] ?? null) !== self::READ
+            if ($composite && ($mode & self::WRITE) !== 0
                     && !$class->implementsInterface(DeserializeInterface::class)) {
                 $errors[] = "{$location}: composite attribute can not be written, declare 'mode' => self::READ or "
                     . 'implement ' . DeserializeInterface::class;
@@ -501,6 +512,13 @@ abstract class Resource implements MetadataInterface
             $target_column_type = self::getColumnType($target, $target_column, $location, $errors);
             if ($target_column_type !== null && $target_column_type !== self::INT) {
                 $errors[] = "{$location}: column {$target_column} of {$target} must be INT, got {$target_column_type}";
+            }
+            // Постоянная колонка (FIXED) одинакова у всех строк сущности: связь на неё опираться не может
+            if (self::getModelTree()?->isFixedColumn($own_column) ?? false) {
+                $errors[] = "{$location}: column {$own_column} is FIXED and can not be a relationship key";
+            }
+            if (is_subclass_of($target, self::class) && ($target::getModelTree()?->isFixedColumn($target_column) ?? false)) {
+                $errors[] = "{$location}: column {$target_column} of {$target} is FIXED and can not be a relationship key";
             }
             if ($relationship instanceof OneToOne && !self::isUniqueColumn($target, $target_column)) {
                 $errors[] = "{$location}: column {$target_column} must be the primary key or a unique column of {$target}"
