@@ -18,9 +18,9 @@ namespace Ggs\JsonApiEngine\Resource;
  *
  * Строки владельца связь не размножает, поэтому ресурс читается тем же SQL-запросом, что и владелец (`JOIN`;
  * `LEFT JOIN`, если ресурса может не быть). Одна строка запроса — несколько ресурсов:
- *  - `SharedDataIterator` даёт каждому `SerializeIterator` (владельца и ресурса) окно на текущую строку;
- *  - `SharedRowJoinIterator` попарно соединяет поток владельца с потоком ресурса и пишет связь (ресурса нет — `null`);
- *  - `SharedScanIterator` один раз на строку продвигает общий источник.
+ *  - `EntitySharedWindowReader` даёт каждому `SerializeReader` (владельца и ресурса) окно на текущую строку;
+ *  - `EntitySharedJoinReader` попарно соединяет поток владельца с потоком ресурса и пишет связь (ресурса нет — `null`);
+ *  - `EntitySharedAdvanceReader` один раз на строку продвигает общий источник.
  * В примере `certificate` + `detail` + `delivery` из одной строки `QUERY1` (`example/document.php`).
  */
 final readonly class OneToOne extends Relationship

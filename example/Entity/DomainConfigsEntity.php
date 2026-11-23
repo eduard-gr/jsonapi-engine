@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace Ggs\JsonApiEngine\Example\Entity;
 
-use Ggs\JsonApiEngine\Model\Entity;
+use Ggs\JsonApiEngine\Model\DatabaseEntitySource;
 
 /**
  * Таблица `domain_configs`: настройки домена, 1:1 с `domains`.
@@ -12,7 +12,7 @@ use Ggs\JsonApiEngine\Model\Entity;
  * `domain_id` — первичный ключ и одновременно внешний ключ на `domains.id`. Колонка описывает только одно
  * ограничение, поэтому записано `PRIMARY`; связь с доменом задаётся в модели ресурса.
  */
-final class DomainConfigsEntity extends Entity
+final class DomainConfigsEntity extends DatabaseEntitySource
 {
     public const string TABLE = 'domain_configs';
 

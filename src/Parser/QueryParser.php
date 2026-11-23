@@ -15,9 +15,10 @@ use Ggs\JsonApiEngine\Resource;
  * Этап 1: разбирает параметры запроса JSON:API по корневому ресурсу endpoint'а и строит дерево запроса.
  *
  * Что можно, описывает только сам ресурс: всё, что в нём объявлено, клиенту доступно.
- *  - `include` — любая связь из `relationships()` ресурса-родителя, на любую глубину;
- *  - `fields` — публичные атрибуты ресурса (`publicAttributes()`);
- *  - `filter` — атрибуты, у которых ресурс объявил `filter`, и только эти операторы;
+ *  - `include` — любая связь из `getRelationships()` ресурса-родителя, на любую глубину;
+ *  - `fields` — публичные атрибуты ресурса (`getPublicAttributes()`);
+ *  - `filter` — атрибуты, у которых ресурс объявил `filter`, и только эти операторы; оператор `in` временно
+ *    отключён: даже объявленный в ресурсе, он отклоняется (400), потому что план не строит для него условие;
  *  - `sort` — атрибуты, у которых ресурс объявил `sort`.
  * Схемы endpoint'а, которая сужала бы это, пока нет (решение пользователя: сначала всё на ресурсах, ограничения —
  * потом).
@@ -75,19 +76,19 @@ final class QueryParser
         foreach ($this->includePaths($query['include'] ?? null) as $path) {
             $node = &$tree;
             $current = '';
-            /** @var array<class-string, true> $onPath ресурсы от корня до узла: класс не может повториться */
-            $onPath = [$resource => true];
+            /** @var array<class-string, true> $on_path ресурсы от корня до узла: класс не может повториться */
+            $on_path = [$resource => true];
             foreach (explode('.', $path) as $name) {
                 $current = $current === '' ? $name : "{$current}.{$name}";
                 // связь описывает ресурс родителя; подключить можно любую его связь
-                $relationship = $node['resource']::relationship($name);
+                $relationship = $node['resource']::getRelationship($name);
                 if ($relationship === null) {
                     throw new InvalidQueryException("Relationship {$current} can not be included", 'include');
                 }
-                if ($cycle === null && isset($onPath[$relationship->resource])) {
-                    $cycle = "Include path {$current} contains a cycle: {$relationship->resource::type()} is already on the path";
+                if ($cycle === null && isset($on_path[$relationship->resource])) {
+                    $cycle = "Include path {$current} contains a cycle: {$relationship->resource::getType()} is already on the path";
                 }
-                $onPath[$relationship->resource] = true;
+                $on_path[$relationship->resource] = true;
                 if (!isset($node['includes'][$name])) {
                     $node['includes'][$name] = [
                         'type' => $this->getRelationshipType($relationship),
@@ -137,7 +138,7 @@ final class QueryParser
     {
         return [
             'resource' => $resource,
-            'fields' => $resource::publicAttributes(),
+            'fields' => $resource::getPublicAttributes(),
             'filters' => [],
             'sort' => [],
             'includes' => [],
@@ -187,15 +188,15 @@ final class QueryParser
             if (!\is_string($list)) {
                 throw new InvalidQueryException("{$parameter} must be a comma-separated list", $parameter);
             }
-            $names = array_values(array_filter(array_map('trim', explode(',', $list)), fn (string $n) => $n !== ''));
+            $names = array_values(array_filter(array_map('trim', explode(',', $list)), fn (string $candidate_name) => $candidate_name !== ''));
 
             $found = false;
             $this->walk($tree, '', function (array &$node) use ($type, $names, $parameter, &$found): void {
-                if ($node['resource']::type() !== (string) $type) {
+                if ($node['resource']::getType() !== (string) $type) {
                     return;
                 }
                 $found = true;
-                $allowed = $node['resource']::publicAttributes();
+                $allowed = $node['resource']::getPublicAttributes();
                 foreach ($names as $name) {
                     if (!\in_array($name, $allowed, true)) {
                         throw new InvalidQueryException("Field {$name} is not available for {$type}", $parameter);
@@ -229,7 +230,7 @@ final class QueryParser
 
             $resource = $resources[$path]
                 ?? throw new InvalidQueryException("Resource {$path} is not included", $parameter);
-            $operators = $resource::hasAttribute($name) ? $resource::filterOperators($name) : [];
+            $operators = $resource::hasAttribute($name) ? $resource::getFilterOperators($name) : [];
             if ($operators === []) {
                 throw new InvalidQueryException("Unknown filter {$name}", $parameter);
             }
@@ -242,7 +243,7 @@ final class QueryParser
                 );
             }
 
-            $type = $resource::attributeType($name);
+            $type = $resource::getAttributeType($name);
 
             $node = &self::at($tree, $path);
             foreach ($conditions as $operator => $operand) {
@@ -250,6 +251,11 @@ final class QueryParser
                 $allowed = Operator::tryFrom($operator);
                 if ($allowed === null || !\in_array($allowed, $operators, true)) {
                     throw new InvalidQueryException("Operator {$operator} is not allowed for filter {$name}", $parameter);
+                }
+                // Оператор in временно отключён: условие для него план пока не строит, поэтому запрос отклоняется
+                // здесь, ошибкой клиенту, а не LogicException при построении SQL
+                if ($allowed === Operator::In) {
+                    throw new InvalidQueryException("Operator in is not supported yet for filter {$name}", $parameter);
                 }
                 $node['filters'][] = [
                     'attribute' => $name,
@@ -290,7 +296,7 @@ final class QueryParser
 
             $resource = $resources[$path]
                 ?? throw new InvalidQueryException("Resource {$path} is not included", 'sort');
-            if (!$resource::hasAttribute($attribute) || !$resource::sortable($attribute)) {
+            if (!$resource::hasAttribute($attribute) || !$resource::isSortable($attribute)) {
                 throw new InvalidQueryException("Sorting by {$name} is not allowed", 'sort');
             }
             if (isset($seen[$name])) {
@@ -315,9 +321,9 @@ final class QueryParser
      */
     private static function split(string $name): array
     {
-        $dot = strrpos($name, '.');
+        $last_dot_position = strrpos($name, '.');
 
-        return $dot === false ? ['', $name] : [substr($name, 0, $dot), substr($name, $dot + 1)];
+        return $last_dot_position === false ? ['', $name] : [substr($name, 0, $last_dot_position), substr($name, $last_dot_position + 1)];
     }
 
     /**
@@ -346,7 +352,7 @@ final class QueryParser
                 throw new InvalidQueryException("{$parameter} expects a non-empty list of values", $parameter);
             }
 
-            return array_map(fn (mixed $v): mixed => $this->value($v, $type, $parameter), $values);
+            return array_map(fn (mixed $single_value): mixed => $this->value($single_value, $type, $parameter), $values);
         }
 
         return $this->value($operand, $type, $parameter);

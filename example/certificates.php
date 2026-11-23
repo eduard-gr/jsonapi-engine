@@ -16,10 +16,12 @@
 
 declare(strict_types=1);
 
+use Ggs\JsonApiEngine\Example\Container\ArrayContainer;
+use Ggs\JsonApiEngine\Example\Container\ExampleResources;
 use Ggs\JsonApiEngine\Example\Controller\CertificatesController;
 use Ggs\JsonApiEngine\Parser\InvalidQueryException;
 use Ggs\JsonApiEngine\Parser\ResourceNotFoundException;
-use Ggs\JsonApiEngine\Plan\Select\QueryPlanPrinter;
+use Ggs\JsonApiEngine\Plan\Select\SelectPlanPrinter;
 
 require __DIR__ . '/../vendor/autoload.php';
 require __DIR__ . '/db/connection.php';
@@ -38,21 +40,21 @@ if ($path !== '/certificates') {
     exit(1);
 }
 
-$controller = new CertificatesController(pdo: getPDO());
+$controller = new CertificatesController(pdo: getPDO(), container: new ArrayContainer(services: ExampleResources::getAll()));
 try {
     if ($document) {
         echo json_encode($controller->get(query: $query), JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR), "\n";
         exit(0);
     }
     $plan = $controller->plan(query: $query);
-} catch (InvalidQueryException $e) {
-    fwrite(STDERR, "400 Bad Request: {$e->getMessage()}\n");
+} catch (InvalidQueryException $exception) {
+    fwrite(STDERR, "400 Bad Request: {$exception->getMessage()}\n");
     exit(1);
-} catch (ResourceNotFoundException $e) {
-    fwrite(STDERR, "404 Not Found: {$e->getMessage()}\n");
+} catch (ResourceNotFoundException $exception) {
+    fwrite(STDERR, "404 Not Found: {$exception->getMessage()}\n");
     exit(1);
 }
 
 echo "GET {$url}\n\n";
-echo QueryPlanPrinter::tree(node: $plan), "\n";
-echo QueryPlanPrinter::queries(node: $plan);
+echo SelectPlanPrinter::getTree(node: $plan), "\n";
+echo SelectPlanPrinter::getQueries(node: $plan);

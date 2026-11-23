@@ -9,7 +9,7 @@ use Ggs\JsonApiEngine\Resource;
 /**
  * Описание связи между ресурсами: какой ресурс подключается к ресурсу-владельцу и по какому ключу.
  *
- * Ресурс-владелец объявляет свои связи в `relationships()` (имя связи → связь); каждую из них клиент может
+ * Ресурс-владелец объявляет свои связи в `getRelationships()` (имя связи → связь); каждую из них клиент может
  * подключить через `include`. Сама связь хранит только данные: ресурс на другой стороне и ключ.
  *
  * Ключ — `relation`: `[колонка владельца, колонка ресурса resource]`. Ресурсы объединяются по равенству этих
@@ -21,14 +21,14 @@ use Ggs\JsonApiEngine\Resource;
  * зависит, как связь выполняется (какое поддерево узлов `Plan` строится):
  *  - `OneToOne` — не больше одной строки ресурса у владельца; ключ у ресурса, его колонка уникальна.
  *    `certificate.detail`: `[id, certificate_id]` → `certificates.id = certificate_details.certificate_id`.
- *    Ресурс читается тем же SQL-запросом, что и владелец (`JOIN`): `SharedDataIterator`, `SharedRowJoinIterator`,
- *    `SharedScanIterator`;
+ *    Ресурс читается тем же SQL-запросом, что и владелец (`JOIN`): `EntitySharedWindowReader`, `EntitySharedJoinReader`,
+ *    `EntitySharedAdvanceReader`;
  *  - `ManyToOne` — не больше одной строки ресурса у владельца; ключ у владельца: внешний ключ на первичный ключ
  *    ресурса. `certificate.provider`: `[provider_id, id]` → `certificates.provider_id = providers.id`.
- *    Связь пишет сериализация владельца (связь по внешнему ключу), ресурс читается отдельным SQL-запросом: `PreloadIterator`;
+ *    Связь пишет сериализация владельца (связь по внешнему ключу), ресурс читается отдельным SQL-запросом: `PreloadReader`;
  *  - `OneToMany` — любое число строк ресурса у владельца; ключ у ресурса: внешний ключ на колонку владельца.
  *    `certificate.domains`: `[id, certificate_id]` → `certificates.id = domains.certificate_id`.
- *    Ресурс читается отдельным SQL-запросом: `HashNestJoinIterator` или `MergeNestJoinIterator`.
+ *    Ресурс читается отдельным SQL-запросом: `HashNestJoinReader` или `MergeNestJoinReader`.
  *
  * Связь сама ничего не выполняет: план строят руками (`example/document.php`), планировщика пока нет.
  *

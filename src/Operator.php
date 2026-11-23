@@ -16,8 +16,9 @@ enum Operator: string
     case Lte = 'lte';
     case Gte = 'gte';
     /**
-     * Список значений через запятую. TODO: в SQL плана пока не строится (SharedScanNode::withSelect() бросает
-     * LogicException): через PDO массив одним параметром не передать.
+     * Список значений через запятую. Временно отключён: `QueryParser` отклоняет запрос с ним (400), даже если
+     * ресурс объявил оператор в `filter`. TODO: в SQL плана не строится (через PDO массив одним параметром не
+     * передать); в дереве, собранном руками, `EntityScanNodeDraft::withSelect()` бросает LogicException.
      */
     case In = 'in';
 }

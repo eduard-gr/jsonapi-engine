@@ -12,11 +12,11 @@ use Ggs\JsonApiEngine\Test\Model\Fixture\Model\KeyAlgorithmsEntity;
 use Ggs\JsonApiEngine\Test\Model\Fixture\Model\KeysEntity;
 
 /**
- * Модель данных для тестов `ModelTree`: класс без описания ресурса, только `model()`.
+ * Модель данных для тестов `ModelTree`: класс без описания ресурса, только `getModel()`.
  */
 final class CertificateModel
 {
-    public static function model(): Join
+    public static function getModel(): Join
     {
         return new LeftJoin(
             left: new LeftJoin(

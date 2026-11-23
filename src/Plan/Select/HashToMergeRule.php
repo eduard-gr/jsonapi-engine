@@ -4,28 +4,26 @@ declare(strict_types=1);
 
 namespace Ggs\JsonApiEngine\Plan\Select;
 
-use Ggs\JsonApiEngine\Plan\HashNestJoinNode;
-use Ggs\JsonApiEngine\Plan\JoinNode;
-use Ggs\JsonApiEngine\Plan\MergeNestJoinNode;
-use Ggs\JsonApiEngine\Plan\ResourceNode;
-use Ggs\JsonApiEngine\Plan\Rule;
-use Ggs\JsonApiEngine\Plan\SharedRowJoinNode;
-use Ggs\JsonApiEngine\Plan\SharedScanNode;
 
 /**
  * HashNestJoinNode → MergeNestJoinNode, если обе стороны можно упорядочить по ключу связи:
  * outer — по колонке родителя, inner — по колонке ребёнка.
  *
- * Порядок задаёт только владелец запроса (SharedScanNode); ветки отдают записи
+ * Порядок задаёт только владелец запроса (EntityScanNodeDraft); ветки отдают записи
  * в порядке своего outer, поэтому до владельца правило идёт по outer. У владельца одна ориентация:
  * он отказывает, если уже упорядочен другим Merge или занят клиентской сортировкой.
  *
  * Правило идёт снизу вверх, поэтому глубокие соединения занимают ориентацию первыми:
  * logs получает Merge (домены по id), а domains над ним остаётся Hash.
  *
- * Запускается после SharedScanPass: у каждого запроса к этому моменту уже есть владелец SharedScanNode,
+ * Запускается после EntityScanNodeDraftPass: у каждого запроса к этому моменту уже есть владелец EntityScanNodeDraft,
  * а 1:N внутри строк стали HashJoinNode — их правило не трогает.
- * Порядок записывается во владельца как order; в ORDER BY его кладёт SharedScanNode::withSelect() (шаг sql).
+ * Порядок записывается во владельца как order; в ORDER BY его кладёт EntityScanNodeDraft::withSelect() (шаг sql).
+ *
+ * Владелец над чужим источником (ForeignDataScanNode) принимает порядок, только если ключ — первая колонка
+ * ориентации чтения источника (`SelectForeignDataInterface::getReadOrientation()`): таблицу можно упорядочить по
+ * любому ключу (ORDER BY), а чужой источник читает в одном порядке. Принятый ключ записывается в узел как order,
+ * но источнику не передаётся.
  *
  * TODO: колонки не квалифицированы — одинаковый ключ разных таблиц не отличить, поэтому владелец,
  * занятый любым ключом, считается занятым.
@@ -33,18 +31,18 @@ use Ggs\JsonApiEngine\Plan\SharedScanNode;
 final class HashToMergeRule extends Rule
 {
     #[\Override]
-    public function apply(ResourceNode|SharedScanNode|JoinNode $node): ResourceNode|SharedScanNode|JoinNode|null
+    public function apply(ResourceNode|EntityScanNodeDraft|EntityScanNode|ForeignDataScanNode|JoinNode $node): ResourceNode|EntityScanNodeDraft|EntityScanNode|ForeignDataScanNode|JoinNode|null
     {
         if (!$node instanceof HashNestJoinNode) {
             return null;
         }
 
-        // $parentKey — порядок для outer, $childKey — для inner
-        [$parentKey, $childKey] = $node->relation;
+        // $parent_key — порядок для outer, $child_key — для inner
+        [$parent_key, $child_key] = $node->relation;
 
         // Обе стороны должны принять порядок; если хоть одна не может — остаётся Hash
-        $outer = $this->claim(node: $node->outer, key: $parentKey);
-        $inner = $this->claim(node: $node->inner, key: $childKey);
+        $outer = $this->claim(node: $node->outer, key: $parent_key);
+        $inner = $this->claim(node: $node->inner, key: $child_key);
         if ($outer === null || $inner === null) {
             return null;
         }
@@ -56,14 +54,14 @@ final class HashToMergeRule extends Rule
     /**
      * Закрепляет за владельцем потока порядок по ключу.
      *
-     * @param ResourceNode|SharedScanNode|JoinNode $node корень стороны соединения
-     * @param string                               $key  колонка, по которой должен быть упорядочен поток
-     * @return ResourceNode|SharedScanNode|JoinNode|null сторона с порядком у владельца или null, если владелец занят
+     * @param ResourceNode|EntityScanNodeDraft|EntityScanNode|ForeignDataScanNode|JoinNode $node корень стороны соединения
+     * @param string                                           $key  колонка, по которой должен быть упорядочен поток
+     * @return ResourceNode|EntityScanNodeDraft|EntityScanNode|ForeignDataScanNode|JoinNode|null сторона с порядком у владельца или null, если владелец занят
      */
-    private function claim(ResourceNode|SharedScanNode|JoinNode $node, string $key): ResourceNode|SharedScanNode|JoinNode|null
+    private function claim(ResourceNode|EntityScanNodeDraft|EntityScanNode|ForeignDataScanNode|JoinNode $node, string $key): ResourceNode|EntityScanNodeDraft|EntityScanNode|ForeignDataScanNode|JoinNode|null
     {
-        // После SharedScanPass у каждого запроса есть владелец; голый ресурс или строка — ошибка порядка шагов
-        if ($node instanceof SharedRowJoinNode) {
+        // После EntityScanNodeDraftPass у каждого запроса есть владелец; голый ресурс или строка — ошибка порядка шагов
+        if ($node instanceof EntitySharedJoinNode) {
             throw new \LogicException(message: 'Nest join side leads to an unclosed shared row: ' . $node->name);
         }
         if ($node instanceof ResourceNode) {
@@ -80,7 +78,13 @@ final class HashToMergeRule extends Rule
         }
 
         // Владелец: порядок уже занят — другим Merge или клиентом
-        if ($node->order !== null || $node->sort() !== []) {
+        if ($node->order !== null || $node->getSort() !== []) {
+            return null;
+        }
+
+        // Чужой источник по ключу не отсортировать: он читает только в своей ориентации. Порядок принимается,
+        // если ключ — её первая колонка, то есть поток уже идёт по нему
+        if ($node instanceof ForeignDataScanNode && ($node->getDataSource()::getReadOrientation()[0] ?? null) !== $key) {
             return null;
         }
 

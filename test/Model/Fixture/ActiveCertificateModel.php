@@ -16,7 +16,7 @@ use Ggs\JsonApiEngine\Test\Model\Fixture\Model\OrdersEntity;
  */
 final class ActiveCertificateModel
 {
-    public static function model(): Join
+    public static function getModel(): Join
     {
         return new LeftJoin(
             left: new InnerJoin(

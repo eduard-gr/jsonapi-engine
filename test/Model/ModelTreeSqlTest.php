@@ -17,7 +17,7 @@ use sad_spirit\pg_builder\Parser;
 use sad_spirit\pg_builder\SqlBuilderWalker;
 
 /**
- * SQL модели узлами pg_builder: `ModelTree::from()` (только нужные таблицы, скобки, INNER) и `expression()`.
+ * SQL модели узлами pg_builder: `ModelTree::getFrom()` (только нужные таблицы, скобки, INNER) и `getExpression()`.
  * Ожидаемый SQL разбирается тем же pg_builder и выводится тем же walker'ом, поэтому сравнение не зависит
  * от регистра и форматирования.
  */
@@ -26,7 +26,7 @@ final class ModelTreeSqlTest extends TestCase
     /**
      * @return iterable<string, array{class-string, list<string>, string, array<string, string>}>
      */
-    public static function models(): iterable
+    public static function getModels(): iterable
     {
         yield 'main table only' => [
             CertificateModel::class,
@@ -103,7 +103,7 @@ final class ModelTreeSqlTest extends TestCase
      * @param list<string>          $columns
      * @param array<string, string> $expressions
      */
-    #[DataProvider('models')]
+    #[DataProvider('getModels')]
     public function testFromAndExpression(string $class, array $columns, string $from, array $expressions): void
     {
         $tree = ModelTree::of($class);
@@ -112,12 +112,12 @@ final class ModelTreeSqlTest extends TestCase
 
         self::assertSame(
             $parser->parseFromElement($from)->dispatch($walker),
-            $tree->from('t0', array_fill_keys($columns, true))->dispatch($walker),
+            $tree->getFrom('t0', array_fill_keys($columns, true))->dispatch($walker),
         );
         foreach ($expressions as $column => $expected) {
             self::assertSame(
                 $parser->parseExpression($expected)->dispatch($walker),
-                $tree->expression($column, 't0')->dispatch($walker),
+                $tree->getExpression($column, 't0')->dispatch($walker),
             );
         }
     }
@@ -126,22 +126,22 @@ final class ModelTreeSqlTest extends TestCase
     {
         $tree = ModelTree::of(CertificateModel::class);
 
-        self::assertInstanceOf(RelationReference::class, $tree->from('t0', ['id' => true]));
-        self::assertInstanceOf(JoinExpression::class, $tree->from('t0', ['csr' => true]));
+        self::assertInstanceOf(RelationReference::class, $tree->getFrom('t0', ['id' => true]));
+        self::assertInstanceOf(JoinExpression::class, $tree->getFrom('t0', ['csr' => true]));
     }
 
     public function testNewNodesOnEveryCall(): void
     {
         $tree = ModelTree::of(CertificateModel::class);
 
-        self::assertNotSame($tree->from('t0', ['csr' => true]), $tree->from('t0', ['csr' => true]));
-        self::assertNotSame($tree->expression('csr', 't0'), $tree->expression('csr', 't0'));
+        self::assertNotSame($tree->getFrom('t0', ['csr' => true]), $tree->getFrom('t0', ['csr' => true]));
+        self::assertNotSame($tree->getExpression('csr', 't0'), $tree->getExpression('csr', 't0'));
     }
 
     public function testUnknownColumn(): void
     {
         $this->expectException(\LogicException::class);
         $this->expectExceptionMessage('column nope is not a model column');
-        ModelTree::of(CertificateModel::class)->expression('nope', 't0');
+        ModelTree::of(CertificateModel::class)->getExpression('nope', 't0');
     }
 }

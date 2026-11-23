@@ -77,11 +77,11 @@ parse_str((string) parse_url($url, PHP_URL_QUERY), $query);
 echo "GET {$url}\n\n";
 try {
     $tree = (new QueryParser())->parse(route((string) parse_url($url, PHP_URL_PATH)), $query);
-} catch (InvalidQueryException $e) {
-    echo "400 Bad Request: {$e->getMessage()}\n";
+} catch (InvalidQueryException $exception) {
+    echo "400 Bad Request: {$exception->getMessage()}\n";
     exit(1);
-} catch (ResourceNotFoundException $e) {
-    echo "404 Not Found: {$e->getMessage()}\n";
+} catch (ResourceNotFoundException $exception) {
+    echo "404 Not Found: {$exception->getMessage()}\n";
     exit(1);
 }
 

@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace Ggs\JsonApiEngine\Test\Model\Fixture\Invalid;
 
-use Ggs\JsonApiEngine\Model\Entity;
+use Ggs\JsonApiEngine\Model\DatabaseEntitySource;
 use Ggs\JsonApiEngine\Model\InnerJoin;
 use Ggs\JsonApiEngine\Model\Join;
 use Ggs\JsonApiEngine\Model\LeftJoin;
@@ -12,11 +12,11 @@ use Ggs\JsonApiEngine\Test\Model\Fixture\Model\CustomersEntity;
 use Ggs\JsonApiEngine\Test\Model\Fixture\Model\OrdersEntity;
 
 /**
- * Сущности и модели с ошибками для тестов `Entity::validate()` и `ModelTree`.
+ * Сущности и модели с ошибками для тестов `DatabaseEntitySource::validate()` и `ModelTree`.
  * Подключаются через require_once: PSR-4 требует по классу на файл.
  */
 
-final class ThingsEntity extends Entity
+final class ThingsEntity extends DatabaseEntitySource
 {
     public const string TABLE = 'things';
 
@@ -31,7 +31,7 @@ final class ThingsEntity extends Entity
     ];
 }
 
-final class DetailsEntity extends Entity
+final class DetailsEntity extends DatabaseEntitySource
 {
     public const string TABLE = 'details';
 
@@ -48,7 +48,7 @@ final class DetailsEntity extends Entity
     ];
 }
 
-final class NotesEntity extends Entity
+final class NotesEntity extends DatabaseEntitySource
 {
     public const string TABLE = 'notes';
 
@@ -66,7 +66,7 @@ final class NotesEntity extends Entity
  */
 final class BadModel
 {
-    public static function model(): Join
+    public static function getModel(): Join
     {
         return new LeftJoin(
             left: new LeftJoin(
@@ -85,9 +85,9 @@ final class BadModel
 }
 
 /**
- * Сущности с ошибками в константах для тестов Entity::validate().
+ * Сущности с ошибками в константах для тестов DatabaseEntitySource::validate().
  */
-final class NoPrimaryEntity extends Entity
+final class NoPrimaryEntity extends DatabaseEntitySource
 {
     public const string TABLE = '';
 
@@ -98,7 +98,7 @@ final class NoPrimaryEntity extends Entity
     ];
 }
 
-final class BadEntity extends Entity
+final class BadEntity extends DatabaseEntitySource
 {
     public const string TABLE = 'bad';
 

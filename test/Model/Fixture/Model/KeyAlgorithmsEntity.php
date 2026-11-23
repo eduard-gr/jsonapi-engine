@@ -4,9 +4,9 @@ declare(strict_types=1);
 
 namespace Ggs\JsonApiEngine\Test\Model\Fixture\Model;
 
-use Ggs\JsonApiEngine\Model\Entity;
+use Ggs\JsonApiEngine\Model\DatabaseEntitySource;
 
-final class KeyAlgorithmsEntity extends Entity
+final class KeyAlgorithmsEntity extends DatabaseEntitySource
 {
     public const string TABLE = 'key_algorithms';
 

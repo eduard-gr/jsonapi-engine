@@ -15,12 +15,18 @@ use Ggs\JsonApiEngine\Resource\ManyToOne;
 use Ggs\JsonApiEngine\Resource\OneToMany;
 use Ggs\JsonApiEngine\Resource\OneToOne;
 use Ggs\JsonApiEngine\Resource;
+use Ggs\JsonApiEngine\Resource\InsertableInterface;
+use Ggs\JsonApiEngine\Resource\SerializeInterface;
 
 /**
  * `certificate`: таблица `certificates`. Связи: `provider` (внешний ключ), `detail` и `delivery` (1:1, обратная
  * сторона), `domains` (1:N).
+ *
+ * Свой `serialize()` (ручная сериализация, интерфейс `SerializeInterface`) — ради формата `nominal`.
+ *
+ * Можно создавать (`InsertableInterface`): вставку см. `Executor\Insert\InsertResourceWriter`.
  */
-final class CertificateResource extends Resource
+final class CertificateResource extends Resource implements InsertableInterface, SerializeInterface
 {
     public const string TYPE = 'certificate';
 
@@ -52,7 +58,7 @@ final class CertificateResource extends Resource
         ],
     ];
 
-    public static function relationships(): array
+    public static function getRelationships(): array
     {
         return [
             // внешний ключ: certificates.provider_id → providers.id, пишется из строки сертификата
@@ -60,17 +66,17 @@ final class CertificateResource extends Resource
                 resource: ProviderResource::class,
                 relation: [CertificatesEntity::PROVIDER_ID, ProvidersEntity::ID],
             ),
-            // из той же строки QUERY1: SharedRowJoinIterator `detail`
+            // из той же строки QUERY1: EntitySharedJoinReader `detail`
             self::DETAIL => new OneToOne(
                 resource: DetailResource::class,
                 relation: [CertificatesEntity::ID, CertificateDetailsEntity::CERTIFICATE_ID],
             ),
-            // из той же строки QUERY1 (LEFT JOIN): SharedRowJoinIterator `delivery`, без доставки — null
+            // из той же строки QUERY1 (LEFT JOIN): EntitySharedJoinReader `delivery`, без доставки — null
             self::DELIVERY => new OneToOne(
                 resource: DeliveryResource::class,
                 relation: [CertificatesEntity::ID, CertificateDeliveryMetaEntity::CERTIFICATE_ID],
             ),
-            // QUERY2: HashNestJoinIterator `domains`
+            // QUERY2: HashNestJoinReader `domains`
             self::DOMAINS => new OneToMany(
                 resource: DomainResource::class,
                 relation: [CertificatesEntity::ID, DomainsEntity::CERTIFICATE_ID],
@@ -78,46 +84,43 @@ final class CertificateResource extends Resource
         ];
     }
 
-    public static function model(): string
+    public static function getModel(): string
     {
         return CertificatesEntity::class;
     }
 
     /**
-     * `nominal` — с двумя знаками после точки (`1000.00`); общая сериализация SerializeIterator вызывает этот метод
-     * вместо приведения по `type`.
+     * Ручная сериализация: `nominal` выводится с двумя знаками после точки (`1000.00`), а своего формата у
+     * отдельного атрибута нет — ресурс собирает себя целиком. Метод на каждой строке вызывает
+     * `ManualSerializeReader` (его вместо `SerializeReader` ставит `ReaderBuilder`); `$tuple` — «колонка
+     * модели → значение».
      *
-     * @param array<string, mixed> $values колонки атрибута: `nominal`
+     * Выводится только запрошенное — `$fields`, в его порядке: атрибуты и связь `provider` (по внешнему ключу).
+     * Наличие колонки в `$tuple` запросом не считается: `provider_id` бывает в строке и как ключ соединения.
+     * Значения — как пришли из базы, без приведения по `type`.
      */
-    public static function serializeNominal(array $values): string
+    #[\Override]
+    public function serialize(array $tuple, array $fields): ResourceRecord
     {
-        return number_format((float) $values[CertificatesEntity::NOMINAL], 2, '.', '');
-    }
+        $attributes = [];
+        $relationships = [];
+        foreach ($fields as $name) {
+            if ($name === self::PROVIDER) {
+                $provider_id = $tuple[CertificatesEntity::PROVIDER_ID];
+                $relationships[self::PROVIDER] = [
+                    'data' => $provider_id === null ? null : ['id' => (string) (int) $provider_id, 'type' => ProviderResource::TYPE],
+                ];
+                continue;
+            }
+            $value = $tuple[self::ATTRIBUTES[$name]['column']];
+            $attributes[$name] = $name === self::NOMINAL ? number_format((float) $value, 2, '.', '') : $value;
+        }
 
-    /**
-     * Сертификат из строки QUERY1 (`certificate_id`, `code`, …). Связь `provider` — по внешнему ключу, из своей
-     * строки: есть всегда, даже если провайдеры не загружаются; `provider_id` NULL — пустая связь.
-     */
-    public static function serialize(array $tuple): ResourceRecord
-    {
         return new ResourceRecord(
-            id: $tuple['certificate_id'],
+            id: (int) $tuple[CertificatesEntity::ID],
             type: self::TYPE,
-            attributes: [
-                self::CODE => $tuple['code'],
-                self::NOMINAL => self::serializeNominal([CertificatesEntity::NOMINAL => $tuple['nominal']]),
-                self::CURRENCY => $tuple['currency'],
-                self::STATUS => $tuple['status'],
-                self::CREATED_AT => $tuple['created_at'],
-            ],
-            relationships: [
-                // Формат — как у ResourceRecord::identifier(): сначала id (строкой, как требует JSON:API), затем type
-                self::PROVIDER => [
-                    'data' => $tuple['provider_id'] === null
-                        ? null
-                        : ['id' => (string) $tuple['provider_id'], 'type' => ProviderResource::TYPE],
-                ],
-            ],
+            attributes: $attributes,
+            relationships: $relationships,
         );
     }
 }

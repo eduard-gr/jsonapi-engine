@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace Ggs\JsonApiEngine\Example\Entity;
 
-use Ggs\JsonApiEngine\Model\Entity;
+use Ggs\JsonApiEngine\Model\DatabaseEntitySource;
 
 /**
  * Таблица `certificate_details`: детали сертификата, 1:1 с `certificates`.
@@ -12,7 +12,7 @@ use Ggs\JsonApiEngine\Model\Entity;
  * `certificate_id` — первичный ключ и одновременно внешний ключ на `certificates.id`. Колонка описывает только одно
  * ограничение, поэтому записано `PRIMARY`; связь с сертификатом задаётся в модели ресурса.
  */
-final class CertificateDetailsEntity extends Entity
+final class CertificateDetailsEntity extends DatabaseEntitySource
 {
     public const string TABLE = 'certificate_details';
 

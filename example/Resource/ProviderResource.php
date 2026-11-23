@@ -4,12 +4,11 @@ declare(strict_types=1);
 
 namespace Ggs\JsonApiEngine\Example\Resource;
 
-use Ggs\JsonApiEngine\Document\ResourceRecord;
 use Ggs\JsonApiEngine\Example\Entity\ProvidersEntity;
 use Ggs\JsonApiEngine\Resource;
 
 /**
- * `provider`: справочник `providers` (QUERY4), загружается PreloadIterator.
+ * `provider`: справочник `providers` (QUERY4), загружается PreloadReader.
  */
 final class ProviderResource extends Resource
 {
@@ -27,30 +26,13 @@ final class ProviderResource extends Resource
         self::CREATED_AT => ['column' => ProvidersEntity::CREATED_AT, 'type' => self::DATETIME],
     ];
 
-    public static function relationships(): array
+    public static function getRelationships(): array
     {
         return [];
     }
 
-    public static function model(): string
+    public static function getModel(): string
     {
         return ProvidersEntity::class;
-    }
-
-    /**
-     * Провайдер из строки QUERY4: идентификатор — алиас `provider_id`.
-     */
-    public static function serialize(array $tuple): ResourceRecord
-    {
-        return new ResourceRecord(
-            id: $tuple['provider_id'],
-            type: self::TYPE,
-            attributes: [
-                self::NAME => $tuple['name'],
-                self::WEBSITE => $tuple['website'],
-                self::CREATED_AT => $tuple['created_at'],
-            ],
-            relationships: [],
-        );
     }
 }

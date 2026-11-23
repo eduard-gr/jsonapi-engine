@@ -1,7 +1,7 @@
 <?php
 
 /**
- * Стадии 2–6 выполнения запроса без парсера: дерево запроса → QueryPlanner (шаги плана, SQL) → ExecutorBuilder
+ * Стадии 2–6 выполнения запроса без парсера: дерево запроса → SelectPlanner (шаги плана, SQL) → ReaderBuilder
  * → документ JSON:API по SQLite базе example/db.
  *
  * Дерево в TREE — то, что QueryParser возвращает для `/certificates?include=provider,detail,delivery,domains.logs`
@@ -11,7 +11,7 @@
  *     php example/query-plan.php             # документ
  *     php example/query-plan.php --steps     # дерево плана после каждого шага (nodes, lift, order, close, merge, sql)
  *     php example/query-plan.php --sql       # SQL и параметры каждого запроса плана
- *     php example/query-plan.php --explain   # дерево итераторов (explain())
+ *     php example/query-plan.php --explain   # дерево читателей (explain())
  *
  * Тот же путь от URL, с парсером, — example/certificates.php.
  */
@@ -19,21 +19,23 @@
 declare(strict_types=1);
 
 use Ggs\JsonApiEngine\Document\ResourceRegistry;
+use Ggs\JsonApiEngine\Example\Container\ArrayContainer;
+use Ggs\JsonApiEngine\Example\Container\ExampleResources;
 use Ggs\JsonApiEngine\Example\Resource\CertificateResource;
 use Ggs\JsonApiEngine\Example\Resource\DeliveryResource;
 use Ggs\JsonApiEngine\Example\Resource\DetailResource;
 use Ggs\JsonApiEngine\Example\Resource\DomainResource;
 use Ggs\JsonApiEngine\Example\Resource\LogResource;
 use Ggs\JsonApiEngine\Example\Resource\ProviderResource;
-use Ggs\JsonApiEngine\Executor\ExecutorBuilder;
+use Ggs\JsonApiEngine\Executor\Select\ReaderBuilder;
 use Ggs\JsonApiEngine\Parser\QueryParser;
-use Ggs\JsonApiEngine\Plan\Select\QueryPlanner;
-use Ggs\JsonApiEngine\Plan\Select\QueryPlanPrinter;
+use Ggs\JsonApiEngine\Plan\Select\SelectPlanner;
+use Ggs\JsonApiEngine\Plan\Select\SelectPlanPrinter;
 
 require __DIR__ . '/../vendor/autoload.php';
 require_once __DIR__ . '/db/connection.php';
 
-/** вход QueryPlanner: дерево запроса от QueryParser */
+/** вход SelectPlanner: дерево запроса от QueryParser */
 const TREE = [
     'resource' => CertificateResource::class,
     'fields' => ['code', 'nominal', 'currency', 'status', 'created_at', 'provider'],
@@ -100,23 +102,23 @@ const TREE = [
 ];
 
 // Стадии 2–3: дерево после каждого шага планировщика; последнее ('sql') — план с SQL у каждого владельца запроса
-$steps = (new QueryPlanner())->plan(tree: TREE);
+$steps = (new SelectPlanner())->plan(tree: TREE);
 $plan = $steps['sql'];
 
 if (in_array('--steps', $argv, true)) {
     foreach ($steps as $name => $root) {
-        echo "== {$name}\n", QueryPlanPrinter::tree(node: $root), "\n";
+        echo "== {$name}\n", SelectPlanPrinter::getTree(node: $root), "\n";
     }
     exit;
 }
 
 if (in_array('--sql', $argv, true)) {
-    echo QueryPlanPrinter::queries(node: $plan);
+    echo SelectPlanPrinter::getQueries(node: $plan);
     exit;
 }
 
-// Стадия 4: дерево итераторов на одно выполнение
-$builder = new ExecutorBuilder(pdo: getPDO());
+// Стадия 4: дерево читателей на одно выполнение
+$builder = new ReaderBuilder(pdo: getPDO(), container: new ArrayContainer(services: ExampleResources::getAll()));
 
 if (in_array('--explain', $argv, true)) {
     $flow = $builder->build(plan: $plan, registry: new ResourceRegistry());
@@ -125,4 +127,4 @@ if (in_array('--explain', $argv, true)) {
 }
 
 // Стадии 5–6: дерево выполняется внутри json_encode(): data — поток от корня, included — обход связей по реестру
-echo json_encode($builder->document(plan: $plan), JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES), "\n";
+echo json_encode($builder->getDocument(plan: $plan), JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES), "\n";

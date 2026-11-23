@@ -16,7 +16,7 @@ use Ggs\JsonApiEngine\Test\Model\Fixture\Model\KeysEntity;
  */
 final class KnownKeyCertificateModel
 {
-    public static function model(): Join
+    public static function getModel(): Join
     {
         return new LeftJoin(
             left: CertificatesEntity::class,

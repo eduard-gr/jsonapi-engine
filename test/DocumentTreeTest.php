@@ -12,14 +12,18 @@ use Ggs\JsonApiEngine\Example\Resource\DetailResource;
 use Ggs\JsonApiEngine\Example\Resource\DomainResource;
 use Ggs\JsonApiEngine\Example\Resource\LogResource;
 use Ggs\JsonApiEngine\Example\Resource\ProviderResource;
-use Ggs\JsonApiEngine\Executor\HashNestJoinIterator;
-use Ggs\JsonApiEngine\Executor\MergeNestJoinIterator;
-use Ggs\JsonApiEngine\Executor\PreloadIterator;
-use Ggs\JsonApiEngine\Executor\SerializeIterator;
-use Ggs\JsonApiEngine\Executor\SharedDataIterator;
-use Ggs\JsonApiEngine\Executor\SharedRowJoinIterator;
-use Ggs\JsonApiEngine\Executor\SharedScanIterator;
-use Ggs\JsonApiEngine\Executor\SqlScanIterator;
+use Ggs\JsonApiEngine\Executor\Select\AscendingKeyReader;
+use Ggs\JsonApiEngine\Executor\Select\HashNestJoinReader;
+use Ggs\JsonApiEngine\Executor\Select\SerializeReader;
+use Ggs\JsonApiEngine\Executor\Select\ManualSerializeReader;
+use Ggs\JsonApiEngine\Executor\Select\MergeNestJoinReader;
+use Ggs\JsonApiEngine\Executor\Select\PreloadReader;
+use Ggs\JsonApiEngine\Executor\Select\RegisterReader;
+use Ggs\JsonApiEngine\Executor\Select\EntitySharedWindowReader;
+use Ggs\JsonApiEngine\Executor\Select\EntitySharedJoinReader;
+use Ggs\JsonApiEngine\Executor\Select\EntitySharedAdvanceReader;
+use Ggs\JsonApiEngine\Executor\Select\EntityScanReader;
+use Ggs\JsonApiEngine\Executor\Select\UniqueAscendingKeyReader;
 use PHPUnit\Framework\TestCase;
 
 require_once __DIR__ . '/../example/db/connection.php';
@@ -28,7 +32,10 @@ require_once __DIR__ . '/../example/db/connection.php';
  * Дерево узлов из `example/document.php` на SQLite базе `example/db`:
  * `GET /certificates?include=provider,detail,delivery,domains.logs`.
  *
- * Ресурсы собирает `serialize()` классов `example/Resource` по алиасам колонок запросов `QUERY1`–`QUERY4`.
+ * Ресурсы собирает `SerializeReader` по описанию классов `example/Resource` (сертификат со своим `serialize()` —
+ * `ManualSerializeReader`); где в строке запросов
+ * `QUERY1`–`QUERY4` лежат колонки ресурса, говорят написанные руками записи колонок (`QUERY1_CERTIFICATE` и другие
+ * в `example/db/connection.php`).
  * Эталон `Fixture/document.json` — вывод `example/document.php` (он же вывод прототипа); данные базы
  * детерминированы (`example/db/seed.php`).
  */
@@ -38,13 +45,13 @@ final class DocumentTreeTest extends TestCase
     {
         self::assertJsonStringEqualsJsonFile(
             __DIR__ . '/Fixture/document.json',
-            json_encode(self::document(), \JSON_THROW_ON_ERROR),
+            json_encode(self::getDocument(), \JSON_THROW_ON_ERROR),
         );
     }
 
     public function testEachResourceAppearsOnce(): void
     {
-        $document = self::decoded();
+        $document = self::getDecoded();
         $keys = array_map(
             static fn (array $resource): string => "{$resource['type']}:{$resource['id']}",
             [...$document['data'], ...$document['included']],
@@ -65,12 +72,12 @@ final class DocumentTreeTest extends TestCase
     }
 
     /**
-     * Связь по внешнему ключу пишет сериализатор сертификата из `provider_id`, а `PreloadIterator` только загружает
+     * Связь по внешнему ключу пишет сериализатор сертификата из `provider_id`, а `PreloadReader` только загружает
      * провайдеров: у каждого сертификата провайдер есть и в связи, и в `included`.
      */
     public function testProviderComesFromForeignKey(): void
     {
-        $document = self::decoded();
+        $document = self::getDecoded();
         $providers = [];
         foreach ($document['included'] as $resource) {
             if ($resource['type'] === ProviderResource::TYPE) {
@@ -86,11 +93,11 @@ final class DocumentTreeTest extends TestCase
     }
 
     /**
-     * Без `PreloadIterator` связь `provider` остаётся (она из строки сертификата), а провайдеров в `included` нет.
+     * Без `PreloadReader` связь `provider` остаётся (она из строки сертификата), а провайдеров в `included` нет.
      */
     public function testProviderWithoutInclude(): void
     {
-        $document = self::decodedDocument(self::certificates(...), QUERY1);
+        $document = self::getDecodedDocument(self::getCertificates(...), QUERY1);
 
         self::assertCount(20, $document['data']);
         self::assertArrayNotHasKey(ProviderResource::TYPE, self::countTypes($document['included']));
@@ -108,7 +115,7 @@ final class DocumentTreeTest extends TestCase
         $sql = str_replace('cdm.certificate_id = cc.id', 'cdm.certificate_id = cc.id and cc.id % 5 <> 0', QUERY1);
         self::assertNotSame(QUERY1, $sql);
 
-        $document = self::decodedDocument(self::certificates(...), $sql);
+        $document = self::getDecodedDocument(self::getCertificates(...), $sql);
 
         self::assertCount(20, $document['data']);
         $deliveries = [];
@@ -133,40 +140,40 @@ final class DocumentTreeTest extends TestCase
 
     public function testExplainDescribesTree(): void
     {
-        $explain = self::tree(getPDO(), new ResourceRegistry())->explain();
+        $explain = self::getTree(getPDO(), new ResourceRegistry())->explain();
 
-        self::assertSame(HashNestJoinIterator::class, $explain['node']);
+        self::assertSame(HashNestJoinReader::class, $explain['node']);
         self::assertSame(CertificateResource::DOMAINS, $explain['name']);
-        self::assertSame(PreloadIterator::class, $explain['outer']['node']);
-        self::assertSame(SharedScanIterator::class, $explain['outer']['source']['node']);
-        self::assertSame(SharedRowJoinIterator::class, $explain['outer']['source']['source']['node']);
+        self::assertSame(PreloadReader::class, $explain['outer']['node']);
+        self::assertSame(EntitySharedAdvanceReader::class, $explain['outer']['source']['node']);
+        self::assertSame(EntitySharedJoinReader::class, $explain['outer']['source']['source']['node']);
         self::assertSame(CertificateResource::DELIVERY, $explain['outer']['source']['source']['name']);
-        self::assertSame(MergeNestJoinIterator::class, $explain['inner']['node']);
+        self::assertSame(MergeNestJoinReader::class, $explain['inner']['node']);
         self::assertSame(DomainResource::LOGS, $explain['inner']['name']);
     }
 
-    private static function document(): Document
+    private static function getDocument(): Document
     {
         $registry = new ResourceRegistry();
 
-        return new Document(self::tree(getPDO(), $registry), $registry);
+        return new Document(self::getTree(getPDO(), $registry), $registry);
     }
 
     /**
      * @return array{data: list<array<string, mixed>>, included: list<array<string, mixed>>}
      */
-    private static function decoded(): array
+    private static function getDecoded(): array
     {
-        return json_decode(json_encode(self::document(), \JSON_THROW_ON_ERROR), true, flags: \JSON_THROW_ON_ERROR);
+        return json_decode(json_encode(self::getDocument(), \JSON_THROW_ON_ERROR), true, flags: \JSON_THROW_ON_ERROR);
     }
 
     /**
      * Документ по поддереву сертификатов без провайдеров и доменов.
      *
-     * @param \Closure(\PDO, ResourceRegistry, string): SharedScanIterator $certificates
+     * @param \Closure(\PDO, ResourceRegistry, string): EntitySharedAdvanceReader $certificates
      * @return array{data: list<array<string, mixed>>, included: list<array<string, mixed>>}
      */
-    private static function decodedDocument(\Closure $certificates, string $sql): array
+    private static function getDecodedDocument(\Closure $certificates, string $sql): array
     {
         $registry = new ResourceRegistry();
         $document = new Document($certificates(getPDO(), $registry, $sql), $registry);
@@ -190,29 +197,44 @@ final class DocumentTreeTest extends TestCase
      * Сертификаты с деталями и доставкой из одного SQL (QUERY1), провайдеры (QUERY4) загружаются в реестр,
      * домены (QUERY2) с логами (QUERY3) вкладываются в сертификаты.
      *
-     * Публичный: `PlanTreeTest` сравнивает с ним топологию дерева, которое `ExecutorBuilder` собирает по плану.
+     * Публичный: `PlanTreeTest` сравнивает с ним топологию дерева, которое `ReaderBuilder` собирает по плану.
      */
-    public static function tree(\PDO $pdo, ResourceRegistry $registry): HashNestJoinIterator
+    public static function getTree(\PDO $pdo, ResourceRegistry $registry): HashNestJoinReader
     {
-        return new HashNestJoinIterator(
-            outer: new PreloadIterator(
-                source: self::certificates($pdo, $registry),
-                preload: new SerializeIterator(
-                    source: new SqlScanIterator(pdo: $pdo, sql: QUERY4),
-                    resource: ProviderResource::class,
+        return new HashNestJoinReader(
+            outer: new PreloadReader(
+                source: self::getCertificates($pdo, $registry),
+                preload: new RegisterReader(
+                    source: new SerializeReader(
+                        source: new EntityScanReader(pdo: $pdo, sql: QUERY4),
+                        resource: new ProviderResource(),
+                        columns: QUERY4_PROVIDER,
+                    ),
                     registry: $registry,
                 ),
             ),
-            inner: new MergeNestJoinIterator(
-                outer: new SerializeIterator(
-                    source: new SqlScanIterator(pdo: $pdo, sql: QUERY2),
-                    resource: DomainResource::class,
-                    registry: $registry,
+            inner: new MergeNestJoinReader(
+                outer: new UniqueAscendingKeyReader(
+                    source: new RegisterReader(
+                        source: new SerializeReader(
+                            source: new EntityScanReader(pdo: $pdo, sql: QUERY2),
+                            resource: new DomainResource(),
+                            columns: QUERY2_DOMAIN,
+                        ),
+                        registry: $registry,
+                    ),
+                    key: 'id',
                 ),
-                inner: new SerializeIterator(
-                    source: new SqlScanIterator(pdo: $pdo, sql: QUERY3),
-                    resource: LogResource::class,
-                    registry: $registry,
+                inner: new AscendingKeyReader(
+                    source: new RegisterReader(
+                        source: new SerializeReader(
+                            source: new EntityScanReader(pdo: $pdo, sql: QUERY3),
+                            resource: new LogResource(),
+                            columns: QUERY3_LOG,
+                        ),
+                        registry: $registry,
+                    ),
+                    key: 'domain_id',
                 ),
                 outer_key: 'id',
                 inner_key: 'domain_id',
@@ -227,19 +249,40 @@ final class DocumentTreeTest extends TestCase
     /**
      * Поддерево общего SQL (QUERY1): сертификат, детали и доставка из одной строки.
      */
-    private static function certificates(\PDO $pdo, ResourceRegistry $registry, string $sql = QUERY1): SharedScanIterator
+    private static function getCertificates(\PDO $pdo, ResourceRegistry $registry, string $sql = QUERY1): EntitySharedAdvanceReader
     {
-        $data = new SharedDataIterator(source: new SqlScanIterator(pdo: $pdo, sql: $sql));
+        $data = new EntitySharedWindowReader(source: new EntityScanReader(pdo: $pdo, sql: $sql));
 
-        return new SharedScanIterator(
+        return new EntitySharedAdvanceReader(
             data: $data,
-            source: new SharedRowJoinIterator(
-                outer: new SharedRowJoinIterator(
-                    outer: new SerializeIterator(source: $data, resource: CertificateResource::class, registry: $registry),
-                    inner: new SerializeIterator(source: $data, resource: DetailResource::class, registry: $registry),
+            source: new EntitySharedJoinReader(
+                outer: new EntitySharedJoinReader(
+                    outer: new RegisterReader(
+                        source: new ManualSerializeReader(
+                            source: $data,
+                            resource: new CertificateResource(),
+                            columns: QUERY1_CERTIFICATE,
+                        ),
+                        registry: $registry,
+                    ),
+                    inner: new RegisterReader(
+                        source: new SerializeReader(
+                            source: $data,
+                            resource: new DetailResource(),
+                            columns: QUERY1_DETAIL,
+                        ),
+                        registry: $registry,
+                    ),
                     name: CertificateResource::DETAIL,
                 ),
-                inner: new SerializeIterator(source: $data, resource: DeliveryResource::class, registry: $registry),
+                inner: new RegisterReader(
+                    source: new SerializeReader(
+                        source: $data,
+                        resource: new DeliveryResource(),
+                        columns: QUERY1_DELIVERY,
+                    ),
+                    registry: $registry,
+                ),
                 name: CertificateResource::DELIVERY,
             ),
         );

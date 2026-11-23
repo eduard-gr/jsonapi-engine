@@ -5,15 +5,25 @@ declare(strict_types=1);
 namespace Ggs\JsonApiEngine\Model;
 
 use sad_spirit\pg_builder\nodes\ColumnReference;
+use sad_spirit\pg_builder\nodes\expressions\Constant;
 use sad_spirit\pg_builder\nodes\expressions\OperatorExpression;
 use sad_spirit\pg_builder\nodes\Identifier;
 use sad_spirit\pg_builder\nodes\QualifiedName;
 use sad_spirit\pg_builder\nodes\range\FromElement;
 use sad_spirit\pg_builder\nodes\range\JoinExpression;
+use sad_spirit\pg_builder\nodes\lists\TargetList;
 use sad_spirit\pg_builder\nodes\range\RelationReference;
+use sad_spirit\pg_builder\nodes\range\Subselect;
+use sad_spirit\pg_builder\nodes\Star;
+use sad_spirit\pg_builder\Select;
 
 /**
  * Разобранная модель данных: таблицы, колонки модели и соединения с найденными таблицами `relation`.
+ *
+ * Лист модели — источник (`DataSource`) одного из двух видов: сущность (`DatabaseEntitySource`, источник в базе) или
+ * чужой источник (`ForeignDataSource`). Модель из одного листа может быть источником любого вида; в соединении (`Join`)
+ * лист обязан быть сущностью: соединение собирается в SQL, а чужой источник читает данные своим кодом.
+ * У чужого источника SQL нет: `getFrom()` бросает `LogicException`, `getRootEntity()` возвращает null.
  *
  * Таблицы (листья дерева) нумеруются слева направо: крайняя левая — основная таблица, она получает алиас места
  * в запросе (`t0`), остальные — `<алиас>_<номер>` (`t0_1`, `t0_2`). Колонки модели — колонки всех сущностей, кроме правой
@@ -22,7 +32,7 @@ use sad_spirit\pg_builder\nodes\range\RelationReference;
  * Разбор зависит только от класса, поэтому `of()` кеширует его на класс; ошибки собирает конструктор
  * (их показывает `validate()` класса с моделью).
  *
- * SQL модели отдаётся узлами pg_builder (`from()`, `expression()`), а не текстом. Узел pg_builder принадлежит одному
+ * SQL модели отдаётся узлами pg_builder (`getFrom()`, `getExpression()`), а не текстом. Узел pg_builder принадлежит одному
  * дереву запроса, поэтому каждый вызов строит новые узлы: их можно сразу вставлять в запрос, не клонируя. Имена таблиц
  * и колонок берутся только из констант сущностей; кавычки, если нужны, ставит pg_builder при выводе SQL.
  */
@@ -31,7 +41,7 @@ final class ModelTree
     /** @var array<class-string, ModelTree> */
     private static array $cache = [];
 
-    /** @var list<class-string<Entity>> таблицы по номеру */
+    /** @var list<class-string<DataSource>> источники (таблицы) по номеру; в модели из одного листа — любой источник */
     private array $entities = [];
 
     /** @var array<string, array{int, string}> колонка модели → [номер таблицы, колонка таблицы] */
@@ -47,12 +57,12 @@ final class ModelTree
     {
         [$this->root, $visible] = $this->analyze($model, 'root');
         foreach ($visible as $column => $leaf) {
-            $this->columns[$column] = [$leaf, $this->entities[$leaf]::column($column)];
+            $this->columns[$column] = [$leaf, self::getTableColumn($this->entities[$leaf], $column)];
         }
     }
 
     /**
-     * Разобранная модель класса со статическим `model(): Join|string` (в этом проекте — ресурса).
+     * Разобранная модель класса со статическим `getModel(): Join|string` (в этом проекте — ресурса).
      *
      * @param class-string $class
      *
@@ -76,7 +86,7 @@ final class ModelTree
      *
      * @return list<string>
      */
-    public function columns(): array
+    public function getColumns(): array
     {
         return array_keys($this->columns);
     }
@@ -89,7 +99,7 @@ final class ModelTree
     /**
      * Номер таблицы колонки модели (0 — основная) или null, если колонки нет.
      */
-    public function columnTable(string $column): ?int
+    public function getColumnTable(string $column): ?int
     {
         return $this->columns[$column][0] ?? null;
     }
@@ -97,7 +107,7 @@ final class ModelTree
     /**
      * `type` колонки модели из её сущности или null, если колонки нет.
      */
-    public function columnType(string $column): ?string
+    public function getColumnType(string $column): ?string
     {
         if (!isset($this->columns[$column])) {
             return null;
@@ -112,7 +122,7 @@ final class ModelTree
      */
     public function isUnique(string $column): bool
     {
-        return $this->columnTable($column) === 0 && $this->entities[0]::isUnique($column);
+        return $this->getColumnTable($column) === 0 && $this->entities[0]::isUnique($column);
     }
 
     /**
@@ -120,20 +130,20 @@ final class ModelTree
      *
      * @return list<string>
      */
-    public function errors(): array
+    public function getErrors(): array
     {
         return $this->errors;
     }
 
     /**
-     * Разбирает модель класса без кеша и без исключения: ошибки — в `errors()`.
+     * Разбирает модель класса без кеша и без исключения: ошибки — в `getErrors()`.
      *
      * @param class-string $class
      */
     public static function build(string $class): self
     {
         /** @var callable(): mixed $model */
-        $model = [$class, 'model'];
+        $model = [$class, 'getModel'];
 
         return new self($model());
     }
@@ -150,7 +160,7 @@ final class ModelTree
      *
      * @throws \LogicException если модель с ошибками
      */
-    public function from(string $alias, array $needed): FromElement
+    public function getFrom(string $alias, array $needed): FromElement
     {
         if ($this->root === null) {
             throw new \LogicException('invalid model: ' . implode('; ', $this->errors));
@@ -163,37 +173,106 @@ final class ModelTree
      * Выражение колонки модели — `ColumnReference` `<алиас таблицы>.<колонка таблицы>`. Каждый вызов — новый узел.
      *
      * @param string $column колонка модели
-     * @param string $alias  алиас места в запросе, тот же, что в `from()`
+     * @param string $alias  алиас места в запросе, тот же, что в `getFrom()`
      *
      * @throws \LogicException если такой колонки в модели нет
      */
-    public function expression(string $column, string $alias): ColumnReference
+    public function getExpression(string $column, string $alias): ColumnReference
     {
         if (!isset($this->columns[$column])) {
             throw new \LogicException("column {$column} is not a model column");
         }
-        [$leaf, $tableColumn] = $this->columns[$column];
+        [$leaf, $table_column] = $this->columns[$column];
 
-        return new ColumnReference(self::alias($alias, $leaf), $tableColumn);
+        return new ColumnReference(self::getAlias($alias, $leaf), $table_column);
     }
 
     /**
-     * Сущность основной таблицы или null, если модель с ошибками.
+     * Сущность основной таблицы; null, если модель с ошибками или её лист — чужой источник.
      *
-     * @return class-string<Entity>|null
+     * @return class-string<DatabaseEntitySource>|null
      */
-    public function rootEntity(): ?string
+    public function getRootEntity(): ?string
+    {
+        $source = $this->entities[0] ?? null;
+
+        return $source !== null && is_subclass_of($source, DatabaseEntitySource::class) ? $source : null;
+    }
+
+    /**
+     * Условия постоянных колонок сущности: `<колонка таблицы> = <значение литералом>` на каждую колонку с
+     * `'mode' => FIXED` (`DatabaseEntitySource::getFixedValues()`); пусто — постоянных колонок нет. Каждый вызов —
+     * новые узлы. Их добавляют в `WHERE` подзапрос чтения (`getFrom()`) и исполнители записи.
+     *
+     * @param class-string<DatabaseEntitySource> $entity
+     * @return list<OperatorExpression>
+     */
+    public static function getFixedValueExpressions(string $entity): array
+    {
+        $expressions = [];
+        foreach ($entity::getFixedValues() as $column => $value) {
+            $expressions[] = new OperatorExpression(
+                '=',
+                new ColumnReference($entity::getColumn($column)),
+                Constant::createFromPHPValue($value),
+            );
+        }
+
+        return $expressions;
+    }
+
+    /**
+     * Постоянная ли это колонка модели (`'mode' => FIXED` у её сущности): клиент её не пишет, связь на неё не опирается.
+     */
+    public function isFixedColumn(string $column): bool
+    {
+        if (!isset($this->columns[$column])) {
+            return false;
+        }
+        $entity = $this->entities[$this->columns[$column][0]];
+
+        return is_subclass_of($entity, DatabaseEntitySource::class) && isset($entity::getFixedValues()[$column]);
+    }
+
+    /**
+     * Читается ли модель из чужого источника (`ForeignDataSource`): тогда SQL у неё нет, данные отдаёт код источника.
+     * У модели с ошибками — false.
+     */
+    public function isForeignData(): bool
+    {
+        $source = $this->entities[0] ?? null;
+
+        return $source !== null && is_subclass_of($source, ForeignDataSource::class);
+    }
+
+    /**
+     * Основной источник модели — сущность основной таблицы или чужой источник; null, если модель с ошибками.
+     *
+     * @return class-string<DataSource>|null
+     */
+    public function getRootDataSource(): ?string
     {
         return $this->entities[0] ?? null;
     }
 
-    private static function alias(string $alias, int $leaf): string
+    /**
+     * Колонка таблицы в БД; у чужого источника — само имя колонки.
+     *
+     * @param class-string<DataSource> $source
+     */
+    private static function getTableColumn(string $source, string $column): string
+    {
+        return is_subclass_of($source, DatabaseEntitySource::class) ? $source::getColumn($column) : $column;
+    }
+
+    private static function getAlias(string $alias, int $leaf): string
     {
         return $leaf === 0 ? $alias : "{$alias}_{$leaf}";
     }
 
     /**
-     * Поддерево модели в узлы pg_builder: лист — `RelationReference` с алиасом, соединение — `JoinExpression`
+     * Поддерево модели в узлы pg_builder: лист — `RelationReference` с алиасом (у сущности с постоянными колонками —
+     * подзапрос `(select * from <таблица> where <колонка> = <значение>)` с тем же алиасом), соединение — `JoinExpression`
      * с `ON <правая колонка relation> = <левая колонка relation>`.
      *
      * @param array<string, mixed> $node
@@ -202,11 +281,30 @@ final class ModelTree
     private function render(array $node, string $alias, array $needed): FromElement
     {
         if (isset($node['leaf'])) {
+            $entity = $this->entities[$node['leaf']];
+            if (!is_subclass_of($entity, DatabaseEntitySource::class)) {
+                throw new \LogicException("{$entity} is a foreign data source: it has no SQL");
+            }
             // TABLE может быть со схемой (`schema.table`): каждая часть — отдельный идентификатор
-            $table = new RelationReference(new QualifiedName(...explode('.', $this->entities[$node['leaf']]::TABLE)));
-            $table->setAlias(new Identifier(self::alias($alias, $node['leaf'])));
+            $table = new RelationReference(new QualifiedName(...explode('.', $entity::TABLE)));
+            $conditions = self::getFixedValueExpressions(entity: $entity);
+            if ($conditions === []) {
+                $table->setAlias(new Identifier(self::getAlias($alias, $node['leaf'])));
 
-            return $table;
+                return $table;
+            }
+
+            // Сущность с постоянными колонками — не вся таблица, а её строки с этими значениями: подзапрос на месте
+            // таблицы. Так условие действует везде, где стоит таблица: в JOIN (а не в WHERE запроса) и в теле CTE
+            $select = new Select(new TargetList([new Star()]));
+            $select->from[] = $table;
+            foreach ($conditions as $condition) {
+                $select->where->and($condition);
+            }
+            $subselect = new Subselect($select);
+            $subselect->setAlias(new Identifier(self::getAlias($alias, $node['leaf'])));
+
+            return $subselect;
         }
 
         /** @var Join $join */
@@ -217,13 +315,13 @@ final class ModelTree
         // соединению нужна левая колонка relation: её таблица в левом поддереве должна остаться
         $left = $this->render($node['left'], $alias, $needed + [$node['relation'] => true]);
         $right = $this->render($node['right'], $alias, $needed);
-        [$leftLeaf, $leftColumn, $rightLeaf, $rightColumn] = $node['on'];
+        [$left_leaf, $left_column, $right_leaf, $right_column] = $node['on'];
 
-        $expression = new JoinExpression($left, $right, $join->type());
+        $expression = new JoinExpression($left, $right, $join->getType());
         $expression->on = new OperatorExpression(
             '=',
-            new ColumnReference(self::alias($alias, $rightLeaf), $rightColumn),
-            new ColumnReference(self::alias($alias, $leftLeaf), $leftColumn),
+            new ColumnReference(self::getAlias($alias, $right_leaf), $right_column),
+            new ColumnReference(self::getAlias($alias, $left_leaf), $left_column),
         );
 
         return $expression;
@@ -236,11 +334,19 @@ final class ModelTree
      *                                                                        (колонка → номер таблицы) и номер
      *                                                                        его основной таблицы
      */
-    private function analyze(mixed $model, string $at): array
+    private function analyze(mixed $model, string $location): array
     {
         if (\is_string($model)) {
-            if (!is_subclass_of($model, Entity::class)) {
-                $this->errors[] = "model {$at}: {$model} is not a subclass of " . Entity::class;
+            // источник — одного из двух видов: в базе (SQL строит движок) или чужой (читает своим кодом)
+            if (!is_subclass_of($model, DatabaseEntitySource::class) && !is_subclass_of($model, ForeignDataSource::class)) {
+                $this->errors[] = "model {$location}: {$model} is not a subclass of "
+                    . DatabaseEntitySource::class . ' or ' . ForeignDataSource::class;
+
+                return [null, [], null];
+            }
+            // соединение собирается в SQL: его лист — только таблица
+            if ($location !== 'root' && !is_subclass_of($model, DatabaseEntitySource::class)) {
+                $this->errors[] = "model {$location}: {$model} is a foreign data source and cannot be joined";
 
                 return [null, [], null];
             }
@@ -250,58 +356,58 @@ final class ModelTree
             return [['leaf' => $leaf], array_fill_keys(array_keys($model::COLUMNS), $leaf), $leaf];
         }
         if (!$model instanceof Join) {
-            $this->errors[] = "model {$at}: expected an entity class or a Join, got " . get_debug_type($model);
+            $this->errors[] = "model {$location}: expected a source class or a Join, got " . get_debug_type($model);
 
             return [null, [], null];
         }
 
-        [$left, $leftVisible, $leftMain] = $this->analyze($model->left, "{$at}.left");
-        [$right, $rightVisible, $rightMain] = $this->analyze($model->right, "{$at}.right");
+        [$left, $left_visible, $left_main] = $this->analyze($model->left, "{$location}.left");
+        [$right, $right_visible, $right_main] = $this->analyze($model->right, "{$location}.right");
 
         $relation = $model->relation;
         if (\count($relation) !== 2) {
-            $this->errors[] = "model {$at}: relation must be [left column, right column]";
+            $this->errors[] = "model {$location}: relation must be [left column, right column]";
 
-            return [null, $leftVisible + $rightVisible, $leftMain];
+            return [null, $left_visible + $right_visible, $left_main];
         }
 
-        [$leftColumn, $rightColumn] = $relation;
+        [$left_column, $right_column] = $relation;
         $valid = $left !== null && $right !== null;
-        if (!isset($leftVisible[$leftColumn]) && $left !== null) {
-            $this->errors[] = "model {$at}: column {$leftColumn} is missing in the left subtree";
+        if (!isset($left_visible[$left_column]) && $left !== null) {
+            $this->errors[] = "model {$location}: column {$left_column} is missing in the left subtree";
             $valid = false;
         }
-        if (!isset($rightVisible[$rightColumn]) && $right !== null) {
-            $this->errors[] = "model {$at}: column {$rightColumn} is missing in the right subtree";
+        if (!isset($right_visible[$right_column]) && $right !== null) {
+            $this->errors[] = "model {$location}: column {$right_column} is missing in the right subtree";
             $valid = false;
-        } elseif ($right !== null && $rightVisible[$rightColumn] !== $rightMain) {
-            $this->errors[] = "model {$at}: column {$rightColumn} must belong to the main table of the right subtree";
+        } elseif ($right !== null && $right_visible[$right_column] !== $right_main) {
+            $this->errors[] = "model {$location}: column {$right_column} must belong to the main table of the right subtree";
             $valid = false;
         }
 
         if ($valid) {
-            $leftEntity = $this->entities[$leftVisible[$leftColumn]];
-            $rightEntity = $this->entities[$rightVisible[$rightColumn]];
-            if (!$rightEntity::isUnique($rightColumn)) {
-                $this->errors[] = "model {$at}: column {$rightColumn} must be PRIMARY or unique in {$rightEntity}"
+            $left_entity = $this->entities[$left_visible[$left_column]];
+            $right_entity = $this->entities[$right_visible[$right_column]];
+            if (!$right_entity::isUnique($right_column)) {
+                $this->errors[] = "model {$location}: column {$right_column} must be PRIMARY or unique in {$right_entity}"
                     . ' (relation must be to-one)';
             }
-            if (($leftEntity::COLUMNS[$leftColumn]['type'] ?? null)
-                !== ($rightEntity::COLUMNS[$rightColumn]['type'] ?? null)) {
-                $this->errors[] = "model {$at}: columns {$leftColumn} and {$rightColumn} must have the same type";
+            if (($left_entity::COLUMNS[$left_column]['type'] ?? null)
+                !== ($right_entity::COLUMNS[$right_column]['type'] ?? null)) {
+                $this->errors[] = "model {$location}: columns {$left_column} and {$right_column} must have the same type";
             }
         }
 
-        $rightLeaf = $rightVisible[$rightColumn] ?? $rightMain;
+        $right_leaf = $right_visible[$right_column] ?? $right_main;
         // правая колонка relation равна левой: колонкой модели она не считается
-        unset($rightVisible[$rightColumn]);
-        foreach (array_intersect_key($rightVisible, $leftVisible) as $column => $leaf) {
-            $this->errors[] = "model {$at}: column {$column} is defined in both "
-                . $this->entities[$leftVisible[$column]] . ' and ' . $this->entities[$leaf];
+        unset($right_visible[$right_column]);
+        foreach (array_intersect_key($right_visible, $left_visible) as $column => $leaf) {
+            $this->errors[] = "model {$location}: column {$column} is defined in both "
+                . $this->entities[$left_visible[$column]] . ' and ' . $this->entities[$leaf];
         }
 
         if (!$valid) {
-            return [null, $leftVisible + $rightVisible, $leftMain];
+            return [null, $left_visible + $right_visible, $left_main];
         }
 
         return [
@@ -310,16 +416,16 @@ final class ModelTree
                 'left' => $left,
                 'right' => $right,
                 'on' => [
-                    $leftVisible[$leftColumn],
-                    $this->entities[$leftVisible[$leftColumn]]::column($leftColumn),
-                    $rightLeaf,
-                    $this->entities[$rightLeaf]::column($rightColumn),
+                    $left_visible[$left_column],
+                    self::getTableColumn($this->entities[$left_visible[$left_column]], $left_column),
+                    $right_leaf,
+                    self::getTableColumn($this->entities[$right_leaf], $right_column),
                 ],
-                'relation' => $leftColumn,
-                'columns' => $rightVisible,
+                'relation' => $left_column,
+                'columns' => $right_visible,
             ],
-            $leftVisible + $rightVisible,
-            $leftMain,
+            $left_visible + $right_visible,
+            $left_main,
         ];
     }
 }
