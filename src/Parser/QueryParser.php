@@ -16,7 +16,8 @@ use Ggs\JsonApiEngine\Resource;
  *
  * Что можно, описывает только сам ресурс: всё, что в нём объявлено, клиенту доступно.
  *  - `include` — любая связь из `getRelationships()` ресурса-родителя, на любую глубину;
- *  - `fields` — публичные атрибуты ресурса (`getPublicAttributes()`);
+ *  - `fields` — публичные атрибуты ресурса (`getPublicAttributes()`); без `fields` клиент получает набор по
+ *    умолчанию (`getDefaultAttributes()`): те же атрибуты, кроме объявленных `OPTIONAL` — они только по запросу;
  *  - `filter` — атрибуты, у которых ресурс объявил `filter`, и только эти операторы; оператор `in` временно
  *    отключён: даже объявленный в ресурсе, он отклоняется (400), потому что план не строит для него условие;
  *  - `sort` — атрибуты, у которых ресурс объявил `sort`.
@@ -138,7 +139,7 @@ final class QueryParser
     {
         return [
             'resource' => $resource,
-            'fields' => $resource::getPublicAttributes(),
+            'fields' => $resource::getDefaultAttributes(),
             'filters' => [],
             'sort' => [],
             'includes' => [],

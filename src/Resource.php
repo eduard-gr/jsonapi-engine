@@ -164,7 +164,23 @@ abstract class Resource implements MetadataInterface
     }
 
     /**
-     * Имена атрибутов, кроме первичного ключа, и связей по внешнему ключу ресурса.
+     * Что клиент получает, когда не прислал `fields` для ресурса: публичные атрибуты (`getPublicAttributes()`) без
+     * тех, что объявлены `'mode' => … | self::OPTIONAL` — такие отдаются только по запросу. Связи по внешнему
+     * ключу входят всегда: режима у связи нет. Назвать в `fields` клиент может любой публичный атрибут.
+     *
+     * @return list<string>
+     */
+    public static function getDefaultAttributes(): array
+    {
+        return array_values(array_filter(
+            static::getPublicAttributes(),
+            static fn(string $name): bool => ((static::ATTRIBUTES[$name]['mode'] ?? self::READ_WRITE) & self::OPTIONAL) === 0,
+        ));
+    }
+
+    /**
+     * Имена атрибутов, кроме первичного ключа, и связей по внешнему ключу ресурса: всё, что клиент может назвать
+     * в `fields`. Набор по умолчанию (без `fields`) — `getDefaultAttributes()`.
      *
      * @return list<string>
      */
@@ -365,14 +381,18 @@ abstract class Resource implements MetadataInterface
             if (isset($attribute['type']) && !\in_array($attribute['type'], self::TYPES, true)) {
                 $errors[] = "{$location}: unknown type {$attribute['type']}";
             }
-            // Режим атрибута — маска READ и WRITE; FIXED бывает только у колонки сущности. Атрибут без READ
-            // (только запись) пока не поддержан: его всё равно отдали бы клиенту
+            // Режим атрибута — маска READ, WRITE и OPTIONAL; FIXED бывает только у колонки сущности. Атрибут без
+            // READ (только запись) пока не поддержан: его всё равно отдали бы клиенту
             $mode = $attribute['mode'] ?? self::READ_WRITE;
-            if (!\is_int($mode) || $mode <= 0 || ($mode & ~self::READ_WRITE) !== 0) {
-                $errors[] = "{$location}: mode must be a mask of READ and WRITE";
+            if (!\is_int($mode) || $mode <= 0 || ($mode & ~self::ATTRIBUTE_MODES) !== 0) {
+                $errors[] = "{$location}: mode must be a mask of READ, WRITE and OPTIONAL";
                 $mode = self::READ_WRITE;
             } elseif (($mode & self::READ) === 0) {
                 $errors[] = "{$location}: an attribute without READ is not supported yet";
+            }
+            // id отдаётся всегда: первичный ключ не бывает «только по запросу»
+            if (($mode & self::OPTIONAL) !== 0 && ($attribute['constraint'] ?? null) === self::PRIMARY) {
+                $errors[] = "{$location}: PRIMARY attribute can not be OPTIONAL";
             }
             // Постоянную колонку сущности (FIXED) пишет движок, клиент её не меняет
             if (($mode & self::WRITE) !== 0 && isset($attribute['column']) && \is_string($attribute['column'])

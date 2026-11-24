@@ -419,7 +419,7 @@ $fields = getFieldsArgument(arguments: $argv);
 $validations_query = new EntityScanNodeDraft(
     input: new ResourceNode(
         resource: ValidationResource::class,
-        fields: $fields === null ? ValidationResource::getPublicAttributes() : explode(',', $fields),
+        fields: $fields === null ? ValidationResource::getDefaultAttributes() : explode(',', $fields),
     ),
 )
     ->withOrder(order: CertificateValidationsEntity::CERTIFICATE_ID)
